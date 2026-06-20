@@ -34,7 +34,10 @@ jobs:
 
       - name: Install Semgrep CE
         # Standalone / community edition — no SEMGREP_APP_TOKEN, no Semgrep Cloud.
-        run: pip install semgrep==1.99.0
+        # Pin setuptools <81: v81 dropped `pkg_resources`, which Semgrep's
+        # opentelemetry dependency still imports at startup (otherwise the scan
+        # crashes with ModuleNotFoundError before writing any SARIF).
+        run: pip install "setuptools<81" "semgrep==1.167.0"
 
       - name: Run Semgrep
         # Backend rulesets only (no p/react, no p/nextjs — this is a Node/TS service).
