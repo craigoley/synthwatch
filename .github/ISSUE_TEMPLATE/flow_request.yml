@@ -1,0 +1,60 @@
+name: Flow request
+description: Propose a new browser flow (or a change to one) to monitor a funnel.
+title: "[flow]: "
+labels: ["flow", "enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Flows are **code, added via reviewed pull request** — never uploaded or run
+        at runtime. This issue proposes one; implementation follows in a PR per
+        [CONTRIBUTING.md](../blob/main/CONTRIBUTING.md#writing-a-flow-safely).
+  - type: input
+    id: flow-name
+    attributes:
+      label: Proposed flow name
+      description: Lowercase, matches /^[a-z0-9-]+$/ (becomes runner/checks/<name>.ts).
+      placeholder: checkout-funnel
+    validations:
+      required: true
+  - type: input
+    id: target
+    attributes:
+      label: Target URL
+      description: The starting URL for the flow (config lives in the dashboard, not source).
+      placeholder: https://example.com/
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Funnel steps
+      description: List each step as it will be wrapped in rec.step(...).
+      placeholder: |
+        1. open homepage
+        2. focus search box
+        3. submit search
+        4. assert results present
+    validations:
+      required: true
+  - type: textarea
+    id: selectors
+    attributes:
+      label: Verified selectors
+      description: Real selectors inspected from the live DOM (not guesses). One per step where relevant.
+      placeholder: |
+        - search box: input#search
+        - results: .results-list .result
+    validations:
+      required: false
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety acknowledgement
+      options:
+        - label: Selectors will be verified against the live DOM (no guessed/placeholder selectors).
+          required: true
+        - label: The flow will use no dynamic code execution and contain no secrets.
+          required: true
+        - label: Every action will be wrapped in StepRecorder (rec.step).
+          required: true

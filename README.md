@@ -1,9 +1,22 @@
 # SynthWatch
 
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/craigoley/synthwatch/badge)](https://scorecard.dev/viewer/?uri=github.com/craigoley/synthwatch)
+[![CodeQL](https://github.com/craigoley/synthwatch/actions/workflows/codeql.yml/badge.svg)](https://github.com/craigoley/synthwatch/actions/workflows/codeql.yml)
+
 A self-hosted synthetic monitoring system. SynthWatch runs **HTTP** and
 **real-browser (Playwright)** checks on a timer, records every run (and every
 *step* of a browser flow), and opens/resolves debounced incidents with pluggable
 alerting.
+
+The **data plane** (this repo's `runner/`) executes checks on **Azure Container
+Apps Jobs**; the **dashboard** is a separate Next.js app on **Vercel**. See
+[Decision 8](#decision-8--two-repo-split-runner-here-dashboard-on-vercel) for why
+the split exists.
+
+> **Contributing & security:** see [CONTRIBUTING.md](CONTRIBUTING.md) (including
+> the mandatory *“Writing a flow safely”* section), [SECURITY.md](SECURITY.md),
+> and the [Code of Conduct](CODE_OF_CONDUCT.md). Report vulnerabilities
+> **privately** — never via a public issue.
 
 This repository currently contains the **data-plane runner**, the **database
 schema**, and the **container image**. No dashboard and no infrastructure-as-code
@@ -151,6 +164,30 @@ transient blip never pages anyone. A partial unique index
 (`one_open_incident_per_check WHERE status = 'open'`) keeps incident state
 coherent in the database; because each check is claimed by exactly one replica
 per tick, that index is a backstop rather than the primary guard.
+
+## Decision 8 — Two-repo split: runner here, dashboard on Vercel
+
+The runner needs a **full container with Chromium** and runs on ACA Jobs
+(Decision 1). The dashboard is a Next.js app that deploys best on Vercel. These
+have different runtimes, deploy cadences, and scaling models, so they live in
+**separate repositories** rather than a monorepo:
+
+- The runner can be rebuilt/redeployed (and its Playwright/base-image pair bumped
+  together — Decision 5) without touching the dashboard, and vice versa.
+- Each repo gets a focused CI/security surface (this repo's scanners target a
+  Node/TS **backend**, not a React/Next frontend).
+- The shared contract between them is the **database schema** (`db/schema.sql`),
+  not shared application code.
+
+## Decision 9 — Generated DB types are committed, not built on demand
+
+Types that mirror the schema are **generated at commit time and checked in**,
+rather than regenerated during every build or at runtime. Committing them means
+`tsc` type-checks against a concrete, reviewed artifact; schema changes show up as
+a **visible diff** in the PR (easy to review and to catch drift); and neither CI
+nor the dashboard needs a live database connection just to type-check. The
+trade-off — remembering to regenerate after a schema change — is enforced by
+review and the schema/migration convergence check.
 
 ---
 
