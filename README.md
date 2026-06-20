@@ -229,6 +229,58 @@ docker build -t synthwatch-runner ./runner
 docker run --rm --ipc=host -e DATABASE_URL="$DATABASE_URL" synthwatch-runner
 ```
 
+## Deploy (Azure — runner only)
+
+`infra/main.bicep` provisions the **runner's** Azure footprint into the
+**existing** resource group `synthwatch-rg` (eastus), referencing the
+**existing** registry `synthwatcholey0620.azurecr.io`. It does **not** create the
+resource group or the registry, and it does **not** provision the dashboard
+(that's a separate Vercel app). The ACA Job pulls its image via a user-assigned
+managed identity granted **AcrPull** — no registry password is stored.
+
+```bash
+# 0. Build and push the runner image to the existing ACR.
+az acr login --name synthwatcholey0620
+docker build -t synthwatcholey0620.azurecr.io/synthwatch-runner:0.1.0 ./runner
+docker push synthwatcholey0620.azurecr.io/synthwatch-runner:0.1.0
+
+# 1. Provision the runner footprint (PostgreSQL, Storage, Log Analytics, ACA
+#    environment + scheduled Job).
+az deployment group create \
+  --resource-group synthwatch-rg \
+  --name synthwatch-infra \
+  --template-file infra/main.bicep \
+  --parameters \
+      postgresAdminPassword='<strong-password>' \
+      runnerImage='synthwatcholey0620.azurecr.io/synthwatch-runner:0.1.0'
+
+# 2. Grab the Postgres FQDN from the deployment outputs.
+FQDN=$(az deployment group show -g synthwatch-rg -n synthwatch-infra \
+        --query properties.outputs.postgresFqdn.value -o tsv)
+export DATABASE_URL="postgresql://synthadmin:<strong-password>@${FQDN}:5432/synthwatch?sslmode=require"
+
+# 3. Apply the schema and seed to the fresh database.
+#    schema.sql is the full, converged schema for a NEW database — it already
+#    includes everything through db/migrations/0001. Do NOT also run the
+#    migrations on a fresh DB (that would duplicate run_metrics / the checks
+#    columns and error). Migrations are only for upgrading an EXISTING database:
+#    on one created before a migration, apply just the new db/migrations/*.sql.
+psql "$DATABASE_URL" -f db/schema.sql
+psql "$DATABASE_URL" -f db/seed.sql
+
+# 4. Smoke-test: fire one Job execution now instead of waiting for the cron tick.
+az containerapp job start -g synthwatch-rg -n synthwatch-runner-job
+```
+
+> To run `psql` from your workstation you must also allow your client IP on the
+> Postgres server (Portal → the server → *Networking*), or run these steps from
+> **Azure Cloud Shell**. The Bicep opens the firewall to *Azure services* (so the
+> Job can connect) but not to arbitrary public IPs.
+
+> Alert channels (`ALERT_EMAIL_TO`, `TEAMS_WEBHOOK_URL`, `XMATTERS_*`) are added
+> as Job env vars per deployment; an absent channel is simply disabled. The Bicep
+> intentionally hardcodes none.
+
 ## Writing a browser flow
 
 Add `runner/checks/<name>.ts` exporting a `flow`, then point a check's
