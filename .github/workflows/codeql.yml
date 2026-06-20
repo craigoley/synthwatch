@@ -1,0 +1,60 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly, off-peak (Mondays 04:17 UTC — deliberately not on :00/:30).
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+# Least privilege: only what CodeQL analysis needs.
+permissions:
+  security-events: write
+  packages: read
+  actions: read
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    # Cancel superseded runs of the same ref + language, but never cancel
+    # in-flight runs of a different language.
+    concurrency:
+      group: codeql-${{ github.workflow }}-${{ github.ref }}-${{ matrix.language }}
+      cancel-in-progress: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: javascript-typescript
+            build-mode: none
+            # Scope extraction to runner/** (TS is not at the repo root).
+            config-file: ./.github/codeql/codeql-config.yml
+          - language: actions
+            build-mode: none
+            # actions analysis scans .github/workflows — no path scoping.
+            config-file: ""
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        # Major tag per GitHub's advanced-setup guidance (v4 = Node 24);
+        # Dependabot (github-actions) keeps it current.
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          config-file: ${{ matrix.config-file }}
+          # Level up from security-extended: adds maintainability/quality queries.
+          queries: security-and-quality
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{ matrix.language }}"

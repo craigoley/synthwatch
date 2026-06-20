@@ -1,0 +1,16 @@
+# CodeQL configuration for SynthWatch.
+#
+# All TypeScript for the runner lives under runner/ (not the repo root). Without
+# this path filter, CodeQL's javascript-typescript extraction can scan the empty
+# root tree and fail with:
+#   "Only found JavaScript or TypeScript files that were empty or contained
+#    syntax errors."
+# Scoping extraction to runner/** points it at the actual source.
+name: "SynthWatch CodeQL config"
+
+paths:
+  - runner/**
+
+paths-ignore:
+  - runner/dist/**
+  - "**/node_modules/**"

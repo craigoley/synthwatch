@@ -1,0 +1,30 @@
+name: Dependency Review
+
+# Inspects dependency changes in a PR diff and comments a summary.
+# Non-blocking (warn-only) — catches a bad dep without walling merges.
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: dependency-review-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dependency-review:
+    name: Review
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Dependency Review
+        uses: actions/dependency-review-action@v4
+        # Warn-only: never fail the PR; surface findings as a PR comment instead.
+        continue-on-error: true
+        with:
+          comment-summary-in-pr: always

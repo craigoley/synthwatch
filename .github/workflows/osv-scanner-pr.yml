@@ -1,0 +1,30 @@
+name: OSV-Scanner (PR)
+
+# Diff-aware scan: fails only on vulnerabilities the PR *introduces*, never on
+# pre-existing ones. Uses Google's official reusable PR workflow.
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  security-events: write
+  contents: read
+  actions: read
+
+jobs:
+  scan-pr:
+    # Don't run on Dependabot's own PRs (they get the scheduled full scan).
+    if: ${{ github.actor != 'dependabot[bot]' }}
+    # SHA-pinned third-party action (v2.3.8); Dependabot bumps it.
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@9a498708959aeaef5ef730655706c5a1df1edbc2
+    with:
+      # Recursively scan the repo (picks up runner/package-lock.json).
+      scan-args: |-
+        -r
+        ./
+      # Diff job: surface introduced vulns without walling the PR.
+      fail-on-vuln: false
+    permissions:
+      security-events: write
+      contents: read
+      actions: read

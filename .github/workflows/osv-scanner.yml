@@ -1,0 +1,33 @@
+name: OSV-Scanner
+
+# Full dependency-tree scan on push to main and on a weekly schedule.
+# Reports to the Security tab via SARIF; does not block (warn-only).
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Weekly, off-peak (Mondays 04:43 UTC — staggered from CodeQL/Semgrep).
+    - cron: "43 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  security-events: write
+  contents: read
+  actions: read
+
+jobs:
+  scan:
+    # SHA-pinned third-party action (v2.3.8); Dependabot bumps it.
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@9a498708959aeaef5ef730655706c5a1df1edbc2
+    with:
+      scan-args: |-
+        -r
+        ./
+      upload-sarif: true
+      # Warn-only: full-tree findings populate the Security tab without
+      # failing main/scheduled runs.
+      fail-on-vuln: false
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
