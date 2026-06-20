@@ -18,6 +18,7 @@ import { StepRecorder } from './stepRecorder.js';
 import { loadFlow } from './checks/index.js';
 import { uploadScreenshot } from './artifacts.js';
 import { evaluate } from './evaluate.js';
+import { startMetricsCapture, writeRunMetrics, EMPTY_METRICS } from './metrics.js';
 
 interface Outcome {
   ok: boolean;
@@ -169,6 +170,11 @@ async function executeBrowser(check: Check, runId: number): Promise<Outcome> {
   const page = await context.newPage();
   page.setDefaultTimeout(check.timeout_ms);
 
+  // Passive Tier-1 telemetry capture rides this run's own navigation. Set up
+  // BEFORE the flow so the LCP observer / response listener / CDP session see
+  // the whole page load; collected in the finally below.
+  const capture = await startMetricsCapture(context, page);
+
   try {
     const rec = new StepRecorder(runId, page, check.target_url);
     const flow = await loadFlow(check.flow_name);
@@ -190,6 +196,18 @@ async function executeBrowser(check: Check, runId: number): Promise<Outcome> {
       };
     }
   } finally {
+    // Persist one run_metrics row (pass OR fail) before tearing down the
+    // context. Telemetry must never affect the verdict — swallow everything and
+    // fall back to an all-null row if capture or the write itself throws.
+    try {
+      const metrics = await capture.collect();
+      await writeRunMetrics(runId, metrics);
+    } catch (err) {
+      console.warn(`[metrics] run ${runId} telemetry capture failed:`, err);
+      await writeRunMetrics(runId, EMPTY_METRICS).catch((e) =>
+        console.warn(`[metrics] run ${runId} telemetry write failed:`, e),
+      );
+    }
     await context.close();
   }
 }
