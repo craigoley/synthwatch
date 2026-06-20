@@ -46,6 +46,15 @@ CREATE TABLE checks (
     enabled            BOOLEAN     NOT NULL DEFAULT TRUE,
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
 
+    -- Lighthouse / perf-budget config (Tier 3 — schema only for now; the audit
+    -- code paths land in a later PR and nothing reads these yet). Kept in sync
+    -- with db/migrations/0001_run_metrics.sql.
+    lighthouse_enabled          BOOLEAN NOT NULL DEFAULT false,
+    lighthouse_interval_seconds INTEGER,
+    lighthouse_form_factor      TEXT    NOT NULL DEFAULT 'desktop',
+    perf_budget_lcp_ms          INTEGER,
+    perf_budget_transfer_bytes  BIGINT,
+
     -- A browser check is meaningless without a flow to run.
     CONSTRAINT browser_needs_flow
         CHECK (kind <> 'browser' OR flow_name IS NOT NULL)
@@ -92,6 +101,38 @@ CREATE TABLE run_steps (
 );
 
 CREATE INDEX run_steps_run_idx ON run_steps (run_id, step_index);
+
+-- ---------------------------------------------------------------------------
+-- run_metrics: Tier-1 per-run telemetry. One row per BROWSER run (HTTP checks
+-- write nothing here). Captured passively off the run's own navigation; every
+-- metric is nullable because a capture failure must never fail the check. Kept
+-- in sync with db/migrations/0001_run_metrics.sql.
+-- ---------------------------------------------------------------------------
+CREATE TABLE run_metrics (
+    id                    BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    run_id                BIGINT      NOT NULL UNIQUE
+                                      REFERENCES runs(id) ON DELETE CASCADE,
+
+    -- Navigation Timing (W3C) + paint, ms relative to navigation start.
+    ttfb_ms               INTEGER,
+    dom_content_loaded_ms INTEGER,
+    load_event_ms         INTEGER,
+    fcp_ms                INTEGER,
+    lcp_ms                INTEGER,
+
+    -- Page weight.
+    transfer_bytes        BIGINT,
+    resource_count        INTEGER,
+    dom_node_count        INTEGER,
+
+    -- CDP Performance.getMetrics.
+    js_heap_bytes         BIGINT,
+    cpu_time_ms           INTEGER,
+    layout_count          INTEGER,
+    recalc_style_count    INTEGER,
+
+    captured_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
 -- ---------------------------------------------------------------------------
 -- incidents: open/resolved lifecycle per check, debounced against flapping.
