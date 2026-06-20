@@ -1,0 +1,56 @@
+name: Semgrep
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly, off-peak (Mondays 05:23 UTC — staggered from CodeQL).
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  security-events: write
+  contents: read
+  actions: read
+
+concurrency:
+  group: semgrep-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  semgrep:
+    name: Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Semgrep CE
+        # Standalone / community edition — no SEMGREP_APP_TOKEN, no Semgrep Cloud.
+        run: pip install semgrep==1.99.0
+
+      - name: Run Semgrep
+        # Backend rulesets only (no p/react, no p/nextjs — this is a Node/TS service).
+        # Never fail the build here; findings surface in the Security tab via SARIF.
+        run: |
+          semgrep scan \
+            --config p/typescript \
+            --config p/javascript \
+            --config p/security-audit \
+            --config p/secrets \
+            --sarif --output semgrep.sarif
+        continue-on-error: true
+
+      - name: Upload SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep

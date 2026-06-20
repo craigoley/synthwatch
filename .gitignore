@@ -13,6 +13,9 @@ dist/
 *.log
 npm-debug.log*
 
+# Security scan artifacts (generated in CI)
+*.sarif
+
 # OS / editor
 .DS_Store
 .vscode/

@@ -1,0 +1,27 @@
+version: 2
+updates:
+  # Runner app dependencies (package.json lives under runner/, not the repo root).
+  - package-ecosystem: npm
+    directory: /runner
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      # Collapse minor + patch bumps into a single PR so the (future)
+      # auto-merge pipeline isn't flooded with one-PR-per-bump.
+      npm-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  # GitHub Actions used across .github/workflows (keeps codeql-action @v4,
+  # osv-scanner-action SHA, etc. fresh).
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions-minor-and-patch:
+        update-types:
+          - minor
+          - patch

@@ -1,0 +1,54 @@
+name: ESLint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  security-events: write
+  contents: read
+  actions: read
+
+concurrency:
+  group: eslint-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  eslint:
+    name: Lint
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: runner
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: runner/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint (SARIF)
+        # Generate SARIF for the Security tab; don't fail the job here so the
+        # upload step always runs. The gate below enforces pass/fail.
+        run: npm run lint:sarif
+        continue-on-error: true
+
+      - name: Upload ESLint SARIF
+        uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        with:
+          sarif_file: runner/eslint-results.sarif
+          category: eslint
+
+      - name: ESLint gate (--max-warnings 0)
+        run: npm run lint
