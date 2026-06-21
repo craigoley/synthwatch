@@ -377,3 +377,5 @@ export const flow: Flow = async (rec) => {
 
 `checks/homepage-search.ts` is a **template** with **placeholder selectors** —
 inspect the real DOM and replace them before trusting it.
+
+<!-- claude-review end-to-end validation: trivial docs touch, safe to merge. -->
