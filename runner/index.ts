@@ -14,6 +14,7 @@
 import { chromium, type Browser } from 'playwright';
 import { pool, type Check, type RunRecord, type TerminalStatus } from './db.js';
 import { runHttpCheck } from './httpCheck.js';
+import { runSslCheck } from './sslCheck.js';
 import { StepRecorder } from './stepRecorder.js';
 import { loadFlow } from './checks/index.js';
 import { uploadScreenshot } from './artifacts.js';
@@ -132,10 +133,9 @@ async function runOne(check: Check): Promise<void> {
 
   let outcome: Outcome;
   try {
-    outcome =
-      check.kind === 'http'
-        ? await executeHttp(check)
-        : await executeBrowser(check, runId);
+    if (check.kind === 'http') outcome = await executeHttp(check);
+    else if (check.kind === 'ssl') outcome = await executeSsl(check);
+    else outcome = await executeBrowser(check, runId);
   } catch (err) {
     // Unexpected runner error (e.g. flow loader threw) -> 'error', not 'fail'.
     outcome = {
@@ -205,6 +205,21 @@ async function executeHttp(check: Check): Promise<Outcome> {
     httpStatus: r.httpStatus,
     durationMs: r.durationMs,
     error: r.error,
+    failedStep: null,
+    screenshot: null,
+    metrics: null,
+  };
+}
+
+async function executeSsl(check: Check): Promise<Outcome> {
+  const r = await runSslCheck(check);
+  // The cert status line (incl. days-remaining) is recorded in error_message for
+  // every ssl run so the dashboard can show "expires in N days" even on pass.
+  return {
+    status: r.verdict, // 'pass' | 'warn' | 'fail' | 'error' (warn = expiring soon)
+    httpStatus: null,
+    durationMs: r.durationMs,
+    error: r.message,
     failedStep: null,
     screenshot: null,
     metrics: null,

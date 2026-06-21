@@ -19,7 +19,7 @@ export type TerminalStatus = Exclude<RunStatus, 'running'>;
 export interface Check {
   id: number;
   name: string;
-  kind: 'http' | 'browser';
+  kind: 'http' | 'browser' | 'ssl';
   target_url: string;
   flow_name: string | null;
   method: string;
@@ -36,6 +36,8 @@ export interface Check {
   // metric. claim() does SELECT *, so these ride along; typed here so code reads them.
   perf_budget_lcp_ms: number | null;
   perf_budget_transfer_bytes: number | null;
+  // For kind='ssl': days-until-expiry threshold for the warn window (default 30).
+  cert_expiry_warn_days: number;
 }
 
 /** A row from the `runs` table after we've finished executing a check. */
