@@ -40,4 +40,21 @@ VALUES (
            -- (real LCP is ~1.3-1.5s, so this flags genuine regressions).
 );
 
+-- SSL/TLS cert-expiry check (kind='ssl', no browser). Reads the leaf cert over a
+-- TLS handshake: > cert_expiry_warn_days remaining => pass, within the window =>
+-- warn, expired/invalid => fail, unreachable => error. days-remaining is recorded
+-- in the run's error_message for the dashboard.
+INSERT INTO checks (name, kind, target_url, interval_seconds, timeout_ms,
+                    failure_threshold, severity, cert_expiry_warn_days)
+VALUES (
+    'wegmans.com TLS cert',
+    'ssl',
+    'https://www.wegmans.com/',
+    3600,  -- hourly is plenty for a cert that changes ~quarterly
+    10000, -- TLS handshake budget (ms)
+    2,
+    'critical',
+    30     -- warn when the cert has <= 30 days left
+);
+
 COMMIT;

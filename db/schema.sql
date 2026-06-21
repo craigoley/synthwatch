@@ -18,7 +18,8 @@ CREATE TABLE checks (
     name               TEXT        NOT NULL,
     -- 'http'    -> cheap tier, plain fetch(), no browser.
     -- 'browser' -> real Chromium via Playwright, runs a named flow.
-    kind               TEXT        NOT NULL CHECK (kind IN ('http', 'browser')),
+    -- 'ssl'     -> declarative TLS cert-expiry check (no browser); see sslCheck.ts.
+    kind               TEXT        NOT NULL CHECK (kind IN ('http', 'browser', 'ssl')),
     target_url         TEXT        NOT NULL,
 
     -- For browser checks: which flow module under runner/checks/ to execute.
@@ -38,6 +39,11 @@ CREATE TABLE checks (
 
     -- Flap debounce: open an incident only after this many CONSECUTIVE failures.
     failure_threshold  INTEGER     NOT NULL DEFAULT 3 CHECK (failure_threshold > 0),
+
+    -- For kind='ssl': days-until-expiry threshold. Cert with more days -> pass;
+    -- within this window -> warn; expired/invalid -> fail; unreachable -> error.
+    -- Harmless on http/browser rows. (Mirrors db/migrations/0005_ssl_checks.sql.)
+    cert_expiry_warn_days INTEGER  NOT NULL DEFAULT 30,
 
     -- Severity stamped onto incidents opened for this check.
     severity           TEXT        NOT NULL DEFAULT 'critical'
