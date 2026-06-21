@@ -157,3 +157,81 @@ CREATE UNIQUE INDEX one_open_incident_per_check
     WHERE status = 'open';
 
 COMMIT;
+
+-- ===========================================================================
+-- SLA / availability reporting (mirrors db/migrations/0002_sla_view.sql).
+-- Kept here so fresh installs converge with migrated databases. See that
+-- migration for the authoritative availability definition and rationale.
+--
+-- Computed ON-DEMAND from runs (no precomputed rollups): index-assisted via
+-- runs_check_started_idx, sub-second at current scale. If a single SLA query
+-- ever exceeds ~1-2s, swap the view for a MATERIALIZED VIEW with zero caller
+-- impact (callers query the view, not the SQL).
+--
+-- Availability definition:
+--   completed = status IN ('pass','warn','fail','error')   ('running' excluded)
+--   "Up"      = status IN ('pass','warn')   (warn = degraded but reachable)
+--   "Down"    = status IN ('fail','error')
+--   availability_pct = up_runs / completed_runs * 100, per check, per window.
+-- The IN-lists use the full intended taxonomy; the runs CHECK currently permits
+-- only ('pass','fail'), so today this resolves to up=pass / down=fail and stays
+-- correct unchanged when warn/error/running are introduced.
+-- ===========================================================================
+
+BEGIN;
+
+CREATE OR REPLACE FUNCTION sla_availability(p_from timestamptz, p_to timestamptz)
+RETURNS TABLE (
+    check_id         bigint,
+    check_name       text,
+    kind             text,
+    window_from      timestamptz,
+    window_to        timestamptz,
+    completed_runs   bigint,
+    up_runs          bigint,
+    down_runs        bigint,
+    availability_pct numeric
+)
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT
+        c.id   AS check_id,
+        c.name AS check_name,
+        c.kind AS kind,
+        p_from AS window_from,
+        p_to   AS window_to,
+        count(*) FILTER (WHERE r.status IN ('pass', 'warn', 'fail', 'error')) AS completed_runs,
+        count(*) FILTER (WHERE r.status IN ('pass', 'warn'))                  AS up_runs,
+        count(*) FILTER (WHERE r.status IN ('fail', 'error'))                 AS down_runs,
+        round(
+            100.0 * count(*) FILTER (WHERE r.status IN ('pass', 'warn'))
+                  / nullif(count(*) FILTER (WHERE r.status IN ('pass', 'warn', 'fail', 'error')), 0),
+            4
+        ) AS availability_pct
+    FROM checks c
+    LEFT JOIN runs r
+           ON r.check_id   = c.id
+          AND r.started_at >= p_from
+          AND r.started_at <  p_to
+    -- MAINTENANCE-WINDOW EXCLUSION SLOT (later PR): add a
+    --   LEFT JOIN maintenance_windows mw ON mw.check_id = c.id
+    --        AND r.started_at <@ mw.during
+    -- and append "AND mw.id IS NULL" at the WHERE marker below. Additive, no rewrite.
+    WHERE true
+    GROUP BY c.id, c.name, c.kind
+$$;
+
+COMMENT ON FUNCTION sla_availability(timestamptz, timestamptz) IS
+    'Per-check availability over [p_from, p_to). up=(pass,warn) / completed=(pass,warn,fail,error); running excluded. On-demand, index-assisted.';
+
+CREATE OR REPLACE VIEW sla_availability_24h AS
+    SELECT * FROM sla_availability(now() - interval '24 hours', now());
+
+CREATE OR REPLACE VIEW sla_availability_7d AS
+    SELECT * FROM sla_availability(now() - interval '7 days', now());
+
+CREATE OR REPLACE VIEW sla_availability_30d AS
+    SELECT * FROM sla_availability(now() - interval '30 days', now());
+
+COMMIT;
