@@ -96,7 +96,12 @@ CREATE TABLE runs (
     -- For browser flows: the StepRecorder name of the step that threw. Lets a
     -- failed run show WHERE it died without re-running anything.
     failed_step    TEXT,
-    screenshot_url TEXT
+    screenshot_url TEXT,
+    -- For kind='ssl' runs: signed days relative to the cert's notAfter (+ = until
+    -- expiry, - = past expiry). NULL for non-ssl runs or when no cert was obtained.
+    -- (Mirrors db/migrations/0007_cert_days_remaining.sql.) error_message keeps the
+    -- human-readable cert line; this is the structured value for the API/dashboard.
+    cert_days_remaining INTEGER
 );
 
 -- Hot path: "latest N runs for this check, newest first" (status pages, the

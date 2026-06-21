@@ -40,6 +40,9 @@ interface Outcome {
   // Browser runs only: the captured Tier-1 metrics (for the perf-budget -> warn
   // comparison). null for HTTP runs (no browser, no metrics).
   metrics: RunMetrics | null;
+  // SSL runs only: signed days relative to cert notAfter (+ until / - past
+  // expiry). null for non-ssl runs and ssl runs with no cert obtained.
+  certDaysRemaining: number | null;
 }
 
 // A 'running' row older than this is assumed orphaned by a hard crash (the ACA
@@ -146,6 +149,7 @@ async function runOne(check: Check): Promise<void> {
       failedStep: null,
       screenshot: null,
       metrics: null,
+      certDaysRemaining: null,
     };
   }
 
@@ -170,7 +174,8 @@ async function runOne(check: Check): Promise<void> {
   await pool.query(
     `UPDATE runs
         SET status = $2, finished_at = now(), duration_ms = $3, http_status = $4,
-            error_message = $5, failed_step = $6, screenshot_url = $7
+            error_message = $5, failed_step = $6, screenshot_url = $7,
+            cert_days_remaining = $8
       WHERE id = $1`,
     [
       runId,
@@ -180,6 +185,7 @@ async function runOne(check: Check): Promise<void> {
       errorMessage,
       outcome.failedStep,
       screenshotUrl,
+      outcome.certDaysRemaining,
     ],
   );
 
@@ -209,13 +215,14 @@ async function executeHttp(check: Check): Promise<Outcome> {
     failedStep: null,
     screenshot: null,
     metrics: null,
+    certDaysRemaining: null,
   };
 }
 
 async function executeSsl(check: Check): Promise<Outcome> {
   const r = await runSslCheck(check);
-  // The cert status line (incl. days-remaining) is recorded in error_message for
-  // every ssl run so the dashboard can show "expires in N days" even on pass.
+  // error_message keeps the human-readable cert line; certDaysRemaining is the
+  // structured value (signed days) the API/dashboard read directly.
   return {
     status: r.verdict, // 'pass' | 'warn' | 'fail' | 'error' (warn = expiring soon)
     httpStatus: null,
@@ -224,6 +231,7 @@ async function executeSsl(check: Check): Promise<Outcome> {
     failedStep: null,
     screenshot: null,
     metrics: null,
+    certDaysRemaining: r.daysRemaining,
   };
 }
 
@@ -233,7 +241,7 @@ async function executeBrowser(check: Check, runId: number): Promise<Outcome> {
     return {
       status: 'error', httpStatus: null, durationMs: 0,
       error: 'browser check has no flow_name', failedStep: null,
-      screenshot: null, metrics: null,
+      screenshot: null, metrics: null, certDaysRemaining: null,
     };
   }
 
@@ -296,6 +304,7 @@ async function executeBrowser(check: Check, runId: number): Promise<Outcome> {
     failedStep,
     screenshot,
     metrics,
+    certDaysRemaining: null,
   };
 }
 
