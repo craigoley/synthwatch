@@ -69,8 +69,8 @@ constraints**:
 > **Update 2026-06-21 (taxonomy widened):** the runner widened `runs.status` from the
 > original `('pass','fail')` to **`('pass','warn','fail','error','running')`** and
 > `run_steps.status` to **`('pass','fail','error')`**. Re-verified directly against the live
-> CHECK constraints, and live data now contains `warn`/`error` rows. The original
-> "ONLY pass/fail" note below is superseded by this.
+> CHECK constraints, and live data now contains `warn`/`error` rows. This supersedes the
+> original `('pass','fail')`-only constraint (and the former `'fail'` default).
 
 **`runs.status` now permits `pass`, `warn`, `fail`, `error`, `running`** (the full intended
 taxonomy); **`run_steps.status` permits `pass`, `fail`, `error`** (steps have no
