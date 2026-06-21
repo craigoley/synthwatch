@@ -11,6 +11,7 @@
 // That wrapping is what makes the funnel telemetry structural — if a step
 // throws, run_steps records exactly where, and the run stops there.
 import type { Flow } from './index.js';
+import { expect } from '../errors.js';
 
 export const flow: Flow = async (rec) => {
   await rec.step('open homepage', async (page) => {
@@ -34,10 +35,10 @@ export const flow: Flow = async (rec) => {
   });
 
   await rec.step('assert results present', async (page) => {
-    // PLACEHOLDER selector — assert at least one result rendered.
+    // PLACEHOLDER selector — assert at least one result rendered. Use expect() so
+    // an empty result set is a clean 'fail' (an assertion miss), distinct from a
+    // selector timeout above which would be an 'error' (exception).
     const count = await page.locator('.search-results .result').count();
-    if (count === 0) {
-      throw new Error('no search results rendered');
-    }
+    expect(count > 0, 'no search results rendered');
   });
 };

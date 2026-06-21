@@ -66,10 +66,13 @@ CREATE TABLE checks (
 CREATE TABLE runs (
     id             BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     check_id       BIGINT      NOT NULL REFERENCES checks(id) ON DELETE CASCADE,
-    -- Inserted pessimistically as 'fail' before execution so that a crashed /
-    -- OOM-killed runner leaves an honest failure on the record, then flipped to
-    -- 'pass' on success.
-    status         TEXT        NOT NULL DEFAULT 'fail' CHECK (status IN ('pass', 'fail')),
+    -- Full run-status taxonomy (see db/migrations/0003_widen_status.sql):
+    --   pass | warn | fail | error | running.
+    -- Inserted as 'running' (in-flight) and updated to a terminal status on
+    -- finish; a stale 'running' (hard crash mid-run) is reaped to 'error' by the
+    -- runner. SLA excludes 'running'; warn counts as up; fail/error are down.
+    status         TEXT        NOT NULL DEFAULT 'running'
+                               CHECK (status IN ('pass', 'warn', 'fail', 'error', 'running')),
     started_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     finished_at    TIMESTAMPTZ,
     duration_ms    INTEGER,
@@ -94,7 +97,8 @@ CREATE TABLE run_steps (
     run_id         BIGINT      NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
     step_index     INTEGER     NOT NULL,
     name           TEXT        NOT NULL,
-    status         TEXT        NOT NULL CHECK (status IN ('pass', 'fail')),
+    -- pass | fail (a flow expectation) | error (an exception/timeout).
+    status         TEXT        NOT NULL CHECK (status IN ('pass', 'fail', 'error')),
     duration_ms    INTEGER     NOT NULL,
     error_message  TEXT,
     started_at     TIMESTAMPTZ NOT NULL DEFAULT now()
