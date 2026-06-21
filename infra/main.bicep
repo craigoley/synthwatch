@@ -284,8 +284,9 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
               name: 'AZURE_STORAGE_CONTAINER'
               value: artifactContainerName
             }
-            // Alert-channel vars (ALERT_EMAIL_TO, TEAMS_WEBHOOK_URL,
-            // XMATTERS_*) are added per deployment; absent => channel disabled.
+            // Alert-channel vars (TEAMS_WEBHOOK_URL, ACS_EMAIL_* / ALERT_EMAIL_*,
+            // ALERT_WEBHOOK_URL[/_AUTH_HEADER], DASHBOARD_URL) are added per
+            // deployment; absent => that channel is disabled.
           ]
         }
       ]

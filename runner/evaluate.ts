@@ -57,6 +57,7 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
         [open.id, run.id],
       );
       await dispatchAlerts({
+        checkId: check.id,
         checkName: check.name,
         severity: check.severity,
         status: 'resolved',
@@ -106,6 +107,7 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
   );
 
   await dispatchAlerts({
+    checkId: check.id,
     checkName: check.name,
     severity: check.severity,
     status: 'open',
