@@ -1,0 +1,68 @@
+name: Deploy runner to ACA Job
+
+# Build the runner image and roll it to the Azure Container Apps JOB on merge to
+# main. Authentication uses OIDC (federated credential) — no Azure secrets stored
+# in the repo; only the non-sensitive client/tenant/subscription IDs are repo vars.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'runner/**'
+      - '**/Dockerfile'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+
+# Never cancel a deploy mid-roll; serialize deploys to main instead.
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
+# Least privilege: id-token to mint the OIDC token for azure/login, read to checkout.
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Azure login (OIDC)
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build and push image (ACR)
+        uses: azure/cli@3c87847598b988e406a2c25e657114d760fd035c # v2.1.0
+        with:
+          azcliversion: latest
+          # Build context is runner/ (NOT repo root) because the Dockerfile's
+          # COPY paths are relative to the runner/ directory.
+          inlineScript: |
+            az acr build -r synthwatcholey0620 \
+              -t synthwatch-runner:${{ github.sha }} -t synthwatch-runner:latest \
+              -f runner/Dockerfile runner
+
+      - name: Roll the ACA Job to the new image
+        uses: azure/cli@3c87847598b988e406a2c25e657114d760fd035c # v2.1.0
+        with:
+          azcliversion: latest
+          # This is an ACA JOB, not a Container App — use `containerapp job update`,
+          # never `containerapp update`.
+          inlineScript: |
+            az containerapp job update -n synthwatch-runner-job -g synthwatch-rg \
+              --image synthwatcholey0620.azurecr.io/synthwatch-runner:${{ github.sha }}
+
+      - name: Write deployment summary
+        run: |
+          {
+            echo "### Runner deployed"
+            echo ""
+            echo "- **Commit SHA:** \`${{ github.sha }}\`"
+            echo "- **Image tag:** \`synthwatcholey0620.azurecr.io/synthwatch-runner:${{ github.sha }}\`"
+            echo "- **ACA Job:** \`synthwatch-runner-job\` (resource group \`synthwatch-rg\`)"
+          } >> "$GITHUB_STEP_SUMMARY"
