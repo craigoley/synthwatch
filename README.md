@@ -245,7 +245,9 @@ docker build -t synthwatcholey0620.azurecr.io/synthwatch-runner:0.1.0 ./runner
 docker push synthwatcholey0620.azurecr.io/synthwatch-runner:0.1.0
 
 # 1. Provision the runner footprint (PostgreSQL, Storage, Log Analytics, ACA
-#    environment + scheduled Job).
+#    environment + scheduled Jobs). The Bicep param defaults match the LIVE stack
+#    (-e2 naming, eastus2), so this is additive — it reuses existing resources
+#    rather than building a duplicate stack.
 az deployment group create \
   --resource-group synthwatch-rg \
   --name synthwatch-infra \
@@ -272,6 +274,26 @@ psql "$DATABASE_URL" -f db/seed.sql
 # 4. Smoke-test: fire one Job execution now instead of waiting for the cron tick.
 az containerapp job start -g synthwatch-rg -n synthwatch-runner-job
 ```
+
+> **Re-running against the live stack (additive).** The Bicep param defaults are
+> pinned to the live deployment's values (`-e2` names, `eastus2`), so re-running
+> the command above only re-asserts the existing resources — it does **not** build
+> a duplicate stack. One caveat: CD rolls the runner/migrate jobs to `:<git-sha>`
+> images, so re-running with the default `runnerImage` (`:0.1.0`) would revert the
+> runner image. To stay fully additive, pass the **current** image:
+>
+> ```bash
+> RUNNER_IMG=$(az containerapp job show -n synthwatch-runner-job -g synthwatch-rg \
+>               --query "properties.template.containers[0].image" -o tsv)
+> az deployment group create -g synthwatch-rg --name synthwatch-infra \
+>   --template-file infra/main.bicep \
+>   --parameters postgresAdminPassword='<password>' runnerImage="$RUNNER_IMG"
+> ```
+>
+> A `what-if` on this then shows **0 to create, 0 to delete** (the only deltas are
+> cosmetic `reference()` re-evaluations that resolve to identical values). If you
+> ever see resources being *created*, the defaults have drifted from the live
+> stack again — stop and reconcile before applying.
 
 > To run `psql` from your workstation you must also allow your client IP on the
 > Postgres server (Portal → the server → *Networking*), or run these steps from
