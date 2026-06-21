@@ -37,7 +37,7 @@ runner/
   httpCheck.ts            Cheap HTTP tier (plain fetch, no browser)
   stepRecorder.ts         Mandatory funnel instrumentation
   evaluate.ts             Debounced incident open/resolve
-  alerts.ts               Email (ACS) / Teams / generic webhook — env-driven
+  alerts.ts               Email (ACS) / generic webhook — env-driven
   artifacts.ts            Failure screenshot -> Azure Blob (no-op if unconfigured)
   checks/
     index.ts              Dynamic flow loader (validates flow name)
@@ -141,13 +141,17 @@ and launches fail. **Bump both together, never one alone.**
 
 ## Decision 6 — Alerting is 100% env-config driven (this repo is public OSS)
 
-Three pluggable channels ship in `alerts.ts`:
+Two vendor-neutral channels ship in `alerts.ts`:
 
 | Channel | Env vars | Disabled when… |
 | --- | --- | --- |
 | Email (Azure Communication Services) | `ACS_EMAIL_CONNECTION_STRING`, `ALERT_EMAIL_FROM`, `ALERT_EMAIL_TO` | any unset |
-| Microsoft Teams | `TEAMS_WEBHOOK_URL` | unset |
-| Generic webhook (xMatters / PagerDuty / Slack) | `ALERT_WEBHOOK_URL` (+ optional `ALERT_WEBHOOK_AUTH_HEADER`) | unset |
+| Generic webhook (PagerDuty / Slack / any HTTP endpoint) | `ALERT_WEBHOOK_URL` (+ optional `ALERT_WEBHOOK_AUTH_HEADER`) | unset |
+
+Vendor-specific channels are intentionally kept out of this open-source engine.
+Wire one either (1) via the generic webhook — point `ALERT_WEBHOOK_URL` at the
+vendor's inbound endpoint — or (2) in a fork, by implementing the `AlertChannel`
+interface in `runner/alerts.ts` and adding it to `CHANNELS`.
 
 An absent env var means that channel is **disabled** — no errors, it simply
 doesn't fire. There is **nothing tenant-specific in source**: no addresses, URLs,
@@ -300,7 +304,7 @@ az containerapp job start -g synthwatch-rg -n synthwatch-runner-job
 > **Azure Cloud Shell**. The Bicep opens the firewall to *Azure services* (so the
 > Job can connect) but not to arbitrary public IPs.
 
-> Alert channels (`ALERT_EMAIL_TO`, `TEAMS_WEBHOOK_URL`, `ALERT_WEBHOOK_*`) are added
+> Alert channels (`ACS_EMAIL_*` / `ALERT_EMAIL_*`, `ALERT_WEBHOOK_*`) are added
 > as Job env vars per deployment; an absent channel is simply disabled. The Bicep
 > intentionally hardcodes none.
 

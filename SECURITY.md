@@ -2,7 +2,7 @@
 
 SynthWatch is a **security-adjacent tool**: it drives real browser automation
 (Chromium via Playwright) and holds credentials for its database and alerting
-channels (Azure Communication Services, Teams, xMatters, Azure Blob). Please
+channels (Azure Communication Services, generic webhook, Azure Blob). Please
 treat vulnerabilities here accordingly.
 
 ## Reporting a vulnerability

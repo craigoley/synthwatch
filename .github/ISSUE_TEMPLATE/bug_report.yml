@@ -36,7 +36,7 @@ body:
         - Runner (HTTP tier)
         - Runner (browser tier / Playwright)
         - Database schema / migration
-        - Alerting (email / Teams / xMatters)
+        - Alerting (email / generic webhook)
         - CI / workflows
         - Other
     validations:
