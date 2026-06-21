@@ -38,6 +38,12 @@ export interface Check {
   perf_budget_transfer_bytes: number | null;
   // For kind='ssl': days-until-expiry threshold for the warn window (default 30).
   cert_expiry_warn_days: number;
+  // Alert routing: the profile this check uses (null => the 'default' profile).
+  alert_profile_id: number | null;
+  // Warn-notify debounce: when we last sent a warn notification + the min
+  // re-notify interval (so a persistent warn doesn't notify every tick).
+  last_warn_notified_at: Date | null;
+  warn_renotify_seconds: number;
 }
 
 /** A row from the `runs` table after we've finished executing a check. */
@@ -45,6 +51,9 @@ export interface RunRecord {
   id: number;
   check_id: number;
   status: TerminalStatus;
+  /** The terminal run's message — failure reason, or the warn reason (e.g. the
+   *  cert-expiry line). Carried into alert summaries. */
+  error_message: string | null;
   failed_step: string | null;
   screenshot_url: string | null;
 }

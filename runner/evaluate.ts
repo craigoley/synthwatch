@@ -43,6 +43,43 @@ export function perfBudgetBreach(check: Check, m: RunMetrics): string | null {
   return breaches.length > 0 ? `perf budget breached: ${breaches.join('; ')}` : null;
 }
 
+// A profile rule: route an alert class to a channel set. Missing fields are
+// treated as wildcards; channels not also CONFIGURED are silently skipped.
+interface AlertRule {
+  severity?: 'critical' | 'warning' | 'any';
+  status?: 'fail' | 'error' | 'warn' | 'resolved' | 'any';
+  channels?: string[];
+}
+
+/** The class an alert routes by — distinct from the message verb (open/resolved/warn). */
+type RouteStatus = 'fail' | 'error' | 'warn' | 'resolved';
+
+/**
+ * Resolve which channels should fire for (check.severity, routeStatus) from the
+ * check's alert profile (or the 'default' profile when unassigned). Returns the
+ * unioned channel names, an EMPTY array if the profile matches no rule (route
+ * nothing), or `undefined` if no profile exists at all (=> legacy: all channels).
+ */
+async function profileChannels(
+  check: Check,
+  routeStatus: RouteStatus,
+): Promise<string[] | undefined> {
+  const { rows } = await pool.query<{ rules: AlertRule[] | null }>(
+    `SELECT rules FROM alert_profiles
+      WHERE id = COALESCE($1, (SELECT id FROM alert_profiles WHERE name = 'default'))`,
+    [check.alert_profile_id],
+  );
+  if (rows.length === 0) return undefined; // no assigned + no 'default' -> legacy all
+  const rules = Array.isArray(rows[0].rules) ? rows[0].rules : [];
+  const channels = new Set<string>();
+  for (const r of rules) {
+    const sevOk = !r.severity || r.severity === 'any' || r.severity === check.severity;
+    const stOk = !r.status || r.status === 'any' || r.status === routeStatus;
+    if (sevOk && stOk) for (const ch of r.channels ?? []) channels.add(ch);
+  }
+  return [...channels];
+}
+
 export async function evaluate(check: Check, run: RunRecord): Promise<void> {
   const open = await getOpenIncident(check.id);
 
@@ -56,15 +93,32 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
           WHERE id = $1`,
         [open.id, run.id],
       );
-      await dispatchAlerts({
-        checkId: check.id,
-        checkName: check.name,
-        severity: check.severity,
-        status: 'resolved',
-        summary: `Check "${check.name}" recovered.`,
-        runId: run.id,
-      });
+      await dispatchAlerts(
+        {
+          checkId: check.id,
+          checkName: check.name,
+          severity: check.severity,
+          status: 'resolved',
+          summary: `Check "${check.name}" recovered.`,
+          runId: run.id,
+        },
+        await profileChannels(check, 'resolved'),
+      );
     }
+
+    if (run.status === 'pass') {
+      // Clear the warn debounce so a fresh degradation re-notifies immediately.
+      await pool.query(
+        `UPDATE checks SET last_warn_notified_at = NULL
+          WHERE id = $1 AND last_warn_notified_at IS NOT NULL`,
+        [check.id],
+      );
+      return;
+    }
+
+    // warn: NOTIFY without opening an incident (SLA unaffected). Debounced, and
+    // suppressed in a maintenance window.
+    await maybeNotifyWarn(check, run);
     return;
   }
 
@@ -106,16 +160,67 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
     [check.id, check.severity, run.id, consecutive, summary],
   );
 
-  await dispatchAlerts({
-    checkId: check.id,
-    checkName: check.name,
-    severity: check.severity,
-    status: 'open',
-    summary,
-    runId: run.id,
-    failedStep: run.failed_step,
-    screenshotUrl: run.screenshot_url,
-  });
+  // Route by the actual down status (fail|error) so a profile can split them.
+  await dispatchAlerts(
+    {
+      checkId: check.id,
+      checkName: check.name,
+      severity: check.severity,
+      status: 'open',
+      summary,
+      runId: run.id,
+      failedStep: run.failed_step,
+      screenshotUrl: run.screenshot_url,
+    },
+    await profileChannels(check, run.status),
+  );
+}
+
+/**
+ * Warn notification path — the feature that makes 'warn' (e.g. an expiring cert)
+ * actually notify without being "down". No incident is opened (SLA unaffected).
+ * Suppressed inside a maintenance window, and DEBOUNCED: notify at most once per
+ * check.warn_renotify_seconds (reset to "first warn" on a pass), so a persistent
+ * warn doesn't notify every tick.
+ */
+async function maybeNotifyWarn(check: Check, run: RunRecord): Promise<void> {
+  if (await inMaintenanceWindow(check.id)) {
+    console.log(
+      `[runner] check ${check.id} "${check.name}" warn — notification suppressed (maintenance window)`,
+    );
+    return;
+  }
+
+  const { rows } = await pool.query<{ due: boolean }>(
+    `SELECT (last_warn_notified_at IS NULL
+             OR now() - last_warn_notified_at >= make_interval(secs => warn_renotify_seconds)) AS due
+       FROM checks WHERE id = $1`,
+    [check.id],
+  );
+  if (!rows[0]?.due) {
+    console.log(`[runner] check ${check.id} "${check.name}" warn — notification debounced`);
+    return;
+  }
+
+  await dispatchAlerts(
+    {
+      checkId: check.id,
+      checkName: check.name,
+      severity: check.severity,
+      status: 'warn',
+      summary: `Check "${check.name}" warning: ${run.error_message ?? 'degraded'}`,
+      runId: run.id,
+      failedStep: run.failed_step,
+      screenshotUrl: run.screenshot_url,
+    },
+    await profileChannels(check, 'warn'),
+  );
+
+  // Record the attempt (caps the notify rate even if a channel was unconfigured).
+  await pool.query(
+    `UPDATE checks SET last_warn_notified_at = now() WHERE id = $1`,
+    [check.id],
+  );
 }
 
 /**
