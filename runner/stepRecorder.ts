@@ -3,12 +3,13 @@
 // Every meaningful action in a browser flow MUST go through `step()`. The
 // Playwright Page is held privately and is ONLY handed to the callback inside
 // step(), so there is no way to drive the browser without being timed and
-// recorded. Each step writes a `run_steps` row (pass or fail) BEFORE control
-// returns; on failure it records the row, remembers the failed step name, and
+// recorded. Each step writes a `run_steps` row (pass / fail / error) BEFORE
+// control returns; on failure it records the row, remembers the failed step name, and
 // rethrows so the flow stops exactly where it broke. The result: a failed run
 // shows which step it died at without re-running anything.
 import type { Page } from 'playwright';
 import { pool } from './db.js';
+import { isExpectationError } from './errors.js';
 
 export class StepRecorder {
   private stepIndex = 0;
@@ -38,7 +39,10 @@ export class StepRecorder {
       return result;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      await this.record(index, name, 'fail', Date.now() - start, message);
+      // A thrown ExpectationError is a clean assertion miss ('fail'); anything
+      // else (Playwright timeout, navigation crash) is an exception ('error').
+      const status = isExpectationError(err) ? 'fail' : 'error';
+      await this.record(index, name, status, Date.now() - start, message);
       this.failedStep = name;
       throw err;
     }
@@ -47,7 +51,7 @@ export class StepRecorder {
   private async record(
     index: number,
     name: string,
-    status: 'pass' | 'fail',
+    status: 'pass' | 'fail' | 'error',
     durationMs: number,
     errorMessage: string | null,
   ): Promise<void> {

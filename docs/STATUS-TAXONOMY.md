@@ -1,5 +1,13 @@
 # Status taxonomy — recon findings
 
+> **UPDATE (implemented):** the 5-status taxonomy and the features below are now
+> live — `runs.status` widened to `pass|warn|fail|error|running` (migration
+> `0003_widen_status.sql`), perf budgets wired to `warn`, exceptions classified as
+> `error`, `running` written on insert, and the `countConsecutiveFailures` →
+> `countConsecutiveDown` (`fail`+`error`) fix applied. This document is retained as
+> the original recon record; the "Recommendation (FUTURE PR)" section below is what
+> got built.
+
 > **Read-only investigation.** No schema, constraint, or logic was changed in the
 > PR that introduced this doc. This records what the runner *actually does* with
 > `runs.status` today, versus the 5-status taxonomy (`pass | warn | fail | error |

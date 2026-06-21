@@ -1,21 +1,54 @@
-// Incident evaluation: turn a stream of pass/fail runs into debounced incidents.
+// Incident evaluation: turn a stream of runs into debounced incidents, and the
+// perf-budget comparison that turns a passing browser run into a 'warn'.
 //
-// Debounce rule: open an incident only after `failure_threshold` CONSECUTIVE
-// failures, so a single blip doesn't page anyone. Resolve on the FIRST pass.
-// Because each check is claimed by exactly one replica per tick (see index.ts),
-// there is no cross-replica race here — the DB's partial unique index
-// (one_open_incident_per_check) is a belt-and-braces backstop.
+// Availability partition (matches the SLA view): "up" = pass | warn (reachable,
+// possibly degraded); "down" = fail | error. Incidents track DOWN: open after
+// `failure_threshold` CONSECUTIVE down runs (so a single blip doesn't page),
+// resolve on the first UP run. Because each check is claimed by exactly one
+// replica per tick (see index.ts) there is no cross-replica race — the DB's
+// partial unique index (one_open_incident_per_check) is a belt-and-braces backstop.
 import { pool, type Check, type RunRecord } from './db.js';
+import type { RunMetrics } from './metrics.js';
 import { dispatchAlerts } from './alerts.js';
 
 interface OpenIncident {
   id: number;
 }
 
+/**
+ * Compare a browser run's captured Tier-1 metrics against the check's perf
+ * budgets. Returns a human description of the breach(es), or null if all budgets
+ * are met (or unset, or the metric wasn't captured). This is what makes the
+ * perf_budget_* columns non-inert: a breach downgrades an otherwise-passing run
+ * to 'warn' (see index.ts).
+ */
+export function perfBudgetBreach(check: Check, m: RunMetrics): string | null {
+  const breaches: string[] = [];
+  if (
+    check.perf_budget_lcp_ms != null &&
+    m.lcpMs != null &&
+    m.lcpMs > check.perf_budget_lcp_ms
+  ) {
+    breaches.push(`LCP ${m.lcpMs}ms > budget ${check.perf_budget_lcp_ms}ms`);
+  }
+  if (
+    check.perf_budget_transfer_bytes != null &&
+    m.transferBytes != null &&
+    m.transferBytes > check.perf_budget_transfer_bytes
+  ) {
+    breaches.push(
+      `transfer ${m.transferBytes}B > budget ${check.perf_budget_transfer_bytes}B`,
+    );
+  }
+  return breaches.length > 0 ? `perf budget breached: ${breaches.join('; ')}` : null;
+}
+
 export async function evaluate(check: Check, run: RunRecord): Promise<void> {
   const open = await getOpenIncident(check.id);
 
-  if (run.status === 'pass') {
+  // "up" = reachable (pass or degraded-but-available warn). An up run clears any
+  // open availability incident.
+  if (run.status === 'pass' || run.status === 'warn') {
     if (open) {
       await pool.query(
         `UPDATE incidents
@@ -34,8 +67,8 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
     return;
   }
 
-  // run failed -> count consecutive trailing failures (most recent first).
-  const consecutive = await countConsecutiveFailures(check.id, check.failure_threshold);
+  // run is DOWN (fail or error) -> count consecutive trailing down runs.
+  const consecutive = await countConsecutiveDown(check.id, check.failure_threshold);
   if (consecutive < check.failure_threshold) {
     return; // still within the debounce window
   }
@@ -50,7 +83,7 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
   }
 
   const summary =
-    `Check "${check.name}" failed ${consecutive} consecutive times` +
+    `Check "${check.name}" down (${run.status}) ${consecutive} consecutive times` +
     (run.failed_step ? ` (died at step: ${run.failed_step})` : '') + '.';
 
   await pool.query(
@@ -79,10 +112,10 @@ async function getOpenIncident(checkId: number): Promise<OpenIncident | null> {
   return rows[0] ?? null;
 }
 
-async function countConsecutiveFailures(checkId: number, threshold: number): Promise<number> {
+async function countConsecutiveDown(checkId: number, threshold: number): Promise<number> {
   // We only need to look back as far as the threshold to make the open/skip
-  // decision: if the most recent `threshold` runs are all failures, that's enough.
-  const { rows } = await pool.query<{ status: 'pass' | 'fail' }>(
+  // decision: if the most recent `threshold` runs are all DOWN, that's enough.
+  const { rows } = await pool.query<{ status: 'pass' | 'warn' | 'fail' | 'error' | 'running' }>(
     `SELECT status FROM runs
       WHERE check_id = $1
       ORDER BY started_at DESC
@@ -91,7 +124,10 @@ async function countConsecutiveFailures(checkId: number, threshold: number): Pro
   );
   let count = 0;
   for (const row of rows) {
-    if (row.status === 'fail') count++;
+    // DOWN = fail OR error. Counting only 'fail' (the old behaviour) meant an
+    // all-'error' streak NEVER opened an incident — a silent alerting hole.
+    // pass/warn (up) and running (in-flight, not a result) break the streak.
+    if (row.status === 'fail' || row.status === 'error') count++;
     else break;
   }
   return count;

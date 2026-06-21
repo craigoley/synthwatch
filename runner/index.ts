@@ -12,22 +12,40 @@
 // The process exits 0 even when checks fail — a failing check is data, not a Job
 // failure. It exits 1 only on infrastructure errors (e.g. DB unreachable).
 import { chromium, type Browser } from 'playwright';
-import { pool, type Check, type RunRecord } from './db.js';
+import { pool, type Check, type RunRecord, type TerminalStatus } from './db.js';
 import { runHttpCheck } from './httpCheck.js';
 import { StepRecorder } from './stepRecorder.js';
 import { loadFlow } from './checks/index.js';
 import { uploadScreenshot } from './artifacts.js';
-import { evaluate } from './evaluate.js';
-import { startMetricsCapture, writeRunMetrics, EMPTY_METRICS } from './metrics.js';
+import { evaluate, perfBudgetBreach } from './evaluate.js';
+import {
+  startMetricsCapture,
+  writeRunMetrics,
+  EMPTY_METRICS,
+  type RunMetrics,
+} from './metrics.js';
+import { isExpectationError } from './errors.js';
 
+// A run's terminal outcome. `status` is the real taxonomy, not a boolean:
+//   pass / fail / error come from execution; `warn` is derived later in runOne
+//   by comparing `metrics` against the check's perf budgets.
 interface Outcome {
-  ok: boolean;
+  status: TerminalStatus;
   httpStatus: number | null;
   durationMs: number;
   error: string | null;
   failedStep: string | null;
   screenshot: Buffer | null;
+  // Browser runs only: the captured Tier-1 metrics (for the perf-budget -> warn
+  // comparison). null for HTTP runs (no browser, no metrics).
+  metrics: RunMetrics | null;
 }
+
+// A 'running' row older than this is assumed orphaned by a hard crash (the ACA
+// replicaTimeout is 240s, so 30 min is comfortably beyond any real run) and is
+// reaped to 'error' so the failure is visible to SLA/incidents rather than
+// lingering as in-flight forever.
+const STALE_RUNNING = "30 minutes";
 
 // Lazily-launched shared browser, reused across all browser checks in this tick.
 let browser: Browser | null = null;
@@ -37,6 +55,8 @@ async function getBrowser(): Promise<Browser> {
 }
 
 async function main(): Promise<void> {
+  await reapStaleRunning();
+
   const due = await findDueChecks();
   console.log(`[runner] ${due.length} check(s) due`);
 
@@ -47,6 +67,26 @@ async function main(): Promise<void> {
       continue;
     }
     await runOne(check);
+  }
+}
+
+/**
+ * Reap orphaned 'running' rows. Inserting 'running' on start (so the SLA
+ * "exclude running" clause is real) means a hard crash mid-run would otherwise
+ * leave a row stuck in-flight forever. Anything still 'running' well past the
+ * replica timeout never finalized -> mark it 'error' so it surfaces as down.
+ */
+async function reapStaleRunning(): Promise<void> {
+  const { rowCount } = await pool.query(
+    `UPDATE runs
+        SET status = 'error', finished_at = now(),
+            error_message = COALESCE(error_message, 'runner did not finalize (stale running)')
+      WHERE status = 'running'
+        AND started_at < now() - make_interval(mins => $1::int)`,
+    [30],
+  );
+  if (rowCount && rowCount > 0) {
+    console.log(`[runner] reaped ${rowCount} stale running run(s) -> error (older than ${STALE_RUNNING})`);
   }
 }
 
@@ -81,10 +121,11 @@ async function claim(id: number): Promise<Check | null> {
 }
 
 async function runOne(check: Check): Promise<void> {
-  // Insert the run row up front (pessimistically 'fail') so the StepRecorder has
-  // a run_id to attach steps to, and a crash leaves an honest failure behind.
+  // Insert the run row as 'running' (in-flight) so the StepRecorder has a run_id
+  // to attach steps to, and the SLA "exclude running" clause has real data. A
+  // hard crash before the terminal update is reaped to 'error' (see main()).
   const { rows } = await pool.query<{ id: number }>(
-    `INSERT INTO runs (check_id, started_at, status) VALUES ($1, now(), 'fail') RETURNING id`,
+    `INSERT INTO runs (check_id, started_at, status) VALUES ($1, now(), 'running') RETURNING id`,
     [check.id],
   );
   const runId = rows[0].id;
@@ -96,19 +137,33 @@ async function runOne(check: Check): Promise<void> {
         ? await executeHttp(check)
         : await executeBrowser(check, runId);
   } catch (err) {
-    // Unexpected runner error (e.g. flow loader threw). Record as a failure.
+    // Unexpected runner error (e.g. flow loader threw) -> 'error', not 'fail'.
     outcome = {
-      ok: false,
+      status: 'error',
       httpStatus: null,
       durationMs: 0,
       error: err instanceof Error ? err.message : String(err),
       failedStep: null,
       screenshot: null,
+      metrics: null,
     };
   }
 
+  // Derive 'warn': a run that otherwise PASSED but breached a perf budget is
+  // degraded-but-available. Only browser runs have metrics to compare. This is
+  // what makes the perf_budget_* columns non-inert.
+  let status: TerminalStatus = outcome.status;
+  let errorMessage = outcome.error;
+  if (status === 'pass' && outcome.metrics) {
+    const breach = perfBudgetBreach(check, outcome.metrics);
+    if (breach) {
+      status = 'warn';
+      errorMessage = breach; // record WHY it warned
+    }
+  }
+
   let screenshotUrl: string | null = null;
-  if (!outcome.ok && outcome.screenshot) {
+  if ((status === 'fail' || status === 'error') && outcome.screenshot) {
     screenshotUrl = await uploadScreenshot(runId, outcome.screenshot);
   }
 
@@ -119,10 +174,10 @@ async function runOne(check: Check): Promise<void> {
       WHERE id = $1`,
     [
       runId,
-      outcome.ok ? 'pass' : 'fail',
+      status,
       outcome.durationMs,
       outcome.httpStatus,
-      outcome.error,
+      errorMessage,
       outcome.failedStep,
       screenshotUrl,
     ],
@@ -131,27 +186,28 @@ async function runOne(check: Check): Promise<void> {
   const run: RunRecord = {
     id: runId,
     check_id: check.id,
-    status: outcome.ok ? 'pass' : 'fail',
+    status,
     failed_step: outcome.failedStep,
     screenshot_url: screenshotUrl,
   };
   await evaluate(check, run);
 
   console.log(
-    `[runner] check ${check.id} "${check.name}" -> ${run.status}` +
-      (outcome.error ? ` (${outcome.error})` : ''),
+    `[runner] check ${check.id} "${check.name}" -> ${status}` +
+      (errorMessage ? ` (${errorMessage})` : ''),
   );
 }
 
 async function executeHttp(check: Check): Promise<Outcome> {
   const r = await runHttpCheck(check);
   return {
-    ok: r.ok,
+    status: r.verdict, // 'pass' | 'fail' | 'error'
     httpStatus: r.httpStatus,
     durationMs: r.durationMs,
     error: r.error,
     failedStep: null,
     screenshot: null,
+    metrics: null,
   };
 }
 
@@ -159,8 +215,9 @@ async function executeBrowser(check: Check, runId: number): Promise<Outcome> {
   if (!check.flow_name) {
     // Schema enforces this, but TypeScript can't know that.
     return {
-      ok: false, httpStatus: null, durationMs: 0,
-      error: 'browser check has no flow_name', failedStep: null, screenshot: null,
+      status: 'error', httpStatus: null, durationMs: 0,
+      error: 'browser check has no flow_name', failedStep: null,
+      screenshot: null, metrics: null,
     };
   }
 
@@ -175,41 +232,55 @@ async function executeBrowser(check: Check, runId: number): Promise<Outcome> {
   // the whole page load; collected in the finally below.
   const capture = await startMetricsCapture(context, page);
 
+  // Decide the verdict in the try/catch, capture metrics in the finally, then
+  // assemble the Outcome after — so the perf-budget comparison upstream gets the
+  // real metrics even though they're collected during teardown.
+  let status: TerminalStatus;
+  let error: string | null = null;
+  let failedStep: string | null = null;
+  let screenshot: Buffer | null = null;
+  let metrics: RunMetrics;
+
   try {
     const rec = new StepRecorder(runId, page, check.target_url);
-    const flow = await loadFlow(check.flow_name);
     try {
+      const flow = await loadFlow(check.flow_name);
       await flow(rec);
-      return {
-        ok: true, httpStatus: null, durationMs: Date.now() - start,
-        error: null, failedStep: null, screenshot: null,
-      };
+      status = 'pass';
     } catch (err) {
-      const screenshot = await page.screenshot().catch(() => null);
-      return {
-        ok: false,
-        httpStatus: null,
-        durationMs: Date.now() - start,
-        error: err instanceof Error ? err.message : String(err),
-        failedStep: rec.failedStep,
-        screenshot,
-      };
+      // A flow ExpectationError is a clean assertion miss ('fail'); any other
+      // throw (Playwright timeout, navigation crash, loader error) is 'error'.
+      status = isExpectationError(err) ? 'fail' : 'error';
+      error = err instanceof Error ? err.message : String(err);
+      failedStep = rec.failedStep;
+      screenshot = await page.screenshot().catch(() => null);
     }
   } finally {
-    // Persist one run_metrics row (pass OR fail) before tearing down the
-    // context. Telemetry must never affect the verdict — swallow everything and
-    // fall back to an all-null row if capture or the write itself throws.
+    // Persist one run_metrics row (any outcome) before tearing down the context.
+    // Telemetry must never affect the verdict — swallow everything and fall back
+    // to an all-null row if capture or the write itself throws.
     try {
-      const metrics = await capture.collect();
+      metrics = await capture.collect();
       await writeRunMetrics(runId, metrics);
     } catch (err) {
       console.warn(`[metrics] run ${runId} telemetry capture failed:`, err);
+      metrics = EMPTY_METRICS;
       await writeRunMetrics(runId, EMPTY_METRICS).catch((e) =>
         console.warn(`[metrics] run ${runId} telemetry write failed:`, e),
       );
     }
     await context.close();
   }
+
+  return {
+    status,
+    httpStatus: null,
+    durationMs: Date.now() - start,
+    error,
+    failedStep,
+    screenshot,
+    metrics,
+  };
 }
 
 main()
