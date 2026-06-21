@@ -161,6 +161,25 @@ CREATE UNIQUE INDEX one_open_incident_per_check
     WHERE status = 'open';
 
 -- ---------------------------------------------------------------------------
+-- maintenance_windows: planned downtime (mirrors db/migrations/0004). A window
+-- both SUPPRESSES incident alerting (evaluate.ts) and EXCLUDES the period from
+-- availability math (sla_availability). check_id NULL = fleet-wide (all checks);
+-- a non-NULL check_id scopes the window to one check.
+-- ---------------------------------------------------------------------------
+CREATE TABLE maintenance_windows (
+    id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    check_id   BIGINT      REFERENCES checks(id) ON DELETE CASCADE, -- NULL => fleet-wide
+    starts_at  TIMESTAMPTZ NOT NULL,
+    ends_at    TIMESTAMPTZ NOT NULL,
+    reason     TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT maintenance_windows_valid_range CHECK (ends_at > starts_at)
+);
+
+CREATE INDEX maintenance_windows_span_idx
+    ON maintenance_windows (starts_at, ends_at);
+
+-- ---------------------------------------------------------------------------
 -- schema_migrations: tracks which db/migrations/*.sql files have been applied
 -- (version = filename without ".sql"). Owned by the migration runner
 -- (db/migrate.sh), which also creates it IF NOT EXISTS.
@@ -235,11 +254,15 @@ AS $$
            ON r.check_id   = c.id
           AND r.started_at >= p_from
           AND r.started_at <  p_to
-    -- MAINTENANCE-WINDOW EXCLUSION SLOT (later PR): add a
-    --   LEFT JOIN maintenance_windows mw ON mw.check_id = c.id
-    --        AND r.started_at <@ mw.during
-    -- and append "AND mw.id IS NULL" at the WHERE marker below. Additive, no rewrite.
-    WHERE true
+    -- MAINTENANCE-WINDOW EXCLUSION (additive anti-join, mirrors 0004): drop runs
+    -- that fall inside an active window for this check (check_id = c.id) OR a
+    -- fleet-wide window (check_id IS NULL). Uncovered runs keep mw.id NULL and
+    -- survive; checks with no runs keep their single null-run row.
+    LEFT JOIN maintenance_windows mw
+           ON (mw.check_id = c.id OR mw.check_id IS NULL)
+          AND r.started_at >= mw.starts_at
+          AND r.started_at <  mw.ends_at
+    WHERE mw.id IS NULL
     GROUP BY c.id, c.name, c.kind
 $$;
 

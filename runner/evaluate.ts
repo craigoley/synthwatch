@@ -82,6 +82,18 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
     return;
   }
 
+  // We're about to OPEN a new incident (and page). Suppress it if we're inside an
+  // active maintenance window — planned downtime should not page. The run + its
+  // status are already recorded (index.ts wrote them); suppression only skips the
+  // incident open + alert, it does NOT hide the data.
+  if (await inMaintenanceWindow(check.id)) {
+    console.log(
+      `[runner] check ${check.id} "${check.name}" down (${run.status}) but ` +
+        `incident suppressed — active maintenance window`,
+    );
+    return;
+  }
+
   const summary =
     `Check "${check.name}" down (${run.status}) ${consecutive} consecutive times` +
     (run.failed_step ? ` (died at step: ${run.failed_step})` : '') + '.';
@@ -102,6 +114,24 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
     failedStep: run.failed_step,
     screenshotUrl: run.screenshot_url,
   });
+}
+
+/**
+ * Is NOW inside an active maintenance window for this check? A check-specific
+ * window (check_id = the check) OR a fleet-wide window (check_id IS NULL) both
+ * suppress — either is sufficient. Uses now() (the alerting decision happens now);
+ * the SLA exclusion separately uses each run's started_at.
+ */
+async function inMaintenanceWindow(checkId: number): Promise<boolean> {
+  const { rows } = await pool.query(
+    `SELECT 1 FROM maintenance_windows
+      WHERE (check_id = $1 OR check_id IS NULL)
+        AND now() >= starts_at
+        AND now() <  ends_at
+      LIMIT 1`,
+    [checkId],
+  );
+  return rows.length > 0;
 }
 
 async function getOpenIncident(checkId: number): Promise<OpenIncident | null> {
