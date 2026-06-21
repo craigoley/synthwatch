@@ -29,6 +29,9 @@ param acrName string = 'synthwatcholey0620'
 @description('Runner image to deploy. Bump the tag when you push a new runner build.')
 param runnerImage string = 'synthwatcholey0620.azurecr.io/synthwatch-runner:0.1.0'
 
+@description('Migration image (applies db/migrations). Bump the tag per migration build.')
+param migrateImage string = 'synthwatcholey0620.azurecr.io/synthwatch-migrate:0.1.0'
+
 @description('PostgreSQL administrator login.')
 param postgresAdminLogin string = 'synthadmin'
 
@@ -52,6 +55,9 @@ param managedEnvironmentName string = 'synthwatch-env'
 
 @description('Container Apps Job name.')
 param jobName string = 'synthwatch-runner-job'
+
+@description('One-off Container Apps Job that applies DB migrations (started by CD).')
+param migrateJobName string = 'synthwatch-migrate-job'
 
 @description('User-assigned managed identity name (used for ACR pull).')
 param identityName string = 'synthwatch-runner-id'
@@ -276,8 +282,74 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
 }
 
 // ---------------------------------------------------------------------------
+// Container Apps JOB — one-off DB migrations. Manual trigger; CD (deploy.yml)
+// rolls its image, starts it, and waits for success BEFORE rolling the runner.
+// It runs db/migrate.sh from INSIDE Azure, so it is covered by the
+// AllowAllAzureServices Postgres firewall rule — no firewall hole for GitHub
+// runners. It reuses the SAME `database-url` secret as the runner job, so the DB
+// password never leaves Azure (GitHub never sees it).
+// ---------------------------------------------------------------------------
+resource migrateJob 'Microsoft.App/jobs@2024-03-01' = {
+  name: migrateJobName
+  location: location
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${identity.id}': {}
+    }
+  }
+  properties: {
+    environmentId: managedEnvironment.id
+    configuration: {
+      triggerType: 'Manual'
+      replicaTimeout: 600
+      replicaRetryLimit: 0
+      manualTriggerConfig: {
+        parallelism: 1
+        replicaCompletionCount: 1
+      }
+      registries: [
+        {
+          server: acr.properties.loginServer
+          identity: identity.id
+        }
+      ]
+      secrets: [
+        {
+          // Same value/shape as the runner job's database-url secret.
+          name: 'database-url'
+          value: 'postgresql://${postgresAdminLogin}:${postgresAdminPassword}@${postgres.properties.fullyQualifiedDomainName}:5432/synthwatch?sslmode=require'
+        }
+      ]
+    }
+    template: {
+      containers: [
+        {
+          name: 'migrate'
+          image: migrateImage
+          resources: {
+            cpu: json('0.25')
+            memory: '0.5Gi'
+          }
+          env: [
+            {
+              name: 'DATABASE_URL'
+              secretRef: 'database-url'
+            }
+          ]
+        }
+      ]
+    }
+  }
+  dependsOn: [
+    acrPull
+  ]
+}
+
+// ---------------------------------------------------------------------------
 // Outputs
 // ---------------------------------------------------------------------------
 output postgresFqdn string = postgres.properties.fullyQualifiedDomainName
 output storageAccountName string = storage.name
 output jobName string = job.name
+output migrateJobName string = migrateJob.name

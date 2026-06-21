@@ -8,6 +8,7 @@ on:
     branches: [main]
     paths:
       - 'runner/**'
+      - 'db/**'
       - '**/Dockerfile'
       - '.github/workflows/deploy.yml'
   workflow_dispatch:
@@ -36,7 +37,7 @@ jobs:
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Build and push image (ACR)
+      - name: Build and push runner image (ACR)
         uses: azure/cli@3c87847598b988e406a2c25e657114d760fd035c # v2.1.0
         with:
           azcliversion: latest
@@ -46,6 +47,55 @@ jobs:
             az acr build -r synthwatcholey0620 \
               -t synthwatch-runner:${{ github.sha }} -t synthwatch-runner:latest \
               -f runner/Dockerfile runner
+
+      - name: Build and push migration image (ACR)
+        uses: azure/cli@3c87847598b988e406a2c25e657114d760fd035c # v2.1.0
+        with:
+          azcliversion: latest
+          # Build context is db/ — Dockerfile.migrate COPYs migrations/ and migrate.sh.
+          inlineScript: |
+            az acr build -r synthwatcholey0620 \
+              -t synthwatch-migrate:${{ github.sha }} -t synthwatch-migrate:latest \
+              -f db/Dockerfile.migrate db
+
+      # Apply DB migrations BEFORE rolling the new runner image, so the schema is
+      # ready when the new code runs. Runs INSIDE Azure (covered by the Postgres
+      # AllowAllAzureServices firewall rule) via the pre-provisioned
+      # synthwatch-migrate-job, which holds the DB creds in its own ACA secret —
+      # the password never reaches GitHub. If migrations fail, this step exits
+      # non-zero and the workflow stops here: the new image is NOT rolled.
+      - name: Apply DB migrations (ACA Job, inside Azure)
+        uses: azure/cli@3c87847598b988e406a2c25e657114d760fd035c # v2.1.0
+        with:
+          azcliversion: latest
+          inlineScript: |
+            set -euo pipefail
+            JOB=synthwatch-migrate-job
+            RG=synthwatch-rg
+            IMAGE=synthwatcholey0620.azurecr.io/synthwatch-migrate:${{ github.sha }}
+
+            # Point the migrate job at this commit's image.
+            az containerapp job update -n "$JOB" -g "$RG" --image "$IMAGE"
+
+            # Start a one-off execution and capture its name.
+            EXEC=$(az containerapp job start -n "$JOB" -g "$RG" --query name -o tsv)
+            echo "Started migration execution: $EXEC"
+
+            # Poll until the execution reaches a terminal state.
+            for _ in $(seq 1 60); do
+              STATUS=$(az containerapp job execution show -n "$JOB" -g "$RG" \
+                --job-execution-name "$EXEC" --query properties.status -o tsv)
+              echo "status: $STATUS"
+              case "$STATUS" in
+                Succeeded) echo "Migrations applied."; exit 0 ;;
+                Failed|Degraded|Cancelled)
+                  echo "::error::Migration job $EXEC ended: $STATUS — aborting deploy (image NOT rolled)."
+                  exit 1 ;;
+              esac
+              sleep 10
+            done
+            echo "::error::Migration job $EXEC did not finish within timeout — aborting deploy."
+            exit 1
 
       - name: Roll the ACA Job to the new image
         uses: azure/cli@3c87847598b988e406a2c25e657114d760fd035c # v2.1.0
@@ -63,6 +113,7 @@ jobs:
             echo "### Runner deployed"
             echo ""
             echo "- **Commit SHA:** \`${{ github.sha }}\`"
-            echo "- **Image tag:** \`synthwatcholey0620.azurecr.io/synthwatch-runner:${{ github.sha }}\`"
+            echo "- **Runner image:** \`synthwatcholey0620.azurecr.io/synthwatch-runner:${{ github.sha }}\`"
+            echo "- **Migrations:** applied via \`synthwatch-migrate-job\` before the roll"
             echo "- **ACA Job:** \`synthwatch-runner-job\` (resource group \`synthwatch-rg\`)"
           } >> "$GITHUB_STEP_SUMMARY"
