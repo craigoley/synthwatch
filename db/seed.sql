@@ -24,16 +24,20 @@ VALUES (
 -- ship alongside it: wegmans-homepage and wegmans-search (verified selectors) —
 -- point a check at those for full-funnel monitoring.
 INSERT INTO checks (name, kind, target_url, flow_name,
-                    interval_seconds, timeout_ms, failure_threshold, severity)
+                    interval_seconds, timeout_ms, failure_threshold, severity,
+                    perf_budget_lcp_ms)
 VALUES (
     'Wegmans homepage',
     'browser',
     'https://www.wegmans.com/',
     'homepage-load',
     1800,  -- every 30 minutes (browser checks are expensive)
-    45000,
+    20000, -- generous-but-meaningful: a real load is ~4-5s, so a genuine
+           -- slowdown trips well before this instead of riding a 45s ceiling.
     3,
-    'critical'
+    'critical',
+    4000   -- perf budget: LCP > 4s downgrades an otherwise-passing run to 'warn'
+           -- (real LCP is ~1.3-1.5s, so this flags genuine regressions).
 );
 
 COMMIT;
