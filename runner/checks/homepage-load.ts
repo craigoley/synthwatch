@@ -1,8 +1,9 @@
 // homepage-load — the simplest real browser check: load the page and assert it
-// rendered. Unlike homepage-search (a TEMPLATE with placeholder selectors), this
-// uses only assertions that hold for any real HTML page, so it actually passes —
-// which also makes it the natural target for perf budgets (a passing browser run
-// is what a perf-budget breach downgrades to 'warn').
+// rendered. Uses only assertions that hold for any real HTML page (non-empty
+// <title> and body text), so it actually passes on any live site — which also
+// makes it the natural target for perf budgets (a passing browser run is what a
+// perf-budget breach downgrades to 'warn'). For site-specific funnels with real
+// inspected selectors, see wegmans-homepage / wegmans-search.
 import type { Flow } from './index.js';
 import { expect } from '../errors.js';
 

@@ -18,16 +18,18 @@ VALUES (
     'critical'
 );
 
--- Real-browser check: runs the homepage-search flow (runner/checks/homepage-search.ts).
--- NOTE: that flow ships with PLACEHOLDER selectors — point target_url at a real
--- site and update the flow's selectors before trusting this check.
+-- Real-browser check: loads a real, rich page and asserts it rendered
+-- (runner/checks/homepage-load.ts — uses assertions that hold for any real HTML
+-- page, so it actually passes). Richer real flows that exercise search + nav
+-- ship alongside it: wegmans-homepage and wegmans-search (verified selectors) —
+-- point a check at those for full-funnel monitoring.
 INSERT INTO checks (name, kind, target_url, flow_name,
                     interval_seconds, timeout_ms, failure_threshold, severity)
 VALUES (
-    'homepage search funnel',
+    'Wegmans homepage',
     'browser',
-    'https://example.com/',
-    'homepage-search',
+    'https://www.wegmans.com/',
+    'homepage-load',
     1800,  -- every 30 minutes (browser checks are expensive)
     45000,
     3,
