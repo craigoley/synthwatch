@@ -60,23 +60,28 @@ constraints**:
 
 | Column | Live CHECK constraint | Permitted values |
 | --- | --- | --- |
-| `runs.status` | `runs_status_check` | **`pass`, `fail`** — and nothing else |
-| `run_steps.status` | `run_steps_status_check` | **`pass`, `fail`** — and nothing else |
+| `runs.status` | `runs_status_check` | **`pass`, `warn`, `fail`, `error`, `running`** |
+| `run_steps.status` | `run_steps_status_check` | **`pass`, `fail`, `error`** |
 | `incidents.status` | `incidents_status_check` | `open`, `resolved` |
 | `checks.kind` | `checks_kind_check` | `http`, `browser` |
 | `checks.severity` / `incidents.severity` | `*_severity_check` | `critical`, `warning` |
 
-**`runs.status` permits ONLY `pass` and `fail`.** The values **`warn`,
-`error`, and `running` are NOT permitted** by the live constraint — an insert
-with any of those would be rejected. The default is `'fail'` (rows are inserted
-pessimistically as `fail`, then flipped to `pass` on success).
+> **Update 2026-06-21 (taxonomy widened):** the runner widened `runs.status` from the
+> original `('pass','fail')` to **`('pass','warn','fail','error','running')`** and
+> `run_steps.status` to **`('pass','fail','error')`**. Re-verified directly against the live
+> CHECK constraints, and live data now contains `warn`/`error` rows. The original
+> "ONLY pass/fail" note below is superseded by this.
 
-> Implication for the SLA work: `sla_availability` classifies with the *full
-> intended* taxonomy (`up = (pass,warn)`, `down = (fail,error)`, `running`
-> excluded), but because the constraint currently allows only `pass`/`fail`, it
-> resolves today to **up = pass, down = fail**. Introducing `warn`/`error`/
-> `running` requires **widening `runs_status_check` first** — that has not
-> happened yet.
+**`runs.status` now permits `pass`, `warn`, `fail`, `error`, `running`** (the full intended
+taxonomy); **`run_steps.status` permits `pass`, `fail`, `error`** (steps have no
+`warn`/`running`). The default for `runs.status` is now **`'running'`** (changed from `'fail'`
+by migration `0003_widen_status.sql`): a row is inserted in-flight as `running`, then updated
+to its terminal status (`pass`/`warn`/`fail`/`error`) on completion.
+
+> Implication for the SLA work: `sla_availability` classifies with the full taxonomy —
+> `up = (pass,warn)`, `down = (fail,error)`, `running` excluded from completed runs. Now that
+> the constraint is widened, all of these values can actually appear, so the availability math
+> exercises the full classification (it no longer collapses to just `up = pass, down = fail`).
 
 ---
 
@@ -133,7 +138,7 @@ One row per check execution (one row per claim). **10 columns.** Row count: **46
 | --- | --- | --- | --- | --- |
 | 1 | `id` | bigint | NO | generated always as identity |
 | 2 | `check_id` | bigint | NO | — |
-| 3 | `status` | text | NO | `'fail'::text` |
+| 3 | `status` | text | NO | `'running'::text` |
 | 4 | `started_at` | timestamptz | NO | `now()` |
 | 5 | `finished_at` | timestamptz | YES | — |
 | 6 | `duration_ms` | integer | YES | — |
@@ -143,7 +148,7 @@ One row per check execution (one row per claim). **10 columns.** Row count: **46
 | 10 | `screenshot_url` | text | YES | — |
 
 **CHECK constraints**
-- `runs_status_check`: `CHECK (status = ANY (ARRAY['pass','fail']))` — see [status callout](#️-status-taxonomy-callout-read-this-first).
+- `runs_status_check`: `CHECK (status = ANY (ARRAY['pass','warn','fail','error','running']))` — see [status callout](#️-status-taxonomy-callout-read-this-first).
 
 **Primary key**
 - `runs_pkey`: `PRIMARY KEY (id)`
@@ -173,7 +178,7 @@ Structural funnel telemetry: one row per `StepRecorder.step()`. **8 columns.** R
 | 8 | `started_at` | timestamptz | NO | `now()` |
 
 **CHECK constraints**
-- `run_steps_status_check`: `CHECK (status = ANY (ARRAY['pass','fail']))`
+- `run_steps_status_check`: `CHECK (status = ANY (ARRAY['pass','fail','error']))`
 
 **Primary key**
 - `run_steps_pkey`: `PRIMARY KEY (id)`
@@ -312,8 +317,10 @@ Specifically verified to match:
   `lighthouse_form_factor`, `perf_budget_lcp_ms`, `perf_budget_transfer_bytes`),
   which are present both live and in `schema.sql` (added via migration
   `0001_run_metrics.sql`).
-- **All CHECK constraints** — including `runs.status` and `run_steps.status`
-  permitting exactly `('pass','fail')`, matching the file.
+- **All CHECK constraints** — including the widened `runs.status`
+  (`'pass','warn','fail','error','running'`) and `run_steps.status`
+  (`'pass','fail','error'`) from migration `0003_widen_status.sql`, matching the file
+  (`db/schema.sql` carries the same widened constraints, so live and file still agree).
 - **All PK/FK** — including the three `incidents` foreign keys and every
   `ON DELETE CASCADE`.
 - **All indexes** — `runs_check_started_idx (check_id, started_at DESC)`,
