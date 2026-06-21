@@ -37,7 +37,7 @@ runner/
   httpCheck.ts            Cheap HTTP tier (plain fetch, no browser)
   stepRecorder.ts         Mandatory funnel instrumentation
   evaluate.ts             Debounced incident open/resolve
-  alerts.ts               Email (ACS) / Teams / xMatters — env-driven
+  alerts.ts               Email (ACS) / Teams / generic webhook — env-driven
   artifacts.ts            Failure screenshot -> Azure Blob (no-op if unconfigured)
   checks/
     index.ts              Dynamic flow loader (validates flow name)
@@ -147,7 +147,7 @@ Three pluggable channels ship in `alerts.ts`:
 | --- | --- | --- |
 | Email (Azure Communication Services) | `ACS_EMAIL_CONNECTION_STRING`, `ALERT_EMAIL_FROM`, `ALERT_EMAIL_TO` | any unset |
 | Microsoft Teams | `TEAMS_WEBHOOK_URL` | unset |
-| xMatters inbound | `XMATTERS_INBOUND_URL` (+ optional `XMATTERS_AUTH_HEADER`) | unset |
+| Generic webhook (xMatters / PagerDuty / Slack) | `ALERT_WEBHOOK_URL` (+ optional `ALERT_WEBHOOK_AUTH_HEADER`) | unset |
 
 An absent env var means that channel is **disabled** — no errors, it simply
 doesn't fire. There is **nothing tenant-specific in source**: no addresses, URLs,
@@ -300,7 +300,7 @@ az containerapp job start -g synthwatch-rg -n synthwatch-runner-job
 > **Azure Cloud Shell**. The Bicep opens the firewall to *Azure services* (so the
 > Job can connect) but not to arbitrary public IPs.
 
-> Alert channels (`ALERT_EMAIL_TO`, `TEAMS_WEBHOOK_URL`, `XMATTERS_*`) are added
+> Alert channels (`ALERT_EMAIL_TO`, `TEAMS_WEBHOOK_URL`, `ALERT_WEBHOOK_*`) are added
 > as Job env vars per deployment; an absent channel is simply disabled. The Bicep
 > intentionally hardcodes none.
 
