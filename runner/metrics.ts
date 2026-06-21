@@ -149,16 +149,17 @@ export async function startMetricsCapture(
     async collect(): Promise<RunMetrics> {
       const metrics: RunMetrics = { ...EMPTY_METRICS };
 
-      // Let the page settle before reading, so LCP is FINAL. LCP only grows as
-      // larger elements paint; on JS-hydrated pages (e.g. an SPA shell that
-      // hydrates its real content after the 'load' event) the largest element
-      // often paints well after a short flow has finished its assertions. Reading
-      // too early yields lcp == fcp (only the first paint had happened). This
-      // settle is bounded and best-effort (never fails the check): wait for the
-      // network to go idle, then poll __swLCP until it stops growing.
-      await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {
-        /* never idles (polling/analytics) — proceed with what we have */
-      });
+      // Let LCP finalize before reading, so it isn't understated as == fcp. LCP
+      // only grows as larger elements paint; on a JS-hydrated SPA the largest
+      // element paints after the 'load' event, so a short flow can finish before
+      // it.
+      //
+      // We deliberately DO NOT wait for networkidle: a heavy SPA (ads/analytics/
+      // long-poll, e.g. wegmans.com) may NEVER reach network silence, so that
+      // wait just rides its timeout on every run — it pinned this check's runs at
+      // ~11s of pure settle regardless of real page speed. Instead we poll the
+      // observed LCP until it stops growing: the MEANINGFUL "largest paint has
+      // happened" signal, bounded (~3s) and exiting early once stable.
       await page
         .evaluate(async () => {
           const read = (): number =>
