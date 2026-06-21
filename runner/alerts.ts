@@ -26,7 +26,9 @@ export interface AlertPayload {
   checkId: number;
   checkName: string;
   severity: 'critical' | 'warning';
-  status: 'open' | 'resolved';
+  // Event type — controls message wording (routing is decided by the caller via
+  // the alert profile). 'warn' = a degraded-but-available notice (no incident).
+  status: 'open' | 'resolved' | 'warn';
   /** Human summary; for an OPEN this carries the failure reason/step. */
   summary: string;
   runId: number;
@@ -46,7 +48,8 @@ interface AlertChannel {
 }
 
 function subjectLine(p: AlertPayload): string {
-  const verb = p.status === 'open' ? 'OPENED' : 'RESOLVED';
+  const verb =
+    p.status === 'open' ? 'OPENED' : p.status === 'resolved' ? 'RESOLVED' : 'WARN';
   return `[SynthWatch][${p.severity}] ${verb}: ${p.checkName}`;
 }
 
@@ -101,7 +104,7 @@ const emailChannel: AlertChannel = {
 //
 // Payload (application/json):
 //   {
-//     "event":        "open" | "resolved",
+//     "event":        "open" | "resolved" | "warn",
 //     "severity":     "critical" | "warning",
 //     "checkId":      number,
 //     "checkName":    string,
@@ -145,15 +148,25 @@ const webhookChannel: AlertChannel = {
 const CHANNELS: AlertChannel[] = [emailChannel, webhookChannel];
 
 /**
- * Fan out an incident OPEN/RESOLVE to every configured channel. Never throws:
- * each channel is awaited independently and failures are logged, so a dead
- * channel cannot fail the run or block incident recording.
+ * Fan out an alert to the requested channels that are also CONFIGURED. The
+ * caller (evaluate.ts) decides `channelNames` from the check's alert profile;
+ * `undefined` means "all channels" (legacy fallback when no profile exists). A
+ * channel named by a profile but missing its env config is silently skipped.
+ *
+ * Never throws: each channel is awaited independently and failures are logged, so
+ * a dead channel cannot fail the run or block incident recording.
  */
-export async function dispatchAlerts(payload: AlertPayload): Promise<void> {
-  const active = CHANNELS.filter((c) => c.isConfigured());
+export async function dispatchAlerts(
+  payload: AlertPayload,
+  channelNames?: string[],
+): Promise<void> {
+  const want = channelNames === undefined ? null : new Set(channelNames);
+  const active = CHANNELS.filter(
+    (c) => (want === null || want.has(c.name)) && c.isConfigured(),
+  );
   if (active.length === 0) {
     console.log(
-      `[alerts] ${payload.status} "${payload.checkName}" — no channels configured (skipped)`,
+      `[alerts] ${payload.status} "${payload.checkName}" — no matching configured channels (skipped)`,
     );
     return;
   }

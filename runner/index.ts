@@ -187,6 +187,7 @@ async function runOne(check: Check): Promise<void> {
     id: runId,
     check_id: check.id,
     status,
+    error_message: errorMessage,
     failed_step: outcome.failedStep,
     screenshot_url: screenshotUrl,
   };

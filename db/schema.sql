@@ -61,6 +61,15 @@ CREATE TABLE checks (
     perf_budget_lcp_ms          INTEGER,
     perf_budget_transfer_bytes  BIGINT,
 
+    -- Alert routing (mirrors db/migrations/0006_alert_profiles.sql). NULL profile
+    -- => the 'default' profile (resolved in code). The FK is added after
+    -- alert_profiles is created, below.
+    alert_profile_id      BIGINT,
+    -- Warn-notify debounce: when we last sent a warn notification, and the min
+    -- re-notify interval (so a persistent warn doesn't notify every tick).
+    last_warn_notified_at TIMESTAMPTZ,
+    warn_renotify_seconds INTEGER NOT NULL DEFAULT 86400 CHECK (warn_renotify_seconds > 0),
+
     -- A browser check is meaningless without a flow to run.
     CONSTRAINT browser_needs_flow
         CHECK (kind <> 'browser' OR flow_name IS NOT NULL)
@@ -184,6 +193,38 @@ CREATE TABLE maintenance_windows (
 
 CREATE INDEX maintenance_windows_span_idx
     ON maintenance_windows (starts_at, ends_at);
+
+-- ---------------------------------------------------------------------------
+-- alert_profiles: per-check routing of (severity x status) -> channel set
+-- (mirrors db/migrations/0006_alert_profiles.sql). rules is a JSONB array of
+--   { "severity": "critical"|"warning"|"any",
+--     "status":   "fail"|"error"|"warn"|"resolved"|"any",
+--     "channels": ["email","webhook", ...] }.
+-- The 'default' profile preserves fail/error/resolved -> all channels and adds
+-- warn -> email only. A check with NULL alert_profile_id falls back to 'default'.
+-- ---------------------------------------------------------------------------
+CREATE TABLE alert_profiles (
+    id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name       TEXT        NOT NULL UNIQUE,
+    rules      JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- FK added here (checks is defined above, before alert_profiles existed).
+ALTER TABLE checks
+    ADD CONSTRAINT checks_alert_profile_id_fkey
+        FOREIGN KEY (alert_profile_id) REFERENCES alert_profiles(id) ON DELETE SET NULL;
+
+INSERT INTO alert_profiles (name, rules) VALUES (
+    'default',
+    '[
+       {"severity":"any","status":"fail",    "channels":["email","webhook"]},
+       {"severity":"any","status":"error",   "channels":["email","webhook"]},
+       {"severity":"any","status":"resolved","channels":["email","webhook"]},
+       {"severity":"any","status":"warn",    "channels":["email"]}
+     ]'::jsonb
+)
+ON CONFLICT (name) DO NOTHING;
 
 -- ---------------------------------------------------------------------------
 -- schema_migrations: tracks which db/migrations/*.sql files have been applied
