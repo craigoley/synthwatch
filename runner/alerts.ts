@@ -1,5 +1,14 @@
 // Alert delivery — a small channel abstraction.
 //
+// This open-source engine ships only VENDOR-NEUTRAL channels: EMAIL (Azure
+// Communication Services) and a GENERIC WEBHOOK. Vendor-specific chat/paging
+// channels (PagerDuty, Slack, etc.) are intentionally NOT in core — wire them
+// either:
+//   1. via the generic webhook (point ALERT_WEBHOOK_URL at the vendor's inbound
+//      endpoint; it receives the documented JSON payload), or
+//   2. in a fork, by implementing the AlertChannel interface below and adding it
+//      to CHANNELS — no change to core needed.
+//
 // Every channel is enabled ONLY when its env config is present; an absent var
 // means the channel is silently off. NOTHING tenant-specific lives in source
 // (this repo is public OSS) — all URLs, addresses and connection strings come
@@ -25,8 +34,11 @@ export interface AlertPayload {
   screenshotUrl?: string | null;
 }
 
-/** One delivery channel. Configured purely from env; send() may throw — the
- *  dispatcher isolates it. */
+/**
+ * One delivery channel. Configured purely from env; send() may throw — the
+ * dispatcher isolates it. This is the fork extension point: implement this and
+ * add the channel to CHANNELS to support any vendor without touching core.
+ */
 interface AlertChannel {
   readonly name: string;
   isConfigured(): boolean;
@@ -53,44 +65,6 @@ function bodyText(p: AlertPayload): string {
   if (link) lines.push(`Dashboard: ${link}`);
   return lines.join('\n');
 }
-
-// --- Channel: Microsoft Teams incoming webhook -----------------------------
-// Env: TEAMS_WEBHOOK_URL
-const teamsChannel: AlertChannel = {
-  name: 'teams',
-  isConfigured: () => Boolean(process.env.TEAMS_WEBHOOK_URL),
-  async send(p: AlertPayload): Promise<void> {
-    const url = process.env.TEAMS_WEBHOOK_URL;
-    if (!url) return;
-    const link = dashboardLink(p);
-    const card = {
-      '@type': 'MessageCard',
-      '@context': 'https://schema.org/extensions',
-      summary: subjectLine(p),
-      // red for an incident opening, green for recovery.
-      themeColor: p.status === 'open' ? 'D7263D' : '2EB67D',
-      title: subjectLine(p),
-      text: bodyText(p).replace(/\n/g, '\n\n'),
-      ...(link
-        ? {
-            potentialAction: [
-              {
-                '@type': 'OpenUri',
-                name: 'Open in SynthWatch',
-                targets: [{ os: 'default', uri: link }],
-              },
-            ],
-          }
-        : {}),
-    };
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(card),
-    });
-    if (!res.ok) throw new Error(`Teams webhook returned ${res.status}`);
-  },
-};
 
 // --- Channel: Azure Communication Services email ---------------------------
 // Env: ACS_EMAIL_CONNECTION_STRING, ALERT_EMAIL_FROM, ALERT_EMAIL_TO
@@ -120,9 +94,10 @@ const emailChannel: AlertChannel = {
 };
 
 // --- Channel: generic webhook ----------------------------------------------
-// The escape hatch for xMatters / PagerDuty / Slack / anything that ingests a
-// POST. Env: ALERT_WEBHOOK_URL (+ optional ALERT_WEBHOOK_AUTH_HEADER, the full
-// Authorization header value, e.g. "Bearer <token>" or "Basic <base64>").
+// The vendor-neutral escape hatch — point it at PagerDuty / Slack / any HTTP
+// endpoint that ingests a POST. Env: ALERT_WEBHOOK_URL (+ optional
+// ALERT_WEBHOOK_AUTH_HEADER, the full Authorization header value, e.g.
+// "Bearer <token>" or "Basic <base64>").
 //
 // Payload (application/json):
 //   {
@@ -167,7 +142,7 @@ const webhookChannel: AlertChannel = {
   },
 };
 
-const CHANNELS: AlertChannel[] = [teamsChannel, emailChannel, webhookChannel];
+const CHANNELS: AlertChannel[] = [emailChannel, webhookChannel];
 
 /**
  * Fan out an incident OPEN/RESOLVE to every configured channel. Never throws:
