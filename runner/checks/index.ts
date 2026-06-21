@@ -1,7 +1,7 @@
 // Dynamic flow loader for browser checks.
 //
 // A check row names its flow in checks.flow_name; we map that to a module under
-// this directory (e.g. 'homepage-search' -> ./homepage-search.js). The name is
+// this directory (e.g. 'homepage-load' -> ./homepage-load.js). The name is
 // validated against a strict allowlist pattern BEFORE it touches import() so a
 // malicious or malformed value can never be used for path traversal.
 import type { StepRecorder } from '../stepRecorder.js';
