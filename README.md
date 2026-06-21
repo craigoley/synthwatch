@@ -245,7 +245,9 @@ docker build -t synthwatcholey0620.azurecr.io/synthwatch-runner:0.1.0 ./runner
 docker push synthwatcholey0620.azurecr.io/synthwatch-runner:0.1.0
 
 # 1. Provision the runner footprint (PostgreSQL, Storage, Log Analytics, ACA
-#    environment + scheduled Job).
+#    environment + scheduled Jobs). The Bicep param defaults match the LIVE stack
+#    (-e2 naming, eastus2), so this is additive — it reuses existing resources
+#    rather than building a duplicate stack.
 az deployment group create \
   --resource-group synthwatch-rg \
   --name synthwatch-infra \
@@ -261,16 +263,37 @@ export DATABASE_URL="postgresql://synthadmin:<strong-password>@${FQDN}:5432/synt
 
 # 3. Apply the schema and seed to the fresh database.
 #    schema.sql is the full, converged schema for a NEW database — it already
-#    includes everything through db/migrations/0001. Do NOT also run the
-#    migrations on a fresh DB (that would duplicate run_metrics / the checks
-#    columns and error). Migrations are only for upgrading an EXISTING database:
-#    on one created before a migration, apply just the new db/migrations/*.sql.
+#    includes the end state of every migration AND the schema_migrations tracker.
+#    Migrations are idempotent (IF NOT EXISTS / CREATE OR REPLACE), so running the
+#    migration runner afterwards is safe: each migration re-applies as a no-op and
+#    registers its version. (On merge this is automatic — see "Database migrations
+#    on merge" below.)
 psql "$DATABASE_URL" -f db/schema.sql
 psql "$DATABASE_URL" -f db/seed.sql
 
 # 4. Smoke-test: fire one Job execution now instead of waiting for the cron tick.
 az containerapp job start -g synthwatch-rg -n synthwatch-runner-job
 ```
+
+> **Re-running against the live stack (additive).** The Bicep param defaults are
+> pinned to the live deployment's values (`-e2` names, `eastus2`), so re-running
+> the command above only re-asserts the existing resources — it does **not** build
+> a duplicate stack. One caveat: CD rolls the runner/migrate jobs to `:<git-sha>`
+> images, so re-running with the default `runnerImage` (`:0.1.0`) would revert the
+> runner image. To stay fully additive, pass the **current** image:
+>
+> ```bash
+> RUNNER_IMG=$(az containerapp job show -n synthwatch-runner-job -g synthwatch-rg \
+>               --query "properties.template.containers[0].image" -o tsv)
+> az deployment group create -g synthwatch-rg --name synthwatch-infra \
+>   --template-file infra/main.bicep \
+>   --parameters postgresAdminPassword='<password>' runnerImage="$RUNNER_IMG"
+> ```
+>
+> A `what-if` on this then shows **0 to create, 0 to delete** (the only deltas are
+> cosmetic `reference()` re-evaluations that resolve to identical values). If you
+> ever see resources being *created*, the defaults have drifted from the live
+> stack again — stop and reconcile before applying.
 
 > To run `psql` from your workstation you must also allow your client IP on the
 > Postgres server (Portal → the server → *Networking*), or run these steps from
@@ -280,6 +303,60 @@ az containerapp job start -g synthwatch-rg -n synthwatch-runner-job
 > Alert channels (`ALERT_EMAIL_TO`, `TEAMS_WEBHOOK_URL`, `XMATTERS_*`) are added
 > as Job env vars per deployment; an absent channel is simply disabled. The Bicep
 > intentionally hardcodes none.
+
+## Database migrations on merge (CD)
+
+DB migrations apply **automatically** as part of CD, **before** the new runner
+image rolls — so a runner that expects a new column never runs against a DB that
+lacks it. On merge to `main` (touching `runner/**`, `db/**`, a Dockerfile, or the
+workflow), `.github/workflows/deploy.yml` runs, in order:
+
+1. **Build** the runner image (`az acr build`, context `runner/`).
+2. **Build** the migration image (`az acr build`, context `db/`, from
+   `db/Dockerfile.migrate` — a tiny `psql`-only image bundling `db/migrate.sh` +
+   `db/migrations/`).
+3. **Migrate** — point `synthwatch-migrate-job` at the new migration image, start
+   a one-off execution, and **poll until it succeeds**. If it fails (or times
+   out) the step exits non-zero and **the deploy stops here — the new runner
+   image is NOT rolled.**
+4. **Roll** the runner job to the new image.
+
+### How migrations are tracked & kept safe
+
+- **Tracking:** `schema_migrations(version, applied_at)` records which
+  `db/migrations/*.sql` have run (`version` = filename without `.sql`). The runner
+  applies, in lexical order, only versions not already recorded.
+- **Idempotency is mandatory.** Every migration uses `IF NOT EXISTS` /
+  `CREATE OR REPLACE`. That makes the record-after-apply gap safe (a re-run is a
+  no-op) and lets an already-migrated DB **auto-baseline** under tracking with no
+  manual step.
+- **Convergence:** `db/schema.sql` contains the converged end state (incl. the
+  `schema_migrations` table). Fresh install = `schema.sql` then the runner, where
+  migrations no-op and self-register. No version list is duplicated.
+- **Adding a migration:** drop `db/migrations/000N_name.sql` (idempotent, with its
+  own `BEGIN/COMMIT`) **and** fold its end state into `db/schema.sql`. CD applies
+  it on the next merge.
+
+### Why migrations run *inside* Azure (DB-access path)
+
+The Postgres firewall allows **Azure-internal** traffic (`AllowAllAzureServices`)
+but **not** arbitrary GitHub-hosted runner IPs. Rather than open a firewall hole
+for CI, the migration runs as the ACA **`synthwatch-migrate-job`** — inside Azure,
+already permitted by that rule. It reuses the **same `database-url` ACA secret** as
+the runner job, so **the DB password never leaves Azure** (it is never a GitHub
+secret and never touches the workflow). CD only *triggers* the job via OIDC.
+
+### Manual fallback (if CD is down)
+
+Run the same runner yourself from a host allowed through the PG firewall (Azure
+Cloud Shell, or your workstation IP added under the server's *Networking*):
+
+```bash
+export DATABASE_URL="postgresql://synthadmin:<password>@<pg-fqdn>:5432/synthwatch?sslmode=require"
+MIGRATIONS_DIR=db/migrations ./db/migrate.sh
+```
+
+It is idempotent — safe to re-run; already-applied migrations are skipped.
 
 ## Writing a browser flow
 

@@ -1,0 +1,25 @@
+# SynthWatch migration image.
+#
+# Tiny image whose only job is to run db/migrate.sh against the database from
+# INSIDE Azure (as a one-off ACA Job), so it is covered by the Postgres
+# "AllowAllAzureServices" firewall rule — no firewall hole for GitHub runners.
+#
+# Build context is db/ (this Dockerfile lives there):
+#   az acr build -r synthwatcholey0620 -t synthwatch-migrate:<tag> -f db/Dockerfile.migrate db
+#
+# The base image ships the psql client (and /bin/sh). It is used only to apply
+# SQL, never to run a server.
+FROM postgres:16-alpine
+
+WORKDIR /app
+
+# The migrations and the runner. migrate.sh reads MIGRATIONS_DIR (default below).
+COPY migrations/ /migrations/
+COPY migrate.sh /app/migrate.sh
+RUN chmod +x /app/migrate.sh
+
+ENV MIGRATIONS_DIR=/migrations
+
+# DATABASE_URL is injected at runtime from the ACA Job's `database-url` secret
+# (the SAME secret the runner job uses); it is never baked into the image.
+ENTRYPOINT ["/app/migrate.sh"]

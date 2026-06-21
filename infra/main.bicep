@@ -19,15 +19,34 @@ targetScope = 'resourceGroup'
 // ---------------------------------------------------------------------------
 // Parameters
 // ---------------------------------------------------------------------------
+//
+// IMPORTANT — these defaults MUST match the LIVE deployed stack, or a redeploy is
+// not additive: it would provision a DUPLICATE parallel stack (new Postgres,
+// storage, Log Analytics, managed environment) and re-home the runner job into a
+// new environment. The live stack uses an `-e2` naming convention and lives in
+// `eastus2` (the resource group itself is in `eastus`, so the region is pinned
+// here explicitly rather than read from resourceGroup().location). Recover the
+// live values with:
+//   az deployment group show -g synthwatch-rg -n main --query properties.parameters
+// Keep these in sync with that deployment. (Image params are CD-managed bootstrap
+// tags — see runnerImage/migrateImage below.)
 
-@description('Azure region. Defaults to the resource group location (eastus).')
-param location string = resourceGroup().location
+@description('Azure region. Pinned to eastus2 to match the live stack (the resource group is in eastus).')
+param location string = 'eastus2'
 
 @description('Existing Azure Container Registry name (without the .azurecr.io suffix).')
 param acrName string = 'synthwatcholey0620'
 
-@description('Runner image to deploy. Bump the tag when you push a new runner build.')
+// runnerImage/migrateImage are BOOTSTRAP tags. CD (deploy.yml) rolls the live
+// jobs to :<git-sha> via `az containerapp job update`, so the running image will
+// differ from these defaults. When re-running this template against a CD-managed
+// deployment, pass runnerImage=<current live image> (query it first) to avoid
+// reverting the runner — see README "Deploy".
+@description('Runner image (BOOTSTRAP tag; CD rolls the live job to :<sha>).')
 param runnerImage string = 'synthwatcholey0620.azurecr.io/synthwatch-runner:0.1.0'
+
+@description('Migration image (BOOTSTRAP tag; CD rolls the live job to :<sha>).')
+param migrateImage string = 'synthwatcholey0620.azurecr.io/synthwatch-migrate:0.1.0'
 
 @description('PostgreSQL administrator login.')
 param postgresAdminLogin string = 'synthadmin'
@@ -36,22 +55,25 @@ param postgresAdminLogin string = 'synthadmin'
 @secure()
 param postgresAdminPassword string
 
-@description('Log Analytics workspace name (backs the Container Apps environment).')
-param logAnalyticsName string = 'synthwatch-logs'
+@description('Log Analytics workspace name (live stack uses the -e2 name).')
+param logAnalyticsName string = 'synthwatch-logs-e2'
 
-@description('PostgreSQL Flexible Server name (must be globally unique).')
-param postgresServerName string = 'synthwatch-pg-${uniqueString(resourceGroup().id)}'
+@description('PostgreSQL Flexible Server name (must match the live -e2 server).')
+param postgresServerName string = 'synthwatch-pg-e2'
 
-@description('Storage account name for failure artifacts (must be globally unique).')
+@description('Storage account name for failure artifacts (the live runner storage; NOT the stranded synthwatche2046f4733).')
 @minLength(3)
 @maxLength(24)
-param storageAccountName string = 'synthwatch${uniqueString(resourceGroup().id)}'
+param storageAccountName string = 'synthwatche24e33105c'
 
-@description('Container Apps managed environment name.')
-param managedEnvironmentName string = 'synthwatch-env'
+@description('Container Apps managed environment name (live stack uses the -e2 name).')
+param managedEnvironmentName string = 'synthwatch-env-e2'
 
 @description('Container Apps Job name.')
 param jobName string = 'synthwatch-runner-job'
+
+@description('One-off Container Apps Job that applies DB migrations (started by CD).')
+param migrateJobName string = 'synthwatch-migrate-job'
 
 @description('User-assigned managed identity name (used for ACR pull).')
 param identityName string = 'synthwatch-runner-id'
@@ -276,8 +298,74 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
 }
 
 // ---------------------------------------------------------------------------
+// Container Apps JOB — one-off DB migrations. Manual trigger; CD (deploy.yml)
+// rolls its image, starts it, and waits for success BEFORE rolling the runner.
+// It runs db/migrate.sh from INSIDE Azure, so it is covered by the
+// AllowAllAzureServices Postgres firewall rule — no firewall hole for GitHub
+// runners. It reuses the SAME `database-url` secret as the runner job, so the DB
+// password never leaves Azure (GitHub never sees it).
+// ---------------------------------------------------------------------------
+resource migrateJob 'Microsoft.App/jobs@2024-03-01' = {
+  name: migrateJobName
+  location: location
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${identity.id}': {}
+    }
+  }
+  properties: {
+    environmentId: managedEnvironment.id
+    configuration: {
+      triggerType: 'Manual'
+      replicaTimeout: 600
+      replicaRetryLimit: 0
+      manualTriggerConfig: {
+        parallelism: 1
+        replicaCompletionCount: 1
+      }
+      registries: [
+        {
+          server: acr.properties.loginServer
+          identity: identity.id
+        }
+      ]
+      secrets: [
+        {
+          // Same value/shape as the runner job's database-url secret.
+          name: 'database-url'
+          value: 'postgresql://${postgresAdminLogin}:${postgresAdminPassword}@${postgres.properties.fullyQualifiedDomainName}:5432/synthwatch?sslmode=require'
+        }
+      ]
+    }
+    template: {
+      containers: [
+        {
+          name: 'migrate'
+          image: migrateImage
+          resources: {
+            cpu: json('0.25')
+            memory: '0.5Gi'
+          }
+          env: [
+            {
+              name: 'DATABASE_URL'
+              secretRef: 'database-url'
+            }
+          ]
+        }
+      ]
+    }
+  }
+  dependsOn: [
+    acrPull
+  ]
+}
+
+// ---------------------------------------------------------------------------
 // Outputs
 // ---------------------------------------------------------------------------
 output postgresFqdn string = postgres.properties.fullyQualifiedDomainName
 output storageAccountName string = storage.name
 output jobName string = job.name
+output migrateJobName string = migrateJob.name

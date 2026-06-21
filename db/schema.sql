@@ -156,6 +156,23 @@ CREATE UNIQUE INDEX one_open_incident_per_check
     ON incidents (check_id)
     WHERE status = 'open';
 
+-- ---------------------------------------------------------------------------
+-- schema_migrations: tracks which db/migrations/*.sql files have been applied
+-- (version = filename without ".sql"). Owned by the migration runner
+-- (db/migrate.sh), which also creates it IF NOT EXISTS.
+--
+-- Convergence (fresh install vs. migrated DB): this file (schema.sql) already
+-- contains the END STATE of every migration, and the migrations are idempotent.
+-- So a fresh install = `psql -f db/schema.sql` then run the migration runner:
+-- each migration re-applies as a harmless no-op and registers its version. We do
+-- NOT pre-seed versions here — idempotent no-op re-apply is the (simpler)
+-- convergence mechanism, so there is no version list to keep in sync in two places.
+-- ---------------------------------------------------------------------------
+CREATE TABLE schema_migrations (
+    version    TEXT        PRIMARY KEY,
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 COMMIT;
 
 -- ===========================================================================
