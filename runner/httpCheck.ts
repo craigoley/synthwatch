@@ -102,6 +102,10 @@ export async function runHttpCheck(check: Check): Promise<HttpResult> {
     if (needsBody) {
       body = await res.text();
       sizeBytes = Buffer.byteLength(body);
+    } else {
+      // No body assertion: discard the unread stream so undici can release the
+      // socket promptly instead of holding it open until GC.
+      await res.body?.cancel().catch(() => {});
     }
 
     const facets: ResponseFacets = {
