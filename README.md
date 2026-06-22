@@ -384,4 +384,3 @@ inspect the real DOM and replace them before trusting it.
 
 <!-- claude-review end-to-end validation: trivial docs touch, safe to merge. -->
 
-<!-- auto-merge pipeline validation: trusted-author no-op (safe to revert) -->
