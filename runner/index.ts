@@ -19,7 +19,10 @@ import { runDnsCheck, runTcpCheck, runPingCheck } from './netChecks.js';
 import { StepRecorder } from './stepRecorder.js';
 import { loadFlow } from './checks/index.js';
 import { syncFlowManifest } from './flowManifest.js';
-import { uploadScreenshot } from './artifacts.js';
+import { uploadScreenshot, uploadTrace } from './artifacts.js';
+import os from 'node:os';
+import path from 'node:path';
+import { unlink } from 'node:fs/promises';
 import { evaluate, perfBudgetBreach } from './evaluate.js';
 import {
   startMetricsCapture,
@@ -45,6 +48,9 @@ interface Outcome {
   // SSL runs only: signed days relative to cert notAfter (+ until / - past
   // expiry). null for non-ssl runs and ssl runs with no cert obtained.
   certDaysRemaining: number | null;
+  // Failed browser runs only: temp-file path of the captured Playwright trace.zip
+  // (runOne uploads it, then deletes the temp file). null otherwise.
+  tracePath: string | null;
 }
 
 // A 'running' row older than this is assumed orphaned by a hard crash (the ACA
@@ -158,6 +164,7 @@ async function runOne(check: Check): Promise<void> {
       screenshot: null,
       metrics: null,
       certDaysRemaining: null,
+      tracePath: null,
     };
   }
 
@@ -179,11 +186,18 @@ async function runOne(check: Check): Promise<void> {
     screenshotUrl = await uploadScreenshot(runId, outcome.screenshot);
   }
 
+  // Upload the failure trace (non-fatal), then delete the temp file regardless.
+  let traceUrl: string | null = null;
+  if (outcome.tracePath) {
+    traceUrl = await uploadTrace(runId, outcome.tracePath);
+    await unlink(outcome.tracePath).catch(() => {});
+  }
+
   await pool.query(
     `UPDATE runs
         SET status = $2, finished_at = now(), duration_ms = $3, http_status = $4,
             error_message = $5, failed_step = $6, screenshot_url = $7,
-            cert_days_remaining = $8
+            cert_days_remaining = $8, trace_url = $9
       WHERE id = $1`,
     [
       runId,
@@ -194,6 +208,7 @@ async function runOne(check: Check): Promise<void> {
       outcome.failedStep,
       screenshotUrl,
       outcome.certDaysRemaining,
+      traceUrl,
     ],
   );
 
@@ -224,6 +239,7 @@ async function executeHttp(check: Check): Promise<Outcome> {
     screenshot: null,
     metrics: null,
     certDaysRemaining: null,
+    tracePath: null,
   };
 }
 
@@ -245,6 +261,7 @@ async function executeNet(check: Check): Promise<Outcome> {
     screenshot: null,
     metrics: null,
     certDaysRemaining: null,
+    tracePath: null,
   };
 }
 
@@ -261,6 +278,7 @@ async function executeSsl(check: Check): Promise<Outcome> {
     screenshot: null,
     metrics: null,
     certDaysRemaining: r.daysRemaining,
+    tracePath: null,
   };
 }
 
@@ -270,7 +288,7 @@ async function executeBrowser(check: Check, runId: number): Promise<Outcome> {
     return {
       status: 'error', httpStatus: null, durationMs: 0,
       error: 'browser check has no flow_name', failedStep: null,
-      screenshot: null, metrics: null, certDaysRemaining: null,
+      screenshot: null, metrics: null, certDaysRemaining: null, tracePath: null,
     };
   }
 
@@ -285,6 +303,19 @@ async function executeBrowser(check: Check, runId: number): Promise<Outcome> {
   // the whole page load; collected in the finally below.
   const capture = await startMetricsCapture(context, page);
 
+  // Start a Playwright trace for the whole run. We KEEP it only on failure (see
+  // finally) so passing runs cost no storage. sources:false avoids embedding the
+  // flow source; screenshots+snapshots are the debugging value. Non-fatal.
+  let tracingOn = false;
+  await context.tracing
+    .start({ screenshots: true, snapshots: true, sources: false })
+    .then(() => {
+      tracingOn = true;
+    })
+    .catch(() => {
+      /* tracing unavailable -> no trace captured */
+    });
+
   // Decide the verdict in the try/catch, capture metrics in the finally, then
   // assemble the Outcome after — so the perf-budget comparison upstream gets the
   // real metrics even though they're collected during teardown.
@@ -293,6 +324,8 @@ async function executeBrowser(check: Check, runId: number): Promise<Outcome> {
   let failedStep: string | null = null;
   let screenshot: Buffer | null = null;
   let metrics: RunMetrics;
+  let tracePath: string | null = null;
+  let failed = false;
 
   try {
     const rec = new StepRecorder(runId, page, check.target_url);
@@ -303,12 +336,29 @@ async function executeBrowser(check: Check, runId: number): Promise<Outcome> {
     } catch (err) {
       // A flow ExpectationError is a clean assertion miss ('fail'); any other
       // throw (Playwright timeout, navigation crash, loader error) is 'error'.
+      failed = true;
       status = isExpectationError(err) ? 'fail' : 'error';
       error = err instanceof Error ? err.message : String(err);
       failedStep = rec.failedStep;
       screenshot = await page.screenshot().catch(() => null);
     }
   } finally {
+    // Stop tracing BEFORE closing the context. Keep the trace.zip on failure
+    // (write it to a temp file runOne uploads); discard it on pass. Non-fatal.
+    if (tracingOn) {
+      try {
+        if (failed) {
+          tracePath = path.join(os.tmpdir(), `sw-trace-${runId}-${Date.now()}.zip`);
+          await context.tracing.stop({ path: tracePath });
+        } else {
+          await context.tracing.stop();
+        }
+      } catch (err) {
+        console.warn(`[trace] run ${runId} trace stop failed:`, err);
+        tracePath = null;
+      }
+    }
+
     // Persist one run_metrics row (any outcome) before tearing down the context.
     // Telemetry must never affect the verdict — swallow everything and fall back
     // to an all-null row if capture or the write itself throws.
@@ -334,6 +384,7 @@ async function executeBrowser(check: Check, runId: number): Promise<Outcome> {
     screenshot,
     metrics,
     certDaysRemaining: null,
+    tracePath,
   };
 }
 
