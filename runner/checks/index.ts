@@ -1,16 +1,45 @@
-// Dynamic flow loader for browser checks.
+// Flow authoring + dynamic loader for browser checks.
 //
-// A check row names its flow in checks.flow_name; we map that to a module under
-// this directory (e.g. 'homepage-load' -> ./homepage-load.js). The name is
-// validated against a strict allowlist pattern BEFORE it touches import() so a
-// malicious or malformed value can never be used for path traversal.
-import type { StepRecorder } from '../stepRecorder.js';
+// AUTHORING (see docs/AUTHORING.md): a flow module exports `flow` (built with
+// defineFlow) and an optional `meta`. defineFlow gives you idiomatic Playwright
+// ergonomics — `page` in scope, `step('name', async () => {...})` like
+// test.step — so codegen output pastes in with near-zero ceremony:
+//
+//     import { defineFlow } from './index.js';
+//     export const meta = { description: 'Homepage loads', entryUrlHint: 'https://example.com/' };
+//     export const flow = defineFlow(async ({ page, step, baseUrl, expect }) => {
+//       await step('open homepage', async () => {
+//         await page.goto(baseUrl, { waitUntil: 'load' });
+//       });
+//     });
+//
+// LOADING: a check names its flow in checks.flow_name; we map that to a module
+// here (e.g. 'homepage-load' -> ./homepage-load.js). The name is validated
+// against a strict allowlist BEFORE import() so a malformed value can't traverse.
+import { StepRecorder, type FlowContext } from '../stepRecorder.js';
+
+export type { FlowContext };
+
+/** A loaded flow: the runner hands it a StepRecorder; defineFlow adapts it. */
+export type Flow = (rec: StepRecorder) => Promise<void>;
+
+/** Optional per-flow metadata for the manifest (the dashboard's flow picker). */
+export interface FlowMeta {
+  /** One-line human description. */
+  description?: string;
+  /** A suggested target_url for checks using this flow (a hint, not enforced). */
+  entryUrlHint?: string;
+}
 
 /**
- * A browser flow. Receives ONLY the StepRecorder — the Playwright Page is
- * reachable solely through rec.step(), which guarantees instrumentation.
+ * Author a flow. The body is written against a FlowContext (page in scope, step,
+ * baseUrl, expect); defineFlow returns the Flow the runner invokes.
  */
-export type Flow = (rec: StepRecorder) => Promise<void>;
+export function defineFlow(
+  body: (ctx: FlowContext) => Promise<void>,
+): Flow {
+  return (rec) => body(rec.context());
+}
 
 const FLOW_NAME = /^[a-z0-9-]+$/;
 

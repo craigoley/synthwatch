@@ -241,6 +241,18 @@ INSERT INTO alert_profiles (name, rules) VALUES (
 ON CONFLICT (name) DO NOTHING;
 
 -- ---------------------------------------------------------------------------
+-- flow_manifest: available browser flows (mirrors 0009_flow_manifest.sql).
+-- Populated by the runner (it discovers its own flow modules at tick start and
+-- upserts here); the API/dashboard read this instead of distinct checks.flow_name.
+-- ---------------------------------------------------------------------------
+CREATE TABLE flow_manifest (
+    name           TEXT        PRIMARY KEY,
+    description    TEXT,
+    entry_url_hint TEXT,
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ---------------------------------------------------------------------------
 -- schema_migrations: tracks which db/migrations/*.sql files have been applied
 -- (version = filename without ".sql"). Owned by the migration runner
 -- (db/migrate.sh), which also creates it IF NOT EXISTS.
