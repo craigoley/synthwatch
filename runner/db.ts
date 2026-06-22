@@ -26,6 +26,25 @@ export interface NetConfig {
   port?: number; // tcp (required unless host:port in target_url) / ping (default 443)
 }
 
+/** Pull a value from a step's JSON response into a named variable (kind='multistep'). */
+export interface ExtractRule {
+  var: string; // variable name; referenced later as {{var}}
+  jsonPath: string; // minimal JSONPath into the parsed JSON body (see assertions.jsonPath)
+}
+
+/** One step of a multistep chain. The request shape mirrors a single http check;
+ *  url/headers/body may contain {{var}} templates resolved from prior extracts. */
+export interface ChainStep {
+  name: string;
+  method?: string; // default GET
+  url: string; // may contain {{var}} templates
+  headers?: Record<string, string>; // values may contain {{var}} templates
+  body?: string; // may contain {{var}} templates
+  auth?: AuthConfig | null; // secret-ref auth (the *_env model), never plaintext
+  assertions?: Assertion[]; // reuse the assertion engine, per step
+  extract?: ExtractRule[]; // pull response values into vars for later steps
+}
+
 // DATABASE_URL is required — the runner cannot do anything without the catalogue.
 export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -41,7 +60,7 @@ export type TerminalStatus = Exclude<RunStatus, 'running'>;
 export interface Check {
   id: number;
   name: string;
-  kind: 'http' | 'browser' | 'ssl' | 'dns' | 'tcp' | 'ping';
+  kind: 'http' | 'browser' | 'ssl' | 'dns' | 'tcp' | 'ping' | 'multistep';
   target_url: string;
   flow_name: string | null;
   method: string;
@@ -55,6 +74,8 @@ export interface Check {
   auth: AuthConfig | null;
   // Per-kind config for dns/tcp/ping checks (host comes from target_url).
   net_config: NetConfig | null;
+  // Ordered step chain for kind='multistep'. null for all other kinds.
+  steps: ChainStep[] | null;
   interval_seconds: number;
   last_run_at: Date | null;
   timeout_ms: number;

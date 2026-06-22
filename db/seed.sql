@@ -78,4 +78,17 @@ INSERT INTO checks (name, kind, target_url, interval_seconds, timeout_ms,
                     failure_threshold, severity)
 VALUES ('wegmans.com reachable', 'ping', 'www.wegmans.com', 300, 5000, 3, 'critical');
 
+-- Multistep API chain (kind='multistep', no browser). Each step is a request +
+-- per-step assertions + extract rules; later steps inject prior vars via {{var}}
+-- and cookies carry forward. This example logs in (extracts a token) then uses it
+-- as a Bearer on the next step — the canonical auth->protected-endpoint chain.
+-- See runner/multistep.ts. (For real auth, the login CREDENTIALS belong in a
+-- secret-ref auth block, never inline — the token here is an EXTRACTED var.)
+INSERT INTO checks (name, kind, target_url, interval_seconds, timeout_ms,
+                    failure_threshold, severity, steps)
+VALUES ('httpbin auth chain', 'multistep', 'https://httpbin.org/', 600, 15000, 3, 'critical', '[
+  {"name":"login","method":"POST","url":"https://httpbin.org/anything","headers":{"content-type":"application/json"},"body":"{\"access_token\":\"demo-token\"}","assertions":[{"source":"status","comparison":"eq","expected":200}],"extract":[{"var":"token","jsonPath":"$.json.access_token"}]},
+  {"name":"use-token","method":"GET","url":"https://httpbin.org/bearer","headers":{"Authorization":"Bearer {{token}}"},"assertions":[{"source":"status","comparison":"eq","expected":200},{"source":"json_path","target":"$.authenticated","comparison":"eq","expected":true}]}
+]'::jsonb);
+
 COMMIT;

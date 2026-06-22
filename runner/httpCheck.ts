@@ -41,7 +41,7 @@ function legacyAssertions(check: Check): Assertion[] {
  * Returns { header } to apply, {} for no auth, or { error } if a referenced
  * secret env var is missing (a config problem surfaced as a clear error).
  */
-function buildAuthHeader(
+export function buildAuthHeader(
   auth: AuthConfig | null,
 ): { header?: [string, string]; error?: string } {
   if (!auth || !auth.type || auth.type === 'none') return {};
