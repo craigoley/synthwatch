@@ -113,6 +113,10 @@ CREATE TABLE runs (
     -- failed run show WHERE it died without re-running anything.
     failed_step    TEXT,
     screenshot_url TEXT,
+    -- Failed browser runs only: Blob URL of the captured Playwright trace.zip
+    -- (mirrors db/migrations/0012_trace_url.sql). NULL for pass/non-browser runs
+    -- and when capture/upload failed (non-fatal).
+    trace_url      TEXT,
     -- For kind='ssl' runs: signed days relative to the cert's notAfter (+ = until
     -- expiry, - = past expiry). NULL for non-ssl runs or when no cert was obtained.
     -- (Mirrors db/migrations/0007_cert_days_remaining.sql.) error_message keeps the
