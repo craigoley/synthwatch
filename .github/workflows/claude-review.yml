@@ -90,6 +90,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      actions: write   # required for `gh workflow run` (dispatch Deploy post-merge)
     steps:
       - name: Enable auto-merge, then dispatch Deploy on merge (trusted author)
         env:
@@ -117,7 +118,9 @@ jobs:
           # fail, the PR never merges and we simply never dispatch (a failed-CI merge
           # must not deploy).
           for _ in $(seq 1 60); do
-            if [ "$(gh pr view "$PR" --repo "$REPO" --json merged --jq '.merged')" = "true" ]; then
+            # NOTE: `gh pr view` has no `merged` JSON field — use `state` (MERGED).
+            STATE=$(gh pr view "$PR" --repo "$REPO" --json state --jq '.state' || echo "")
+            if [ "$STATE" = "MERGED" ]; then
               echo "PR #$PR merged — dispatching Deploy (workflow_dispatch, token-free)."
               gh workflow run deploy.yml --repo "$REPO" --ref main
               exit 0
