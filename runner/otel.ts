@@ -56,6 +56,11 @@ export function otelEnabled(): boolean {
   return tracer !== null;
 }
 
+/** True once metric instruments are initialised — independent of trace init. */
+export function metricsEnabled(): boolean {
+  return durationHist !== null;
+}
+
 /**
  * Initialise OTLP trace export ONCE at startup, only if OTEL_EXPORTER_OTLP_ENDPOINT
  * is set. The OTLP/HTTP exporter reads that endpoint and OTEL_EXPORTER_OTLP_HEADERS

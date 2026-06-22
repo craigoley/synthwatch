@@ -17,7 +17,14 @@ import { runHttpCheck } from './httpCheck.js';
 import { runSslCheck } from './sslCheck.js';
 import { runDnsCheck, runTcpCheck, runPingCheck } from './netChecks.js';
 import { runMultistepChain } from './multistep.js';
-import { initOtel, emitRunSpan, recordRunMetric, otelEnabled, shutdownOtel } from './otel.js';
+import {
+  initOtel,
+  emitRunSpan,
+  recordRunMetric,
+  otelEnabled,
+  metricsEnabled,
+  shutdownOtel,
+} from './otel.js';
 import { StepRecorder } from './stepRecorder.js';
 import { loadFlow } from './checks/index.js';
 import { syncFlowManifest } from './flowManifest.js';
@@ -238,7 +245,7 @@ async function runOne(check: Check): Promise<void> {
   // Side-channel: emit this run as an OTel trace (root + a child span per
   // run_step). Off unless OTEL_EXPORTER_OTLP_ENDPOINT is set; never affects the
   // run (the run is already recorded above), and fully swallowed on any error.
-  if (otelEnabled()) {
+  if (otelEnabled() || metricsEnabled()) {
     try {
       const steps = (
         await pool.query<{
