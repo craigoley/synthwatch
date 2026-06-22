@@ -16,6 +16,7 @@ import { pool, type Check, type RunRecord, type TerminalStatus } from './db.js';
 import { runHttpCheck } from './httpCheck.js';
 import { runSslCheck } from './sslCheck.js';
 import { runDnsCheck, runTcpCheck, runPingCheck } from './netChecks.js';
+import { runMultistepChain } from './multistep.js';
 import { StepRecorder } from './stepRecorder.js';
 import { loadFlow } from './checks/index.js';
 import { syncFlowManifest } from './flowManifest.js';
@@ -152,6 +153,7 @@ async function runOne(check: Check): Promise<void> {
     else if (check.kind === 'ssl') outcome = await executeSsl(check);
     else if (check.kind === 'dns' || check.kind === 'tcp' || check.kind === 'ping')
       outcome = await executeNet(check);
+    else if (check.kind === 'multistep') outcome = await executeMultistep(check, runId);
     else outcome = await executeBrowser(check, runId);
   } catch (err) {
     // Unexpected runner error (e.g. flow loader threw) -> 'error', not 'fail'.
@@ -236,6 +238,23 @@ async function executeHttp(check: Check): Promise<Outcome> {
     durationMs: r.durationMs,
     error: r.error,
     failedStep: null,
+    screenshot: null,
+    metrics: null,
+    certDaysRemaining: null,
+    tracePath: null,
+  };
+}
+
+async function executeMultistep(check: Check, runId: number): Promise<Outcome> {
+  // The chain records its own run_steps (per step); we map its verdict + the
+  // failing step onto the Outcome, exactly like a browser flow.
+  const r = await runMultistepChain(check, runId);
+  return {
+    status: r.verdict, // 'pass' | 'fail' | 'error'
+    httpStatus: null,
+    durationMs: r.durationMs,
+    error: r.error,
+    failedStep: r.failedStep,
     screenshot: null,
     metrics: null,
     certDaysRemaining: null,

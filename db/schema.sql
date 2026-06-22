@@ -21,8 +21,9 @@ CREATE TABLE checks (
     -- 'ssl'     -> declarative TLS cert-expiry check (no browser); see sslCheck.ts.
     -- 'dns' / 'tcp' / 'ping' -> network-layer checks (no browser); see netChecks.ts.
     --   ('ping' is TCP-reachability, not ICMP — see netChecks.ts.)
+    -- 'multistep' -> ordered HTTP chain (steps JSONB); see multistep.ts.
     kind               TEXT        NOT NULL
-                                   CHECK (kind IN ('http', 'browser', 'ssl', 'dns', 'tcp', 'ping')),
+                                   CHECK (kind IN ('http', 'browser', 'ssl', 'dns', 'tcp', 'ping', 'multistep')),
     target_url         TEXT        NOT NULL,
 
     -- For browser checks: which flow module under runner/checks/ to execute.
@@ -46,6 +47,11 @@ CREATE TABLE checks (
     -- Per-kind config for dns/tcp/ping checks (mirrors 0011_network_checks.sql).
     -- dns: {recordType, expectedValue}; tcp/ping: {port}. Host is from target_url.
     net_config         JSONB,
+
+    -- Ordered step chain for kind='multistep' (mirrors 0013_multistep.sql). An
+    -- array of {name, method, url, headers?, body?, auth?, assertions?, extract?};
+    -- url/headers/body may carry {{var}} templates. See multistep.ts.
+    steps              JSONB,
 
     -- Cadence + claim bookkeeping. now() - last_run_at >= interval_seconds => due.
     interval_seconds   INTEGER     NOT NULL DEFAULT 300 CHECK (interval_seconds > 0),
