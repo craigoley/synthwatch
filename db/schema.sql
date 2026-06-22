@@ -164,6 +164,12 @@ CREATE TABLE run_metrics (
     layout_count          INTEGER,
     recalc_style_count    INTEGER,
 
+    -- Core Web Vitals (mirrors db/migrations/0010_cls_inp.sql). cls = session-window
+    -- Cumulative Layout Shift (0 = stable). inp_ms = Interaction to Next Paint;
+    -- BEST-EFFORT: NULL unless the flow performed real interactions.
+    cls                   DOUBLE PRECISION,
+    inp_ms                INTEGER,
+
     captured_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

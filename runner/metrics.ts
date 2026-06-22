@@ -28,6 +28,9 @@ export interface RunMetrics {
   loadEventMs: number | null;
   fcpMs: number | null;
   lcpMs: number | null;
+  // Core Web Vitals: layout shift (unitless score) + interaction latency (ms).
+  cls: number | null;
+  inpMs: number | null;
   // Page weight.
   transferBytes: number | null;
   resourceCount: number | null;
@@ -45,6 +48,8 @@ const EMPTY_METRICS: RunMetrics = {
   loadEventMs: null,
   fcpMs: null,
   lcpMs: null,
+  cls: null,
+  inpMs: null,
   transferBytes: null,
   resourceCount: null,
   domNodeCount: null,
@@ -59,19 +64,52 @@ export interface MetricsCapture {
   collect(): Promise<RunMetrics>;
 }
 
-// Installed before navigation so the LCP observer is live from the first
-// document. LCP only finalises on user input / page-hide, so we keep the latest
-// observed value and read it before the context is torn down.
-const LCP_INIT_SCRIPT = `(() => {
+// Installed before navigation so the observers are live from the first document.
+// Each Core Web Vital accumulates into a window global we read at collect time:
+//   __swLCP  largest-contentful-paint (latest entry's startTime)
+//   __swCLS  cumulative layout shift (session-window score, excl. recent-input shifts)
+//   __swINP  interaction to next paint (max interaction latency; needs real input)
+// Separate try/catch per observer so one unsupported entry type can't kill the rest.
+const CWV_INIT_SCRIPT = `(() => {
   try {
     window.__swLCP = 0;
-    const po = new PerformanceObserver((list) => {
+    new PerformanceObserver((list) => {
       const entries = list.getEntries();
       const last = entries[entries.length - 1];
       if (last) window.__swLCP = last.startTime;
-    });
-    po.observe({ type: 'largest-contentful-paint', buffered: true });
-  } catch { /* observer unsupported — lcp stays null */ }
+    }).observe({ type: 'largest-contentful-paint', buffered: true });
+  } catch { /* lcp unsupported -> stays null */ }
+
+  try {
+    // CLS = the largest "session window" sum (gaps < 1s, window < 5s) of
+    // layout-shift values, ignoring shifts within 500ms of user input — the
+    // Core Web Vitals definition (matches web-vitals.js).
+    window.__swCLS = 0;
+    let sessionValue = 0, sessionStart = 0, sessionLast = 0;
+    new PerformanceObserver((list) => {
+      for (const e of list.getEntries()) {
+        if (e.hadRecentInput) continue;
+        if (sessionValue && e.startTime - sessionLast < 1000 && e.startTime - sessionStart < 5000) {
+          sessionValue += e.value; sessionLast = e.startTime;
+        } else {
+          sessionValue = e.value; sessionStart = e.startTime; sessionLast = e.startTime;
+        }
+        if (sessionValue > window.__swCLS) window.__swCLS = sessionValue;
+      }
+    }).observe({ type: 'layout-shift', buffered: true });
+  } catch { /* layout-shift unsupported -> cls stays 0 */ }
+
+  try {
+    // INP (best-effort): the max latency of a real interaction. interactionId>0
+    // marks a genuine user interaction; a pure load flow with no input leaves
+    // this 0 (recorded as NULL).
+    window.__swINP = 0;
+    new PerformanceObserver((list) => {
+      for (const e of list.getEntries()) {
+        if (e.interactionId && e.duration > window.__swINP) window.__swINP = e.duration;
+      }
+    }).observe({ type: 'event', buffered: true, durationThreshold: 16 });
+  } catch { /* event timing unsupported -> inp stays null */ }
 })();`;
 
 // Shape returned by the in-page evaluate. All raw DOMHighResTimeStamps (ms).
@@ -81,6 +119,8 @@ interface RawPageTimings {
   loadEventEnd: number;
   fcp: number;
   lcp: number;
+  cls: number;
+  inp: number;
   domNodeCount: number;
 }
 
@@ -105,9 +145,9 @@ export async function startMetricsCapture(
   context: BrowserContext,
   page: Page,
 ): Promise<MetricsCapture> {
-  // Register the LCP observer for every document this page loads.
-  await page.addInitScript(LCP_INIT_SCRIPT).catch(() => {
-    /* init scripts unsupported — lcp stays null */
+  // Register the CWV observers (LCP / CLS / INP) for every document this page loads.
+  await page.addInitScript(CWV_INIT_SCRIPT).catch(() => {
+    /* init scripts unsupported — those metrics stay null */
   });
 
   // Page weight: sum response body sizes as requests finish. request().sizes()
@@ -187,12 +227,19 @@ export async function startMetricsCapture(
           const paint = performance
             .getEntriesByType('paint')
             .find((e) => e.name === 'first-contentful-paint');
+          const w = window as unknown as {
+            __swLCP?: number;
+            __swCLS?: number;
+            __swINP?: number;
+          };
           return {
             responseStart: nav?.responseStart ?? 0,
             domContentLoadedEventEnd: nav?.domContentLoadedEventEnd ?? 0,
             loadEventEnd: nav?.loadEventEnd ?? 0,
             fcp: paint?.startTime ?? 0,
-            lcp: (window as unknown as { __swLCP?: number }).__swLCP ?? 0,
+            lcp: w.__swLCP ?? 0,
+            cls: w.__swCLS ?? 0,
+            inp: w.__swINP ?? 0,
             domNodeCount: document.getElementsByTagName('*').length,
           };
         });
@@ -201,6 +248,11 @@ export async function startMetricsCapture(
         metrics.loadEventMs = nz(raw.loadEventEnd);
         metrics.fcpMs = nz(raw.fcp);
         metrics.lcpMs = nz(raw.lcp);
+        // CLS: 0 is a valid score (a stable page), so record it (null only if the
+        // value isn't finite). Round to 4 dp to keep the stored number tidy.
+        metrics.cls = Number.isFinite(raw.cls) ? Math.round(raw.cls * 10000) / 10000 : null;
+        // INP: 0 means no interaction was observed -> null (don't fabricate it).
+        metrics.inpMs = nz(raw.inp);
         metrics.domNodeCount = raw.domNodeCount > 0 ? raw.domNodeCount : null;
       } catch {
         /* page already navigated away / closed — leave timing fields null */
@@ -255,9 +307,10 @@ export async function writeRunMetrics(
     `INSERT INTO run_metrics (
        run_id,
        ttfb_ms, dom_content_loaded_ms, load_event_ms, fcp_ms, lcp_ms,
+       cls, inp_ms,
        transfer_bytes, resource_count, dom_node_count,
        js_heap_bytes, cpu_time_ms, layout_count, recalc_style_count
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
      ON CONFLICT (run_id) DO NOTHING`,
     [
       runId,
@@ -266,6 +319,8 @@ export async function writeRunMetrics(
       m.loadEventMs,
       m.fcpMs,
       m.lcpMs,
+      m.cls,
+      m.inpMs,
       m.transferBytes,
       m.resourceCount,
       m.domNodeCount,
