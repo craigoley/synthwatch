@@ -1,16 +1,68 @@
-// Cheap-tier HTTP check: a plain fetch() with status + body assertions. No
+// Cheap-tier HTTP check: a plain fetch() with a generic assertion evaluator. No
 // browser, no Playwright — this path must stay light because most checks are
 // HTTP and run frequently.
-import type { Check } from './db.js';
+//
+// Request config (custom headers / body / auth) is sent when present; auth uses
+// a SECRET REFERENCE (an env-var name on the runner) — credentials are never read
+// from the DB row. Assertions are evaluated by ./assertions; an empty assertion
+// set falls back to the legacy expected_status (+ body_must_contain) so existing
+// checks behave identically.
+import type { Check, AuthConfig } from './db.js';
+import {
+  evaluateAssertions,
+  type Assertion,
+  type ResponseFacets,
+} from './assertions.js';
 
 export interface HttpResult {
-  // 'pass'  = expectations met.
-  // 'fail'  = a clean assertion miss (wrong status, body-must-contain miss).
-  // 'error' = an exception/timeout/infra problem (network down, DNS, timeout).
+  // 'pass'  = all assertions met.
+  // 'fail'  = a clean assertion miss (status/header/body/json_path/... mismatch).
+  // 'error' = an exception/timeout/infra/config problem (network down, timeout,
+  //           or an auth secret env var that isn't set).
   verdict: 'pass' | 'fail' | 'error';
   httpStatus: number | null;
   durationMs: number;
   error: string | null;
+}
+
+/** The legacy assertions a check carries when its `assertions` array is empty. */
+function legacyAssertions(check: Check): Assertion[] {
+  const a: Assertion[] = [
+    { source: 'status', comparison: 'eq', expected: check.expected_status },
+  ];
+  if (check.body_must_contain) {
+    a.push({ source: 'body', comparison: 'contains', expected: check.body_must_contain });
+  }
+  return a;
+}
+
+/**
+ * Build the Authorization (or api-key) header from the check's auth config.
+ * Returns { header } to apply, {} for no auth, or { error } if a referenced
+ * secret env var is missing (a config problem surfaced as a clear error).
+ */
+function buildAuthHeader(
+  auth: AuthConfig | null,
+): { header?: [string, string]; error?: string } {
+  if (!auth || !auth.type || auth.type === 'none') return {};
+
+  if (auth.type === 'bearer') {
+    const token = auth.token_env ? process.env[auth.token_env] : undefined;
+    if (!token) return { error: `auth: env var "${auth.token_env}" not set` };
+    return { header: ['authorization', `Bearer ${token}`] };
+  }
+  if (auth.type === 'basic') {
+    const pw = auth.password_env ? process.env[auth.password_env] : undefined;
+    if (!pw) return { error: `auth: env var "${auth.password_env}" not set` };
+    const b64 = Buffer.from(`${auth.username ?? ''}:${pw}`).toString('base64');
+    return { header: ['authorization', `Basic ${b64}`] };
+  }
+  if (auth.type === 'api_key') {
+    const val = auth.value_env ? process.env[auth.value_env] : undefined;
+    if (!val) return { error: `auth: env var "${auth.value_env}" not set` };
+    return { header: [auth.header ?? 'x-api-key', val] };
+  }
+  return { error: `unknown auth type: ${String(auth.type)}` };
 }
 
 export async function runHttpCheck(check: Check): Promise<HttpResult> {
@@ -19,35 +71,58 @@ export async function runHttpCheck(check: Check): Promise<HttpResult> {
   const timer = setTimeout(() => controller.abort(), check.timeout_ms);
 
   try {
-    const res = await fetch(check.target_url, {
-      method: check.method,
-      redirect: 'follow',
-      signal: controller.signal,
-    });
-    const durationMs = Date.now() - start;
+    // --- build the request ---
+    const headers = new Headers();
+    if (check.request_headers) {
+      for (const [k, v] of Object.entries(check.request_headers)) headers.set(k, String(v));
+    }
+    const auth = buildAuthHeader(check.auth);
+    if (auth.error) {
+      return { verdict: 'error', httpStatus: null, durationMs: Date.now() - start, error: auth.error };
+    }
+    if (auth.header) headers.set(auth.header[0], auth.header[1]);
 
-    if (res.status !== check.expected_status) {
-      return {
-        verdict: 'fail',
-        httpStatus: res.status,
-        durationMs,
-        error: `expected status ${check.expected_status}, got ${res.status}`,
-      };
+    const method = (check.method || 'GET').toUpperCase();
+    const init: RequestInit = { method, redirect: 'follow', signal: controller.signal, headers };
+    if (check.request_body != null && method !== 'GET' && method !== 'HEAD') {
+      init.body = check.request_body;
     }
 
-    if (check.body_must_contain) {
-      const body = await res.text();
-      if (!body.includes(check.body_must_contain)) {
-        return {
-          verdict: 'fail',
-          httpStatus: res.status,
-          durationMs,
-          error: `body did not contain "${check.body_must_contain}"`,
-        };
-      }
+    // --- send + measure (response time = to headers, before reading the body) ---
+    const res = await fetch(check.target_url, init);
+    const responseTimeMs = Date.now() - start;
+
+    // --- gather facets; only read the body if an assertion needs it ---
+    const assertions = check.assertions?.length ? check.assertions : legacyAssertions(check);
+    const needsBody = assertions.some(
+      (a) => a.source === 'body' || a.source === 'json_path' || a.source === 'size',
+    );
+    let body: string | null = null;
+    let sizeBytes: number | null = null;
+    if (needsBody) {
+      body = await res.text();
+      sizeBytes = Buffer.byteLength(body);
+    } else {
+      // No body assertion: discard the unread stream so undici can release the
+      // socket promptly instead of holding it open until GC.
+      await res.body?.cancel().catch(() => {});
     }
 
-    return { verdict: 'pass', httpStatus: res.status, durationMs, error: null };
+    const facets: ResponseFacets = {
+      status: res.status,
+      responseTimeMs,
+      headers: res.headers,
+      body,
+      sizeBytes,
+    };
+
+    const { ok, failures } = evaluateAssertions(assertions, facets);
+    return {
+      verdict: ok ? 'pass' : 'fail',
+      httpStatus: res.status,
+      durationMs: responseTimeMs,
+      error: ok ? null : failures.join('; '),
+    };
   } catch (err) {
     // A thrown fetch (network failure, DNS, connection reset) or an abort/timeout
     // is an EXCEPTION, not a clean assertion miss => 'error'.
