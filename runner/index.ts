@@ -17,6 +17,7 @@ import { runHttpCheck } from './httpCheck.js';
 import { runSslCheck } from './sslCheck.js';
 import { StepRecorder } from './stepRecorder.js';
 import { loadFlow } from './checks/index.js';
+import { syncFlowManifest } from './flowManifest.js';
 import { uploadScreenshot } from './artifacts.js';
 import { evaluate, perfBudgetBreach } from './evaluate.js';
 import {
@@ -60,6 +61,10 @@ async function getBrowser(): Promise<Browser> {
 
 async function main(): Promise<void> {
   await reapStaleRunning();
+
+  // Publish the deployed flows to flow_manifest for the API/dashboard. Best-effort
+  // — a sync failure must never break the tick.
+  await syncFlowManifest().catch((err) => console.warn('[manifest] sync failed:', err));
 
   const due = await findDueChecks();
   console.log(`[runner] ${due.length} check(s) due`);

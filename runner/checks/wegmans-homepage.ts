@@ -12,28 +12,31 @@
 // Wegmans is a JS-hydrated SPA: at the 'load' event only a small shell exists
 // (~hundreds of nodes); the header/search box/content appear after hydration.
 // So this flow WAITS (web-first) for the search box before asserting — which also
-// lets the page render enough for LCP to settle past FCP. Set the check's
-// target_url to https://www.wegmans.com/.
-import type { Flow } from './index.js';
-import { expect } from '../errors.js';
+// lets the page render enough for LCP to settle past FCP.
+import { defineFlow, type FlowMeta } from './index.js';
 
-export const flow: Flow = async (rec) => {
-  await rec.step('open homepage', async (page) => {
-    await page.goto(rec.baseUrl, { waitUntil: 'load' });
+export const meta: FlowMeta = {
+  description: 'Wegmans homepage: header, search box, and primary nav render.',
+  entryUrlHint: 'https://www.wegmans.com/',
+};
+
+export const flow = defineFlow(async ({ page, step, baseUrl, expect }) => {
+  await step('open homepage', async () => {
+    await page.goto(baseUrl, { waitUntil: 'load' });
   });
 
-  await rec.step('wait for search box (hydration)', async (page) => {
+  await step('wait for search box (hydration)', async () => {
     // Auto-waits until the real UI is present. A genuine never-appears is a
     // Playwright timeout => 'error' (page failed to render), distinct from the
     // assertion 'fail's below.
     await page.getByRole('searchbox').first().waitFor({ state: 'visible', timeout: 20000 });
   });
 
-  await rec.step('assert homepage rendered', async (page) => {
+  await step('assert homepage rendered', async () => {
     const title = await page.title();
     expect(/wegmans/i.test(title), `unexpected page title: "${title}"`);
     expect(await page.getByRole('banner').first().isVisible(), 'site header (banner) not visible');
     const navLinks = await page.getByRole('navigation').first().getByRole('link').count();
     expect(navLinks > 0, 'primary navigation rendered no links');
   });
-};
+});
