@@ -196,7 +196,7 @@ Structural funnel telemetry: one row per `StepRecorder.step()`. **8 columns.** R
 
 Tier-1 per-run telemetry; one row per **browser** run (HTTP checks write nothing
 here). Every metric is nullable — a capture failure must never fail the check.
-**15 columns.** Row count: **11**.
+**17 columns.** Row count: **11**.
 
 | # | Column | Type | Nullable | Default |
 | --- | --- | --- | --- | --- |
@@ -215,6 +215,8 @@ here). Every metric is nullable — a capture failure must never fail the check.
 | 13 | `layout_count` | integer | YES | — |
 | 14 | `recalc_style_count` | integer | YES | — |
 | 15 | `captured_at` | timestamptz | NO | `now()` |
+| 16 | `cls` | double precision | YES | — |
+| 17 | `inp_ms` | integer | YES | — |
 
 **CHECK constraints** — none.
 
