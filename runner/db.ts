@@ -76,6 +76,9 @@ export interface Check {
   net_config: NetConfig | null;
   // Ordered step chain for kind='multistep'. null for all other kinds.
   steps: ChainStep[] | null;
+  // Multi-location: open an incident only when failing from >= this many distinct
+  // locations. null => default rule (>=2 when >=2 locations are active, else 1).
+  min_fail_locations: number | null;
   interval_seconds: number;
   last_run_at: Date | null;
   timeout_ms: number;
@@ -107,4 +110,6 @@ export interface RunRecord {
   error_message: string | null;
   failed_step: string | null;
   screenshot_url: string | null;
+  /** The location that produced this run (the runner's SYNTHWATCH_LOCATION). */
+  location: string;
 }

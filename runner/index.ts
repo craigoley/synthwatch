@@ -61,6 +61,11 @@ interface Outcome {
 // lingering as in-flight forever.
 const STALE_RUNNING = "30 minutes";
 
+// This runner's vantage point, stamped onto every run it writes. The primary
+// region leaves this unset (=> 'default') so single-region behaviour is exactly
+// as before; a 2nd-region runner sets SYNTHWATCH_LOCATION (e.g. 'westus2').
+const LOCATION = process.env.SYNTHWATCH_LOCATION ?? 'default';
+
 // Lazily-launched shared browser, reused across all browser checks in this tick.
 let browser: Browser | null = null;
 async function getBrowser(): Promise<Browser> {
@@ -146,8 +151,8 @@ async function runOne(check: Check): Promise<void> {
   // to attach steps to, and the SLA "exclude running" clause has real data. A
   // hard crash before the terminal update is reaped to 'error' (see main()).
   const { rows } = await pool.query<{ id: number }>(
-    `INSERT INTO runs (check_id, started_at, status) VALUES ($1, now(), 'running') RETURNING id`,
-    [check.id],
+    `INSERT INTO runs (check_id, started_at, status, location) VALUES ($1, now(), 'running', $2) RETURNING id`,
+    [check.id, LOCATION],
   );
   const runId = rows[0].id;
 
@@ -227,6 +232,7 @@ async function runOne(check: Check): Promise<void> {
     error_message: errorMessage,
     failed_step: outcome.failedStep,
     screenshot_url: screenshotUrl,
+    location: LOCATION,
   };
   await evaluate(check, run);
 

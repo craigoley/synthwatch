@@ -83,9 +83,14 @@ async function profileChannels(
 export async function evaluate(check: Check, run: RunRecord): Promise<void> {
   const open = await getOpenIncident(check.id);
 
-  // "up" = reachable (pass or degraded-but-available warn). An up run clears any
-  // open availability incident.
-  if (run.status === 'pass' || run.status === 'warn') {
+  // Incidents track the CROSS-LOCATION verdict, not a single run: the check is
+  // "down" only when failing from >= N distinct locations (a single regional blip
+  // is recorded + visible but does NOT page). With one location this is exactly
+  // the old consecutive-failure behaviour.
+  const verdict = await aggregateVerdict(check);
+
+  // UP across locations (fewer than N locations failing) -> clear any incident.
+  if (!verdict.down) {
     if (open) {
       await pool.query(
         `UPDATE incidents
@@ -115,21 +120,27 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
       );
       return;
     }
-
-    // warn: NOTIFY without opening an incident (SLA unaffected). Debounced, and
-    // suppressed in a maintenance window.
-    await maybeNotifyWarn(check, run);
+    if (run.status === 'warn') {
+      // warn: NOTIFY without opening an incident (SLA unaffected). Debounced, and
+      // suppressed in a maintenance window.
+      await maybeNotifyWarn(check, run);
+      return;
+    }
+    // run is DOWN (fail/error) but the check is UP across locations — a minority
+    // (e.g. single-region) failure: recorded + visible, but NO incident, NO page.
+    // This is the false-positive class multi-location kills.
     return;
   }
 
-  // run is DOWN (fail or error) -> count consecutive trailing down runs.
-  const consecutive = await countConsecutiveDown(check.id, check.failure_threshold);
-  if (consecutive < check.failure_threshold) {
-    return; // still within the debounce window
-  }
+  // DOWN across locations (>= N locations failing). The single-location count
+  // (for the unchanged wording) is the current location's consecutive downs.
+  const consecutive =
+    verdict.total > 1
+      ? verdict.failing
+      : await countConsecutiveDown(check.id, check.failure_threshold, run.location);
 
   if (open) {
-    // Already paged; just keep the running count fresh.
+    // Already paged; keep the count fresh.
     await pool.query(
       `UPDATE incidents SET consecutive_failures = $2 WHERE id = $1`,
       [open.id, consecutive],
@@ -137,10 +148,9 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
     return;
   }
 
-  // We're about to OPEN a new incident (and page). Suppress it if we're inside an
-  // active maintenance window — planned downtime should not page. The run + its
-  // status are already recorded (index.ts wrote them); suppression only skips the
-  // incident open + alert, it does NOT hide the data.
+  // About to OPEN (and page). Suppress inside an active maintenance window —
+  // planned downtime should not page. The run + status are already recorded;
+  // suppression skips only the incident open + alert, never the data.
   if (await inMaintenanceWindow(check.id)) {
     console.log(
       `[runner] check ${check.id} "${check.name}" down (${run.status}) but ` +
@@ -149,8 +159,12 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
     return;
   }
 
+  const where =
+    verdict.total > 1
+      ? `from ${verdict.failing} of ${verdict.total} locations`
+      : `${consecutive} consecutive times`;
   const summary =
-    `Check "${check.name}" down (${run.status}) ${consecutive} consecutive times` +
+    `Check "${check.name}" down (${run.status}) ${where}` +
     (run.failed_step ? ` (died at step: ${run.failed_step})` : '') + '.';
 
   await pool.query(
@@ -160,7 +174,10 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
     [check.id, check.severity, run.id, consecutive, summary],
   );
 
-  // Route by the actual down status (fail|error) so a profile can split them.
+  // Route by the down status (fail|error) so a profile can split them. On the open
+  // path the triggering run is always down; map defensively (pass/warn can't reach
+  // here, but the verdict is cross-location so TS can't prove run.status is down).
+  const routeStatus: RouteStatus = run.status === 'error' ? 'error' : 'fail';
   await dispatchAlerts(
     {
       checkId: check.id,
@@ -172,8 +189,59 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
       failedStep: run.failed_step,
       screenshotUrl: run.screenshot_url,
     },
-    await profileChannels(check, run.status),
+    await profileChannels(check, routeStatus),
   );
+}
+
+// A location silent longer than this is treated as offline (excluded from the
+// verdict) so a decommissioned region can't pin a check down or up forever.
+const STALE_LOCATION = '1 hour';
+
+interface Verdict {
+  /** down = failing from >= N distinct active locations. */
+  down: boolean;
+  /** active locations whose latest `failure_threshold` runs are all down. */
+  failing: number;
+  /** active locations (a completed run within STALE_LOCATION). */
+  total: number;
+}
+
+/**
+ * The cross-location verdict. A location is "failing" when its most-recent
+ * `failure_threshold` completed runs are ALL down (the old per-check debounce, now
+ * scoped per location). The check is DOWN when failing locations >= N, where
+ * N = min_fail_locations, else 2 when >= 2 locations are active, else 1. With a
+ * single active location this reduces to exactly the old behaviour.
+ */
+async function aggregateVerdict(check: Check): Promise<Verdict> {
+  const { rows } = await pool.query<{ total: string; failing: string }>(
+    `WITH recent AS (
+       SELECT location, status,
+              row_number() OVER (PARTITION BY location ORDER BY started_at DESC) AS rn,
+              max(started_at) OVER (PARTITION BY location) AS loc_last
+         FROM runs
+        WHERE check_id = $1 AND status <> 'running'
+     ),
+     per_loc AS (
+       SELECT location,
+              bool_and(status IN ('fail','error')) FILTER (WHERE rn <= $2) AS all_down,
+              count(*) FILTER (WHERE rn <= $2) AS recent_count,
+              max(loc_last) AS loc_last
+         FROM recent
+        GROUP BY location
+     )
+     SELECT
+       count(*) FILTER (WHERE loc_last > now() - $3::interval) AS total,
+       count(*) FILTER (
+         WHERE all_down AND recent_count >= $2 AND loc_last > now() - $3::interval
+       ) AS failing
+       FROM per_loc`,
+    [check.id, check.failure_threshold, STALE_LOCATION],
+  );
+  const total = Number(rows[0]?.total ?? 0);
+  const failing = Number(rows[0]?.failing ?? 0);
+  const n = check.min_fail_locations ?? (total >= 2 ? 2 : 1);
+  return { down: failing >= 1 && failing >= n, failing, total };
 }
 
 /**
@@ -249,15 +317,19 @@ async function getOpenIncident(checkId: number): Promise<OpenIncident | null> {
   return rows[0] ?? null;
 }
 
-async function countConsecutiveDown(checkId: number, threshold: number): Promise<number> {
-  // We only need to look back as far as the threshold to make the open/skip
-  // decision: if the most recent `threshold` runs are all DOWN, that's enough.
+async function countConsecutiveDown(
+  checkId: number,
+  threshold: number,
+  location?: string,
+): Promise<number> {
+  // Trailing consecutive down runs (optionally scoped to one location), used for
+  // the single-location incident wording/count. Look back only as far as needed.
   const { rows } = await pool.query<{ status: 'pass' | 'warn' | 'fail' | 'error' | 'running' }>(
     `SELECT status FROM runs
-      WHERE check_id = $1
+      WHERE check_id = $1 ${location ? 'AND location = $3' : ''}
       ORDER BY started_at DESC
       LIMIT $2`,
-    [checkId, threshold],
+    location ? [checkId, threshold, location] : [checkId, threshold],
   );
   let count = 0;
   for (const row of rows) {
