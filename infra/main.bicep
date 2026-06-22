@@ -81,6 +81,10 @@ param identityName string = 'synthwatch-runner-id'
 @description('Blob container for failure screenshots. Matches the runner default (AZURE_STORAGE_CONTAINER).')
 param artifactContainerName string = 'synthwatch-artifacts'
 
+@description('Retention (days) for failure artifacts — traces/ and root run-*.png screenshots are auto-deleted by the Blob lifecycle policy after this many days. Default 90.')
+@minValue(1)
+param artifactRetentionDays int = 90
+
 // AcrPull built-in role.
 var acrPullRoleId = '7f951dda-4ed3-4680-a7ca-43fe172d538d'
 
@@ -176,6 +180,43 @@ resource artifactContainer 'Microsoft.Storage/storageAccounts/blobServices/conta
   name: artifactContainerName
   properties: {
     publicAccess: 'None'
+  }
+}
+
+// Lifecycle policy: auto-delete failure artifacts older than artifactRetentionDays
+// (default 90). Covers BOTH prefixes in the artifact container — traces/ (zip) and
+// the root-level run-*.png screenshots — server-side, no cron/code. The DB still
+// holds runs.trace_url/screenshot_url after deletion (a dangling reference the
+// dashboard should 404 gracefully; tracked as a follow-up).
+resource artifactRetention 'Microsoft.Storage/storageAccounts/managementPolicies@2023-05-01' = {
+  parent: storage
+  name: 'default'
+  properties: {
+    policy: {
+      rules: [
+        {
+          enabled: true
+          name: 'expire-artifacts'
+          type: 'Lifecycle'
+          definition: {
+            filters: {
+              blobTypes: [ 'blockBlob' ]
+              prefixMatch: [
+                '${artifactContainerName}/traces/'
+                '${artifactContainerName}/run-'
+              ]
+            }
+            actions: {
+              baseBlob: {
+                delete: {
+                  daysAfterModificationGreaterThan: artifactRetentionDays
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
   }
 }
 
