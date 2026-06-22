@@ -53,6 +53,11 @@ CREATE TABLE checks (
     -- url/headers/body may carry {{var}} templates. See multistep.ts.
     steps              JSONB,
 
+    -- Multi-location (mirrors 0014_multi_location.sql): open an incident only when
+    -- failing from >= this many distinct locations. NULL => default rule in
+    -- evaluate.ts (>=2 when >=2 locations are active, else 1).
+    min_fail_locations INTEGER,
+
     -- Cadence + claim bookkeeping. now() - last_run_at >= interval_seconds => due.
     interval_seconds   INTEGER     NOT NULL DEFAULT 300 CHECK (interval_seconds > 0),
     last_run_at        TIMESTAMPTZ,
@@ -127,7 +132,11 @@ CREATE TABLE runs (
     -- expiry, - = past expiry). NULL for non-ssl runs or when no cert was obtained.
     -- (Mirrors db/migrations/0007_cert_days_remaining.sql.) error_message keeps the
     -- human-readable cert line; this is the structured value for the API/dashboard.
-    cert_days_remaining INTEGER
+    cert_days_remaining INTEGER,
+    -- The location (vantage point) that produced this run, from the runner's
+    -- SYNTHWATCH_LOCATION (mirrors 0014_multi_location.sql). DEFAULT 'default' so
+    -- a single-region deploy uses one location and behaves exactly as before.
+    location       TEXT NOT NULL DEFAULT 'default'
 );
 
 -- Hot path: "latest N runs for this check, newest first" (status pages, the
