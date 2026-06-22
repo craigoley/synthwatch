@@ -34,6 +34,12 @@ jobs:
         with:
           # Max subscription token — NOT anthropic_api_key (no per-use API cost).
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # The action blocks ALL bot actors by default (checkHumanActor). Allow ONLY
+          # github-actions[bot] so legitimate re-triggers (a close+reopen, or any
+          # github-actions-initiated run) pass the guard. NOT '*': every other bot —
+          # including dependabot[bot], also excluded at the job `if:` above — stays
+          # blocked. (Matching is case-insensitive and strips the [bot] suffix.)
+          allowed_bots: "github-actions[bot]"
           # Force tag mode on these PR events so the action creates a tracking comment
           # AND wires the GitHub comment + inline-comment MCP tools; the review summary
           # is then posted automatically as Claude's final message.
