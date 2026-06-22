@@ -17,6 +17,7 @@ import { runHttpCheck } from './httpCheck.js';
 import { runSslCheck } from './sslCheck.js';
 import { runDnsCheck, runTcpCheck, runPingCheck } from './netChecks.js';
 import { runMultistepChain } from './multistep.js';
+import { initOtel, emitRunSpan, otelEnabled, shutdownOtel } from './otel.js';
 import { StepRecorder } from './stepRecorder.js';
 import { loadFlow } from './checks/index.js';
 import { syncFlowManifest } from './flowManifest.js';
@@ -68,6 +69,9 @@ async function getBrowser(): Promise<Browser> {
 }
 
 async function main(): Promise<void> {
+  // Opt-in OTLP trace export (no-op unless OTEL_EXPORTER_OTLP_ENDPOINT is set).
+  initOtel();
+
   await reapStaleRunning();
 
   // Publish the deployed flows to flow_manifest for the API/dashboard. Best-effort
@@ -147,6 +151,8 @@ async function runOne(check: Check): Promise<void> {
   );
   const runId = rows[0].id;
 
+  // Wall-clock start of the executor — the OTel root span's start (durationMs anchors its end).
+  const execStartMs = Date.now();
   let outcome: Outcome;
   try {
     if (check.kind === 'http') outcome = await executeHttp(check);
@@ -228,6 +234,51 @@ async function runOne(check: Check): Promise<void> {
     `[runner] check ${check.id} "${check.name}" -> ${status}` +
       (errorMessage ? ` (${errorMessage})` : ''),
   );
+
+  // Side-channel: emit this run as an OTel trace (root + a child span per
+  // run_step). Off unless OTEL_EXPORTER_OTLP_ENDPOINT is set; never affects the
+  // run (the run is already recorded above), and fully swallowed on any error.
+  if (otelEnabled()) {
+    try {
+      const steps = (
+        await pool.query<{
+          step_index: number;
+          name: string;
+          status: string;
+          duration_ms: number;
+          started_at: Date;
+          error_message: string | null;
+        }>(
+          `SELECT step_index, name, status, duration_ms, started_at, error_message
+             FROM run_steps WHERE run_id = $1 ORDER BY step_index`,
+          [runId],
+        )
+      ).rows;
+      emitRunSpan({
+        checkId: check.id,
+        checkName: check.name,
+        checkKind: check.kind,
+        method: check.method,
+        targetUrl: check.target_url,
+        runId,
+        status,
+        errorMessage,
+        httpStatus: outcome.httpStatus,
+        startMs: execStartMs,
+        durationMs: outcome.durationMs,
+        steps: steps.map((s) => ({
+          index: s.step_index,
+          name: s.name,
+          status: s.status,
+          durationMs: s.duration_ms,
+          startedAtMs: s.started_at.getTime(),
+          errorMessage: s.error_message,
+        })),
+      });
+    } catch (err) {
+      console.warn(`[otel] run ${runId} span emit skipped (non-fatal):`, err);
+    }
+  }
 }
 
 async function executeHttp(check: Check): Promise<Outcome> {
@@ -415,6 +466,7 @@ main()
   })
   .then(async (code) => {
     if (browser) await browser.close().catch(() => {});
+    await shutdownOtel(); // flush batched spans (bounded; non-fatal)
     await pool.end().catch(() => {});
     process.exit(code);
   });

@@ -18,6 +18,11 @@
   "dependencies": {
     "@azure/communication-email": "1.1.0",
     "@azure/storage-blob": "12.32.0",
+    "@opentelemetry/api": "^1.9.1",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.219.0",
+    "@opentelemetry/resources": "^2.8.0",
+    "@opentelemetry/sdk-trace-node": "^2.8.0",
+    "@opentelemetry/semantic-conventions": "^1.41.1",
     "pg": "8.22.0",
     "playwright": "1.61.0"
   },
