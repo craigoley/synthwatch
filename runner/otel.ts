@@ -18,12 +18,21 @@ import {
   context,
   SpanStatusCode,
   SpanKind,
+  ValueType,
   type Tracer,
   type Span,
   type Attributes,
+  type Histogram,
+  type Counter,
 } from '@opentelemetry/api';
 import { NodeTracerProvider, BatchSpanProcessor } from '@opentelemetry/sdk-trace-node';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
+import {
+  MeterProvider,
+  PeriodicExportingMetricReader,
+  AggregationTemporality,
+} from '@opentelemetry/sdk-metrics';
+import { OTLPMetricExporter } from '@opentelemetry/exporter-metrics-otlp-http';
 import { resourceFromAttributes } from '@opentelemetry/resources';
 import {
   ATTR_SERVICE_NAME,
@@ -36,9 +45,20 @@ import {
 let tracer: Tracer | null = null;
 let provider: NodeTracerProvider | null = null;
 
+// Metrics (PR phase-2): a MeterProvider alongside the tracer, same endpoint/gate.
+let meterProvider: MeterProvider | null = null;
+let durationHist: Histogram | null = null;
+let runsCounter: Counter | null = null;
+let upCounter: Counter | null = null;
+
 /** True once OTLP export is initialised — lets callers skip work on the off path. */
 export function otelEnabled(): boolean {
   return tracer !== null;
+}
+
+/** True once metric instruments are initialised — independent of trace init. */
+export function metricsEnabled(): boolean {
+  return durationHist !== null;
 }
 
 /**
@@ -64,9 +84,50 @@ export function initOtel(): void {
     console.log(`[otel] OTLP trace export ON -> ${process.env.OTEL_EXPORTER_OTLP_ENDPOINT}`);
   } catch (err) {
     // Init failure must not affect the runner; export simply stays off.
-    console.warn('[otel] init failed; export disabled:', err instanceof Error ? err.message : err);
+    console.warn('[otel] trace init failed; trace export disabled:', err instanceof Error ? err.message : err);
     tracer = null;
     provider = null;
+  }
+
+  // Metrics — same endpoint/headers, its own try so a metrics failure can't
+  // disable traces (or the runner). DELTA temporality suits the ephemeral job:
+  // each tick is a fresh process, so an export carries that tick's counts.
+  try {
+    const resource = resourceFromAttributes({
+      [ATTR_SERVICE_NAME]: process.env.SYNTHWATCH_OTEL_SERVICE_NAME ?? 'synthwatch-runner',
+      'deployment.environment': process.env.SYNTHWATCH_ENV ?? 'production',
+    });
+    const metricExporter = new OTLPMetricExporter({
+      temporalityPreference: AggregationTemporality.DELTA,
+    });
+    meterProvider = new MeterProvider({
+      resource,
+      readers: [
+        new PeriodicExportingMetricReader({
+          exporter: metricExporter,
+          exportIntervalMillis: 60000,
+        }),
+      ],
+    });
+    const meter = meterProvider.getMeter('synthwatch-runner');
+    durationHist = meter.createHistogram('synthwatch.check.duration', {
+      description: 'Check run duration (ms) — yields p50/p95/p99 in the backend.',
+      unit: 'ms',
+      valueType: ValueType.DOUBLE,
+    });
+    runsCounter = meter.createCounter('synthwatch.check.runs', {
+      description: 'Total check runs, by status.',
+      valueType: ValueType.INT,
+    });
+    upCounter = meter.createCounter('synthwatch.check.up', {
+      description: 'Check outcomes labelled result=up|down — ratio for availability.',
+      valueType: ValueType.INT,
+    });
+    console.log(`[otel] OTLP metric export ON -> ${process.env.OTEL_EXPORTER_OTLP_ENDPOINT}`);
+  } catch (err) {
+    console.warn('[otel] metric init failed; metric export disabled:', err instanceof Error ? err.message : err);
+    meterProvider = null;
+    durationHist = runsCounter = upCounter = null;
   }
 }
 
@@ -93,6 +154,8 @@ export interface OtelRun {
   startMs: number;
   durationMs: number;
   steps: OtelStep[];
+  /** The runner's vantage point (forward-looking for multi-location). Bounded. */
+  location?: string;
 }
 
 /** pass/warn -> OK; fail/error -> ERROR (+ a failure event carrying the message). */
@@ -130,6 +193,7 @@ export function emitRunSpan(run: OtelRun): void {
       'synthwatch.check.name': run.checkName,
       'synthwatch.run.id': run.runId,
       'synthwatch.run.status': run.status,
+      'synthwatch.location': run.location ?? 'default',
       [ATTR_URL_FULL]: run.targetUrl,
       ...serverAddress(run.targetUrl),
     };
@@ -171,15 +235,57 @@ export function emitRunSpan(run: OtelRun): void {
   }
 }
 
-/** Flush + close the exporter on shutdown, bounded so a dead collector can't hang the job. */
-export async function shutdownOtel(): Promise<void> {
-  if (!provider) return;
+/**
+ * Record the numeric metrics for a run: duration histogram + runs counter +
+ * up/down counter. ALL attributes are BOUNDED (check id/kind/name, the 4-state
+ * status, result=up|down, location) — high-cardinality values (run id, url,
+ * timestamps, error messages, http status) are deliberately NOT attached, since
+ * metric attributes become Prometheus label dimensions. Non-fatal.
+ */
+export function recordRunMetric(run: OtelRun): void {
+  if (!durationHist || !runsCounter || !upCounter) return; // metrics off / init failed
   try {
-    await Promise.race([
-      provider.shutdown(),
-      new Promise<void>((resolve) => setTimeout(resolve, 5000)),
-    ]);
+    // Bounded label set shared by the duration histogram + runs counter.
+    const attrs: Attributes = {
+      'synthwatch.synthetic': true,
+      'synthwatch.check.id': run.checkId,
+      'synthwatch.check.kind': run.checkKind,
+      'synthwatch.check.name': run.checkName,
+      'synthwatch.run.status': run.status,
+      'synthwatch.location': run.location ?? 'default',
+    };
+    durationHist.record(run.durationMs, attrs);
+    runsCounter.add(1, attrs);
+
+    // Availability series: result=up|down (up = pass|warn). 2-state per check, so
+    // a backend ratios up / (up+down) cleanly. No 4-state status here.
+    const result = run.status === 'pass' || run.status === 'warn' ? 'up' : 'down';
+    upCounter.add(1, {
+      'synthwatch.synthetic': true,
+      'synthwatch.check.id': run.checkId,
+      'synthwatch.check.kind': run.checkKind,
+      'synthwatch.check.name': run.checkName,
+      'synthwatch.result': result,
+      'synthwatch.location': run.location ?? 'default',
+    });
   } catch (err) {
-    console.warn('[otel] shutdown flush failed:', err instanceof Error ? err.message : err);
+    console.warn('[otel] metric record failed (non-fatal):', err instanceof Error ? err.message : err);
   }
+}
+
+/** Flush + close trace AND metric exporters on shutdown, CONCURRENTLY and each
+ *  bounded, so a dead collector can't hang the job (total ~5s, not 5s per signal). */
+export async function shutdownOtel(): Promise<void> {
+  const bounded = async (label: string, p: Promise<unknown> | undefined): Promise<void> => {
+    if (!p) return;
+    try {
+      await Promise.race([p, new Promise<void>((resolve) => setTimeout(resolve, 5000))]);
+    } catch (err) {
+      console.warn(`[otel] ${label} shutdown flush failed:`, err instanceof Error ? err.message : err);
+    }
+  };
+  await Promise.all([
+    bounded('trace', provider?.shutdown()),
+    bounded('metric', meterProvider?.shutdown()),
+  ]);
 }
