@@ -10,6 +10,7 @@
 import { pool, type Check, type RunRecord } from './db.js';
 import type { RunMetrics } from './metrics.js';
 import { dispatchAlerts } from './alerts.js';
+import { rcaEnabled, runRca } from './rca.js';
 
 interface OpenIncident {
   id: number;
@@ -167,12 +168,13 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
     `Check "${check.name}" down (${run.status}) ${where}` +
     (run.failed_step ? ` (died at step: ${run.failed_step})` : '') + '.';
 
-  await pool.query(
+  const { rows: incidentRows } = await pool.query<{ id: number }>(
     `INSERT INTO incidents (check_id, status, severity, opened_run_id,
                             consecutive_failures, summary)
-     VALUES ($1, 'open', $2, $3, $4, $5)`,
+     VALUES ($1, 'open', $2, $3, $4, $5) RETURNING id`,
     [check.id, check.severity, run.id, consecutive, summary],
   );
+  const incidentId = incidentRows[0].id;
 
   // Route by the down status (fail|error) so a profile can split them. On the open
   // path the triggering run is always down; map defensively (pass/warn can't reach
@@ -191,6 +193,28 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
     },
     await profileChannels(check, routeStatus),
   );
+
+  // AI root-cause analysis (opt-in, non-fatal) — fires ONLY here, on incident-open
+  // (not every failed run), so a flapping check isn't RCA-spammed. Runs AFTER the
+  // alert so a slow model never delays paging; writes structured JSON into the
+  // incident. Any failure is swallowed: the incident keeps its record without rca.
+  if (rcaEnabled()) {
+    try {
+      const rca = await runRca(check, run, { failing: verdict.failing, total: verdict.total });
+      if (rca) {
+        await pool.query(`UPDATE incidents SET rca = $2 WHERE id = $1`, [incidentId, JSON.stringify(rca)]);
+        console.log(
+          `[rca] check ${check.id} incident ${incidentId}: ${rca.classification} ` +
+            `(${rca.confidence}${rca.cached ? ', cached' : ''})`,
+        );
+      }
+    } catch (err) {
+      console.warn(
+        `[rca] check ${check.id} incident ${incidentId} skipped (non-fatal):`,
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
 }
 
 // A location silent longer than this is treated as offline (excluded from the

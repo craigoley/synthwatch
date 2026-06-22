@@ -212,7 +212,11 @@ CREATE TABLE incidents (
     opened_run_id        BIGINT      REFERENCES runs(id),
     resolved_run_id      BIGINT      REFERENCES runs(id),
     consecutive_failures INTEGER     NOT NULL DEFAULT 0,
-    summary              TEXT
+    summary              TEXT,
+    -- AI root-cause analysis (mirrors 0015_incident_rca.sql). Structured JSON:
+    -- { classification, confidence, observed[], inferred[], summary, signature,
+    --   model, cached, generated_at }. NULL when RCA is off / failed / pre-existing.
+    rca                  JSONB
 );
 
 -- At most one OPEN incident per check. Lets evaluate.ts rely on the DB to keep
