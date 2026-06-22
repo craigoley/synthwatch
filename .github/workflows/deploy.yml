@@ -183,3 +183,5 @@ jobs:
             echo "- **Migrations:** applied via \`synthwatch-migrate-job\` before the roll"
             echo "- **ACA Job:** \`synthwatch-runner-job\` (resource group \`synthwatch-rg\`)"
           } >> "$GITHUB_STEP_SUMMARY"
+
+# token-free deploy chain validation: second auto-merge to confirm workflow_run fires Deploy (safe to revert).
