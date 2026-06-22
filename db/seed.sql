@@ -57,4 +57,25 @@ VALUES (
     30     -- warn when the cert has <= 30 days left
 );
 
+-- Network-layer checks (no browser). Host comes from target_url; net_config holds
+-- the per-kind extras. See runner/netChecks.ts.
+
+-- DNS: resolve an A record (pass = resolves; add net_config.expectedValue to
+-- assert a specific value).
+INSERT INTO checks (name, kind, target_url, interval_seconds, timeout_ms,
+                    failure_threshold, severity, net_config)
+VALUES ('wegmans.com DNS (A)', 'dns', 'www.wegmans.com', 300, 5000, 3, 'critical',
+        '{"recordType":"A"}'::jsonb);
+
+-- TCP: is the HTTPS port open? (pass = connect; fail = refused; error = timeout)
+INSERT INTO checks (name, kind, target_url, interval_seconds, timeout_ms,
+                    failure_threshold, severity)
+VALUES ('wegmans.com TCP 443', 'tcp', 'www.wegmans.com:443', 300, 5000, 3, 'critical');
+
+-- PING: host reachability (TCP-reachability, NOT ICMP — ACA grants no CAP_NET_RAW;
+-- see netChecks.ts). Defaults to TCP 443; a connect OR refusal means reachable.
+INSERT INTO checks (name, kind, target_url, interval_seconds, timeout_ms,
+                    failure_threshold, severity)
+VALUES ('wegmans.com reachable', 'ping', 'www.wegmans.com', 300, 5000, 3, 'critical');
+
 COMMIT;

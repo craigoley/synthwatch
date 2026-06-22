@@ -18,6 +18,14 @@ export interface AuthConfig {
   value_env?: string; // api_key
 }
 
+/** Per-kind config for network checks (kind = dns | tcp | ping). Host is parsed
+ *  from target_url; these are the extras. */
+export interface NetConfig {
+  recordType?: string; // dns: A | AAAA | CNAME | MX | TXT | NS (default A)
+  expectedValue?: string; // dns: optional substring/value a record must match
+  port?: number; // tcp (required unless host:port in target_url) / ping (default 443)
+}
+
 // DATABASE_URL is required — the runner cannot do anything without the catalogue.
 export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -33,7 +41,7 @@ export type TerminalStatus = Exclude<RunStatus, 'running'>;
 export interface Check {
   id: number;
   name: string;
-  kind: 'http' | 'browser' | 'ssl';
+  kind: 'http' | 'browser' | 'ssl' | 'dns' | 'tcp' | 'ping';
   target_url: string;
   flow_name: string | null;
   method: string;
@@ -45,6 +53,8 @@ export interface Check {
   request_headers: Record<string, string> | null;
   request_body: string | null;
   auth: AuthConfig | null;
+  // Per-kind config for dns/tcp/ping checks (host comes from target_url).
+  net_config: NetConfig | null;
   interval_seconds: number;
   last_run_at: Date | null;
   timeout_ms: number;
