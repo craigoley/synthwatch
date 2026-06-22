@@ -231,9 +231,11 @@ export async function runRca(
     const url = `${ENDPOINT!.replace(/\/$/, '')}/openai/deployments/${DEPLOYMENT}/chat/completions?api-version=${API_VERSION}`;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
-    let res: Response;
+    // Keep the timeout active across BOTH the request and the body read — a slow/hung
+    // response body must not stall the runner past TIMEOUT_MS.
+    let json: { choices?: { message?: { content?: string } }[] };
     try {
-      res = await fetch(url, {
+      const res = await fetch(url, {
         method: 'POST',
         headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
         body: JSON.stringify({
@@ -246,15 +248,15 @@ export async function runRca(
         }),
         signal: controller.signal,
       });
+      if (!res.ok) {
+        console.warn(`[rca] model returned ${res.status} ${res.statusText} (non-fatal); incident records without RCA`);
+        return null;
+      }
+      json = (await res.json()) as { choices?: { message?: { content?: string } }[] };
     } finally {
       clearTimeout(timer);
     }
 
-    if (!res.ok) {
-      console.warn(`[rca] model returned ${res.status} ${res.statusText} (non-fatal); incident records without RCA`);
-      return null;
-    }
-    const json = (await res.json()) as { choices?: { message?: { content?: string } }[] };
     const content = json.choices?.[0]?.message?.content;
     if (!content) return null;
     return parseResult(content, signature);
