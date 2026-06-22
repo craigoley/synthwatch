@@ -1,8 +1,22 @@
 // Shared Postgres connection pool + the row types the runner cares about.
 // NodeNext ESM: note the explicit `.js` on every relative import elsewhere.
 import pg from 'pg';
+import type { Assertion } from './assertions.js';
 
 const { Pool } = pg;
+
+/**
+ * Auth config for an http check — a SECRET REFERENCE, never a plaintext
+ * credential. The *_env fields name a runner env var holding the actual secret.
+ */
+export interface AuthConfig {
+  type: 'none' | 'basic' | 'bearer' | 'api_key';
+  username?: string; // basic (not secret)
+  password_env?: string; // basic
+  token_env?: string; // bearer
+  header?: string; // api_key header name (default x-api-key)
+  value_env?: string; // api_key
+}
 
 // DATABASE_URL is required — the runner cannot do anything without the catalogue.
 export const pool = new Pool({
@@ -25,6 +39,12 @@ export interface Check {
   method: string;
   expected_status: number;
   body_must_contain: string | null;
+  // No-code assertion model + request config (kind='http'). assertions empty =>
+  // legacy expected_status/body_must_contain. auth is a secret reference.
+  assertions: Assertion[];
+  request_headers: Record<string, string> | null;
+  request_body: string | null;
+  auth: AuthConfig | null;
   interval_seconds: number;
   last_run_at: Date | null;
   timeout_ms: number;

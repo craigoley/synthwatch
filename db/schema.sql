@@ -31,6 +31,15 @@ CREATE TABLE checks (
     expected_status    INTEGER     NOT NULL DEFAULT 200,
     body_must_contain  TEXT,
 
+    -- No-code assertion model + request config (mirrors 0008_assertions.sql).
+    -- assertions: JSONB array of {source,comparison,target?,expected?}. EMPTY =>
+    -- evaluate the legacy expected_status/body_must_contain (no regression).
+    -- auth is a SECRET REFERENCE (env-var name), never a plaintext credential.
+    assertions         JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    request_headers    JSONB,
+    request_body       TEXT,
+    auth               JSONB,
+
     -- Cadence + claim bookkeeping. now() - last_run_at >= interval_seconds => due.
     interval_seconds   INTEGER     NOT NULL DEFAULT 300 CHECK (interval_seconds > 0),
     last_run_at        TIMESTAMPTZ,
