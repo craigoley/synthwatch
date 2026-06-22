@@ -60,3 +60,31 @@ export async function uploadTrace(runId: number, filePath: string): Promise<stri
     return null;
   }
 }
+
+/**
+ * Download a blob (by its full URL) as base64 — for feeding a failure screenshot to
+ * the RCA vision model. Returns null if storage is unconfigured, the URL isn't in
+ * our container, the blob is missing, or it's too large to inline. Never throws.
+ */
+export async function downloadBlobBase64(blobUrl: string | null): Promise<string | null> {
+  if (!CONNECTION_STRING || !blobUrl) return null;
+  try {
+    // ".../<CONTAINER>/<blobName>" -> blobName (handles the traces/ prefix too).
+    const marker = `/${CONTAINER}/`;
+    const path = new URL(blobUrl).pathname;
+    const idx = path.indexOf(marker);
+    if (idx < 0) return null;
+    const blobName = decodeURIComponent(path.slice(idx + marker.length));
+    if (!blobName) return null;
+
+    const service = BlobServiceClient.fromConnectionString(CONNECTION_STRING);
+    const blob = service.getContainerClient(CONTAINER).getBlockBlobClient(blobName);
+    const buf = await blob.downloadToBuffer();
+    // Cap inline image size (a PNG screenshot is ~50-300KB; guard against anything huge).
+    if (buf.byteLength > 5_000_000) return null;
+    return buf.toString('base64');
+  } catch (err) {
+    console.warn('[artifacts] blob download failed (non-fatal):', err instanceof Error ? err.message : err);
+    return null;
+  }
+}
