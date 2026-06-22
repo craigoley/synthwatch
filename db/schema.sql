@@ -19,7 +19,10 @@ CREATE TABLE checks (
     -- 'http'    -> cheap tier, plain fetch(), no browser.
     -- 'browser' -> real Chromium via Playwright, runs a named flow.
     -- 'ssl'     -> declarative TLS cert-expiry check (no browser); see sslCheck.ts.
-    kind               TEXT        NOT NULL CHECK (kind IN ('http', 'browser', 'ssl')),
+    -- 'dns' / 'tcp' / 'ping' -> network-layer checks (no browser); see netChecks.ts.
+    --   ('ping' is TCP-reachability, not ICMP — see netChecks.ts.)
+    kind               TEXT        NOT NULL
+                                   CHECK (kind IN ('http', 'browser', 'ssl', 'dns', 'tcp', 'ping')),
     target_url         TEXT        NOT NULL,
 
     -- For browser checks: which flow module under runner/checks/ to execute.
@@ -39,6 +42,10 @@ CREATE TABLE checks (
     request_headers    JSONB,
     request_body       TEXT,
     auth               JSONB,
+
+    -- Per-kind config for dns/tcp/ping checks (mirrors 0011_network_checks.sql).
+    -- dns: {recordType, expectedValue}; tcp/ping: {port}. Host is from target_url.
+    net_config         JSONB,
 
     -- Cadence + claim bookkeeping. now() - last_run_at >= interval_seconds => due.
     interval_seconds   INTEGER     NOT NULL DEFAULT 300 CHECK (interval_seconds > 0),

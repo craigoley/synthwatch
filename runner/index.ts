@@ -15,6 +15,7 @@ import { chromium, type Browser } from 'playwright';
 import { pool, type Check, type RunRecord, type TerminalStatus } from './db.js';
 import { runHttpCheck } from './httpCheck.js';
 import { runSslCheck } from './sslCheck.js';
+import { runDnsCheck, runTcpCheck, runPingCheck } from './netChecks.js';
 import { StepRecorder } from './stepRecorder.js';
 import { loadFlow } from './checks/index.js';
 import { syncFlowManifest } from './flowManifest.js';
@@ -143,6 +144,8 @@ async function runOne(check: Check): Promise<void> {
   try {
     if (check.kind === 'http') outcome = await executeHttp(check);
     else if (check.kind === 'ssl') outcome = await executeSsl(check);
+    else if (check.kind === 'dns' || check.kind === 'tcp' || check.kind === 'ping')
+      outcome = await executeNet(check);
     else outcome = await executeBrowser(check, runId);
   } catch (err) {
     // Unexpected runner error (e.g. flow loader threw) -> 'error', not 'fail'.
@@ -217,6 +220,27 @@ async function executeHttp(check: Check): Promise<Outcome> {
     httpStatus: r.httpStatus,
     durationMs: r.durationMs,
     error: r.error,
+    failedStep: null,
+    screenshot: null,
+    metrics: null,
+    certDaysRemaining: null,
+  };
+}
+
+async function executeNet(check: Check): Promise<Outcome> {
+  const r =
+    check.kind === 'dns'
+      ? await runDnsCheck(check)
+      : check.kind === 'tcp'
+        ? await runTcpCheck(check)
+        : await runPingCheck(check);
+  // message (resolved records / latency / reachability) is recorded in
+  // error_message for visibility, on pass too — mirrors the ssl pattern.
+  return {
+    status: r.verdict, // 'pass' | 'fail' | 'error'
+    httpStatus: null,
+    durationMs: r.durationMs,
+    error: r.message,
     failedStep: null,
     screenshot: null,
     metrics: null,
