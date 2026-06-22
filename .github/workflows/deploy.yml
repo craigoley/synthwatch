@@ -1,16 +1,19 @@
 name: Deploy runner to ACA Job
 
-# Build the runner image and roll it to the Azure Container Apps JOB on merge to
-# main. Authentication uses OIDC (federated credential) — no Azure secrets stored
-# in the repo; only the non-sensitive client/tenant/subscription IDs are repo vars.
+# Build the runner image and roll it to the Azure Container Apps JOB. Authentication
+# uses OIDC (federated credential) — no Azure secrets stored in the repo; only the
+# non-sensitive client/tenant/subscription IDs are repo vars.
 #
-# TOKEN-FREE AUTO-DEPLOY after a hands-free auto-merge: native auto-merge completes
-# via the default GITHUB_TOKEN, and GitHub SUPPRESSES push-triggered workflows from
-# GITHUB_TOKEN events — so `on: push` does NOT fire after an auto-merge. The ONE
-# thing that reliably runs on main post-auto-merge is CodeQL (code-scanning default
-# setup), which is NOT suppressed. So we ALSO chain off it via `workflow_run`
-# (workflow_run is exempt from the GITHUB_TOKEN suppression). The `push` trigger
-# still serves direct human pushes; `workflow_dispatch` is the manual fallback.
+# TRIGGERS:
+#   push (main, path-filtered) — direct human pushes deploy immediately.
+#   workflow_dispatch          — manual fallback AND the token-free auto-deploy path:
+#                                the claude-review `automerge` job dispatches this
+#                                after a hands-free auto-merge. (Native auto-merge
+#                                completes via GITHUB_TOKEN, whose push event GitHub
+#                                SUPPRESSES, so `on: push` does NOT fire post-auto-
+#                                merge — workflow_run off code-scanning default setup
+#                                does not fire either. workflow_dispatch is the
+#                                documented GITHUB_TOKEN exception that IS delivered.)
 on:
   push:
     branches: [main]
@@ -19,10 +22,6 @@ on:
       - 'db/**'
       - '**/Dockerfile'
       - '.github/workflows/deploy.yml'
-  workflow_run:
-    workflows: ["CodeQL"]   # the code-scanning run that fires on main post-auto-merge
-    types: [completed]
-    branches: [main]
   workflow_dispatch:
 
 # Serialize deploys to main; a newer deploy cancels an in-flight older one so two pushes can't
@@ -31,69 +30,17 @@ concurrency:
   group: deploy-main
   cancel-in-progress: true
 
-# Least privilege: id-token to mint the OIDC token for azure/login, contents to checkout
-# + read commit files in the gate.
+# Least privilege: id-token to mint the OIDC token for azure/login, read to checkout.
 permissions:
   id-token: write
   contents: read
 
 jobs:
-  # Decide whether to deploy and resolve the exact commit. The workflow_run path
-  # (auto-merge) can't use `on.push.paths`, so we reproduce the filter here AND
-  # require CodeQL success — a failed-CI merge must never deploy the runner.
-  gate:
-    runs-on: ubuntu-latest
-    outputs:
-      deploy: ${{ steps.decide.outputs.deploy }}
-      sha: ${{ steps.decide.outputs.sha }}
-    steps:
-      - name: Decide deploy + resolve SHA
-        id: decide
-        env:
-          GH_TOKEN: ${{ github.token }}
-          EVENT: ${{ github.event_name }}
-          WR_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
-          WR_SHA: ${{ github.event.workflow_run.head_sha }}
-          PUSH_SHA: ${{ github.sha }}
-          REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          # Manual + direct-push paths: push is already path-filtered by on.push.paths.
-          if [ "$EVENT" = "workflow_dispatch" ] || [ "$EVENT" = "push" ]; then
-            echo "sha=$PUSH_SHA" >> "$GITHUB_OUTPUT"
-            echo "deploy=true"   >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          # workflow_run (auto-merge path, where push is suppressed):
-          echo "sha=$WR_SHA" >> "$GITHUB_OUTPUT"
-          if [ "$WR_CONCLUSION" != "success" ]; then
-            echo "::notice::CodeQL concluded '$WR_CONCLUSION' — NOT deploying (a failed-CI merge must not deploy)."
-            echo "deploy=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          # Reproduce the path filter: only deploy if this commit touched runner/db/Dockerfile/deploy.yml.
-          CHANGED=$(gh api "repos/$REPO/commits/$WR_SHA" --jq '.files[].filename' || true)
-          echo "changed files in $WR_SHA:"; echo "$CHANGED"
-          if echo "$CHANGED" | grep -qE '^(runner/|db/|.*Dockerfile$|\.github/workflows/deploy\.yml$)'; then
-            echo "deploy=true"  >> "$GITHUB_OUTPUT"
-          else
-            echo "::notice::No deploy-relevant changes in $WR_SHA — skipping deploy."
-            echo "deploy=false" >> "$GITHUB_OUTPUT"
-          fi
-
   deploy:
-    needs: gate
-    if: needs.gate.outputs.deploy == 'true'
     runs-on: ubuntu-latest
-    env:
-      SHA: ${{ needs.gate.outputs.sha }}
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          # Deploy the EXACT commit (the merge commit for the workflow_run path),
-          # not whatever HEAD happens to be.
-          ref: ${{ needs.gate.outputs.sha }}
 
       - name: Azure login (OIDC)
         uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
@@ -110,7 +57,7 @@ jobs:
           # COPY paths are relative to the runner/ directory.
           inlineScript: |
             az acr build -r synthwatcholey0620 \
-              -t synthwatch-runner:${SHA} -t synthwatch-runner:latest \
+              -t synthwatch-runner:${{ github.sha }} -t synthwatch-runner:latest \
               -f runner/Dockerfile runner
 
       - name: Build and push migration image (ACR)
@@ -120,7 +67,7 @@ jobs:
           # Build context is db/ — Dockerfile.migrate COPYs migrations/ and migrate.sh.
           inlineScript: |
             az acr build -r synthwatcholey0620 \
-              -t synthwatch-migrate:${SHA} -t synthwatch-migrate:latest \
+              -t synthwatch-migrate:${{ github.sha }} -t synthwatch-migrate:latest \
               -f db/Dockerfile.migrate db
 
       # Apply DB migrations BEFORE rolling the new runner image, so the schema is
@@ -137,7 +84,7 @@ jobs:
             set -euo pipefail
             JOB=synthwatch-migrate-job
             RG=synthwatch-rg
-            IMAGE=synthwatcholey0620.azurecr.io/synthwatch-migrate:${SHA}
+            IMAGE=synthwatcholey0620.azurecr.io/synthwatch-migrate:${{ github.sha }}
 
             # Point the migrate job at this commit's image.
             az containerapp job update -n "$JOB" -g "$RG" --image "$IMAGE"
@@ -170,18 +117,16 @@ jobs:
           # never `containerapp update`.
           inlineScript: |
             az containerapp job update -n synthwatch-runner-job -g synthwatch-rg \
-              --image synthwatcholey0620.azurecr.io/synthwatch-runner:${SHA}
+              --image synthwatcholey0620.azurecr.io/synthwatch-runner:${{ github.sha }}
 
       - name: Write deployment summary
         run: |
           {
             echo "### Runner deployed"
             echo ""
-            echo "- **Commit SHA:** \`${SHA}\`"
+            echo "- **Commit SHA:** \`${{ github.sha }}\`"
             echo "- **Trigger:** \`${{ github.event_name }}\`"
-            echo "- **Runner image:** \`synthwatcholey0620.azurecr.io/synthwatch-runner:${SHA}\`"
+            echo "- **Runner image:** \`synthwatcholey0620.azurecr.io/synthwatch-runner:${{ github.sha }}\`"
             echo "- **Migrations:** applied via \`synthwatch-migrate-job\` before the roll"
             echo "- **ACA Job:** \`synthwatch-runner-job\` (resource group \`synthwatch-rg\`)"
           } >> "$GITHUB_STEP_SUMMARY"
-
-# token-free deploy chain validation: second auto-merge to confirm workflow_run fires Deploy (safe to revert).

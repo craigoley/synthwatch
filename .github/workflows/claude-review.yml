@@ -91,11 +91,37 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - name: Enable auto-merge (trusted author)
+      - name: Enable auto-merge, then dispatch Deploy on merge (trusted author)
         env:
           GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          LOGIN: ${{ github.event.pull_request.user.login }}
         run: |
-          echo "PR #${{ github.event.pull_request.number }} by '${{ github.event.pull_request.user.login }}' is TRUSTED — enabling squash auto-merge."
-          gh pr merge "${{ github.event.pull_request.number }}" \
-            --repo "${{ github.repository }}" \
-            --auto --squash --delete-branch
+          set -euo pipefail
+          echo "PR #$PR by '$LOGIN' is TRUSTED — enabling squash auto-merge."
+          gh pr merge "$PR" --repo "$REPO" --auto --squash --delete-branch
+
+          # TOKEN-FREE AUTO-DEPLOY: native auto-merge completes via GITHUB_TOKEN, whose
+          # resulting push event GitHub SUPPRESSES — so deploy.yml's `on: push` does NOT
+          # fire after an auto-merge (verified; workflow_run off code-scanning default
+          # setup doesn't fire either). workflow_dispatch is the documented GITHUB_TOKEN
+          # EXCEPTION that IS delivered — so once the PR actually merges, dispatch Deploy.
+          # Only if the PR touched deploy-relevant paths (mirrors deploy.yml's path filter).
+          FILES=$(gh pr view "$PR" --repo "$REPO" --json files --jq '.files[].path')
+          if ! echo "$FILES" | grep -qE '^(runner/|db/|.*Dockerfile$|\.github/workflows/deploy\.yml$)'; then
+            echo "No deploy-relevant changes in PR #$PR — not dispatching Deploy."
+            exit 0
+          fi
+          # Wait (bounded) for the auto-merge to land — checks must pass first. If they
+          # fail, the PR never merges and we simply never dispatch (a failed-CI merge
+          # must not deploy).
+          for _ in $(seq 1 60); do
+            if [ "$(gh pr view "$PR" --repo "$REPO" --json merged --jq '.merged')" = "true" ]; then
+              echo "PR #$PR merged — dispatching Deploy (workflow_dispatch, token-free)."
+              gh workflow run deploy.yml --repo "$REPO" --ref main
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "::notice::PR #$PR not merged within ~20m (checks pending/failed) — Deploy not dispatched."
