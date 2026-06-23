@@ -60,15 +60,16 @@ export interface AlertPayload {
 
 /**
  * A delivery channel — a TARGET loaded from the DB `channels` table (NOT env). `config`
- * holds the target: email -> {to, from}; webhook -> {url, authHeader?}. The transport
- * SECRET (ACS connection string) still comes from env — only targets + routing are DB.
+ * holds the target: email -> {to}; webhook -> {url, authHeader?}. The transport SECRET
+ * (ACS_EMAIL_CONNECTION_STRING) AND the SENDER (ALERT_EMAIL_FROM — a verified sender on the
+ * ACS-owned domain) both come from env — only the recipients/URL + routing are DB.
  * `type` drives which send fn runs.
  */
 export interface Channel {
   id: number;
   name: string;
   type: 'email' | 'webhook';
-  config: { to?: string[]; from?: string; url?: string; authHeader?: string };
+  config: { to?: string[]; url?: string; authHeader?: string };
   enabled: boolean;
 }
 
@@ -96,9 +97,9 @@ function bodyText(p: AlertPayload): string {
 }
 
 // --- Delivery: Azure Communication Services email --------------------------
-// Transport SECRET (ACS connection string) from env; sender + recipients from the
-// channel's DB config. Builder is exported so a test can assert the recipients without
-// touching ACS.
+// Transport SECRET (ACS connection string) AND sender (ALERT_EMAIL_FROM) from env;
+// recipients (to[]) from the channel's DB config. Builder is exported so a test can assert
+// the recipients without touching ACS.
 export function buildEmailMessage(from: string, to: string[], p: AlertPayload) {
   return {
     senderAddress: from,
@@ -109,7 +110,7 @@ export function buildEmailMessage(from: string, to: string[], p: AlertPayload) {
 
 async function sendEmail(c: Channel, p: AlertPayload): Promise<void> {
   const connectionString = process.env.ACS_EMAIL_CONNECTION_STRING;
-  const from = c.config.from;
+  const from = process.env.ALERT_EMAIL_FROM; // transport sender (verified ACS domain), not channel config
   const to = c.config.to ?? [];
   if (!connectionString || !from || to.length === 0) return;
   const client = new EmailClient(connectionString);
@@ -157,14 +158,17 @@ async function sendWebhook(c: Channel, p: AlertPayload): Promise<void> {
 
 /**
  * A channel is DELIVERABLE when enabled AND its transport is available: email needs the
- * ACS connection string (env) + a sender + >=1 recipient; webhook needs a URL. (The
- * target came from the DB; the transport secret from env.)
+ * ACS connection string (env) + the sender ALERT_EMAIL_FROM (env) + >=1 recipient (DB);
+ * webhook needs a URL. (Recipients/URL come from the DB; the secret + sender from env.)
  */
 export function channelDeliverable(c: Channel): boolean {
   if (!c.enabled) return false;
   if (c.type === 'email') {
     return Boolean(
-      process.env.ACS_EMAIL_CONNECTION_STRING && c.config.from && c.config.to && c.config.to.length > 0,
+      process.env.ACS_EMAIL_CONNECTION_STRING &&
+        process.env.ALERT_EMAIL_FROM &&
+        c.config.to &&
+        c.config.to.length > 0,
     );
   }
   if (c.type === 'webhook') return Boolean(c.config.url);
