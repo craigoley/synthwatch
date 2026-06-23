@@ -21,6 +21,15 @@ const DEPLOYMENT = process.env.RCA_MODEL_DEPLOYMENT ?? process.env.AZURE_OPENAI_
 // GA chat-completions version (learn.microsoft.com); override if a fork needs newer.
 const API_VERSION = process.env.AZURE_OPENAI_API_VERSION ?? '2024-10-21';
 const TIMEOUT_MS = Number(process.env.RCA_TIMEOUT_MS ?? 30000);
+// Completion budget. gpt-5-mini is a REASONING model: hidden reasoning tokens count
+// against this BEFORE the visible JSON is emitted (commonly 1000-2000), so a tight
+// budget truncates the output (finish_reason='length' -> empty content). Default
+// 4000 leaves ample room for reasoning + the small classification JSON.
+const MAX_TOKENS = Number(process.env.RCA_MAX_TOKENS ?? 4000);
+// OPT-IN reasoning_effort (minimal|low|medium|high) to cap reasoning spend. Sent
+// ONLY when set: api-version 2024-10-21 predates GPT-5 and may 400 on this param, so
+// it stays off by default; a fork on a newer api-version / the v1 API can enable it.
+const REASONING_EFFORT = process.env.RCA_REASONING_EFFORT;
 // Reuse an RCA for an identical failure signature opened within this window.
 const CACHE_TTL = process.env.RCA_CACHE_TTL ?? '24 hours';
 // AAD scope for Azure AI / Cognitive Services data-plane.
@@ -170,17 +179,36 @@ async function cacheLookup(checkId: number, signature: string): Promise<RcaResul
   return rows[0]?.rca ?? null;
 }
 
+/** Pull the JSON object out of a model response — tolerant of markdown fences or
+ *  leading/trailing prose (response_format json_object should prevent these, but be
+ *  robust). Returns the outermost {...} slice. */
+function extractJson(content: string): string {
+  let s = content.trim();
+  const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) s = fence[1].trim();
+  const first = s.indexOf('{');
+  const last = s.lastIndexOf('}');
+  if (first >= 0 && last > first) s = s.slice(first, last + 1);
+  return s;
+}
+
 function parseResult(content: string, signature: string): RcaResult | null {
   let obj: Record<string, unknown>;
   try {
-    obj = JSON.parse(content) as Record<string, unknown>;
-  } catch {
+    obj = JSON.parse(extractJson(content)) as Record<string, unknown>;
+  } catch (err) {
+    console.warn(`[rca] parse failed: JSON.parse error: ${err instanceof Error ? err.message : String(err)}`);
     return null;
   }
   const classification = obj.classification as Classification;
   const confidence = obj.confidence as Confidence;
-  if (!CLASSIFICATIONS.includes(classification) || !CONFIDENCES.includes(confidence)) {
-    return null; // model returned an off-taxonomy class — treat as no RCA (non-fatal)
+  if (!CLASSIFICATIONS.includes(classification)) {
+    console.warn(`[rca] parse failed: off-taxonomy classification ${JSON.stringify(obj.classification)}`);
+    return null;
+  }
+  if (!CONFIDENCES.includes(confidence)) {
+    console.warn(`[rca] parse failed: invalid confidence ${JSON.stringify(obj.confidence)}`);
+    return null;
   }
   const arr = (v: unknown): string[] =>
     Array.isArray(v) ? v.filter((x) => typeof x === 'string').slice(0, 6) : [];
@@ -231,33 +259,53 @@ export async function runRca(
     const url = `${ENDPOINT!.replace(/\/$/, '')}/openai/deployments/${DEPLOYMENT}/chat/completions?api-version=${API_VERSION}`;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+    const body: Record<string, unknown> = {
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user', content: userContent },
+      ],
+      max_completion_tokens: MAX_TOKENS,
+      response_format: { type: 'json_object' },
+    };
+    if (REASONING_EFFORT) body.reasoning_effort = REASONING_EFFORT;
+
     let res: Response;
     try {
       res = await fetch(url, {
         method: 'POST',
         headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-        body: JSON.stringify({
-          messages: [
-            { role: 'system', content: SYSTEM_PROMPT },
-            { role: 'user', content: userContent },
-          ],
-          max_completion_tokens: 800,
-          response_format: { type: 'json_object' },
-        }),
+        body: JSON.stringify(body),
         signal: controller.signal,
       });
     } finally {
       clearTimeout(timer);
     }
 
+    // Funnel telemetry — make every exit path observable from logs alone.
+    console.log(`[rca] model HTTP ${res.status}`);
     if (!res.ok) {
       console.warn(`[rca] model returned ${res.status} ${res.statusText} (non-fatal); incident records without RCA`);
       return null;
     }
-    const json = (await res.json()) as { choices?: { message?: { content?: string } }[] };
-    const content = json.choices?.[0]?.message?.content;
-    if (!content) return null;
-    return parseResult(content, signature);
+    const json = (await res.json()) as {
+      choices?: { message?: { content?: string }; finish_reason?: string }[];
+      usage?: unknown;
+    };
+    const choice = json.choices?.[0];
+    const content = choice?.message?.content;
+    const finishReason = choice?.finish_reason ?? 'unknown';
+    // usage carries completion/reasoning token counts (no prompt content, non-sensitive).
+    console.log(
+      `[rca] finish_reason=${finishReason} content_len=${content?.length ?? 0} usage=${JSON.stringify(json.usage ?? {})}`,
+    );
+    if (!content) {
+      const hint = finishReason === 'length' ? ' (TRUNCATED — raise RCA_MAX_TOKENS)' : '';
+      console.warn(`[rca] empty model content (finish_reason=${finishReason})${hint} — no RCA`);
+      return null;
+    }
+    const result = parseResult(content, signature);
+    if (result) console.log(`[rca] parsed OK: ${result.classification} (${result.confidence})`);
+    return result;
   } catch (err) {
     console.warn('[rca] failed (non-fatal):', err instanceof Error ? err.message : err);
     return null;
