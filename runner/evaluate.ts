@@ -168,12 +168,26 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
     `Check "${check.name}" down (${run.status}) ${where}` +
     (run.failed_step ? ` (died at step: ${run.failed_step})` : '') + '.';
 
+  // ON CONFLICT: with per-location cadence, two regions can evaluate the same check
+  // concurrently, both see no open incident, and both reach this INSERT. The partial
+  // unique index one_open_incident_per_check would make the loser THROW (-> the run's
+  // catch -> process.exit(1)) — so swallow the race: the loser gets zero rows and
+  // silently no-ops (the winner opens the incident + pages exactly once).
   const { rows: incidentRows } = await pool.query<{ id: number }>(
     `INSERT INTO incidents (check_id, status, severity, opened_run_id,
                             consecutive_failures, summary)
-     VALUES ($1, 'open', $2, $3, $4, $5) RETURNING id`,
+     VALUES ($1, 'open', $2, $3, $4, $5)
+     ON CONFLICT (check_id) WHERE status = 'open' DO NOTHING
+     RETURNING id`,
     [check.id, check.severity, run.id, consecutive, summary],
   );
+  if (!incidentRows[0]) {
+    // Another location won the open race — it pages; we don't double-page.
+    console.log(
+      `[runner] check ${check.id} "${check.name}" down — incident already opened by another location this tick`,
+    );
+    return;
+  }
   const incidentId = incidentRows[0].id;
 
   // Route by the down status (fail|error) so a profile can split them. On the open
@@ -374,14 +388,36 @@ const BURN_FAST_THRESHOLD = 14.4;
 const BURN_SLOW_WINDOW = '6 hours';
 const BURN_SLOW_THRESHOLD = 6;
 
-async function sloBurnRate(checkId: number, windowInterval: string): Promise<number | null> {
-  const { rows } = await pool.query<{ burn_rate: string | null }>(
-    `SELECT burn_rate FROM slo_status($1, now() - $2::interval, now())`,
+/**
+ * Burn rate PER LOCATION over [now-window, now): (down/total)/(1-target) for each
+ * location with runs in the window, maintenance-excluded (same anti-join as
+ * slo_status). Pooling all locations into one rate (the old slo_status path) let a
+ * single fully-down region trip a critical burn page that the cross-location verdict
+ * deliberately suppresses — so we keep the rates separated and let the caller require
+ * >= min_fail_locations regions to be burning before paging. caller guards slo_target.
+ */
+async function burnRatesByLocation(
+  checkId: number,
+  windowInterval: string,
+  target: number,
+): Promise<number[]> {
+  const { rows } = await pool.query<{ total: string; down: string }>(
+    `SELECT count(*) FILTER (WHERE r.status IN ('pass','warn','fail','error')) AS total,
+            count(*) FILTER (WHERE r.status IN ('fail','error'))                AS down
+       FROM runs r
+       LEFT JOIN maintenance_windows mw
+              ON (mw.check_id = r.check_id OR mw.check_id IS NULL)
+             AND r.started_at >= mw.starts_at AND r.started_at < mw.ends_at
+      WHERE r.check_id = $1
+        AND r.started_at >= now() - $2::interval AND r.started_at < now()
+        AND mw.id IS NULL
+      GROUP BY r.location`,
     [checkId, windowInterval],
   );
-  // No row => the check has no slo_target (opt-in). burn_rate is numeric (string via pg).
-  if (rows.length === 0) return null;
-  return rows[0].burn_rate == null ? 0 : Number(rows[0].burn_rate);
+  return rows
+    .map((r) => ({ total: Number(r.total), down: Number(r.down) }))
+    .filter((r) => r.total > 0)
+    .map((r) => r.down / r.total / (1 - target));
 }
 
 /**
@@ -405,16 +441,26 @@ export async function maybeBurnAlert(check: Check): Promise<void> {
     let windowLabel: string;
     let burn: number;
 
-    const fast = await sloBurnRate(check.id, BURN_FAST_WINDOW);
-    if (fast === null) return; // no slo_target row (shouldn't happen given the guard)
-    if (fast >= BURN_FAST_THRESHOLD) {
-      severity = 'critical'; routeStatus = 'error'; label = 'fast burn'; windowLabel = '1h'; burn = fast;
+    // Page only when burn crosses threshold from >= N locations (mirrors the
+    // cross-location verdict's min_fail_locations), so one flaky region can't page.
+    // With a single active location this reduces to exactly the old pooled behaviour.
+    const fastRates = await burnRatesByLocation(check.id, BURN_FAST_WINDOW, check.slo_target);
+    const fastActive = fastRates.length;
+    const fastN = check.min_fail_locations ?? (fastActive >= 2 ? 2 : 1);
+    const fastBurning = fastRates.filter((b) => b >= BURN_FAST_THRESHOLD).length;
+    if (fastActive > 0 && fastBurning >= fastN) {
+      severity = 'critical'; routeStatus = 'error'; label = 'fast burn'; windowLabel = '1h';
+      burn = Math.max(...fastRates);
     } else {
-      const slow = (await sloBurnRate(check.id, BURN_SLOW_WINDOW)) ?? 0;
-      if (slow >= BURN_SLOW_THRESHOLD) {
-        severity = 'warning'; routeStatus = 'warn'; label = 'slow burn'; windowLabel = '6h'; burn = slow;
+      const slowRates = await burnRatesByLocation(check.id, BURN_SLOW_WINDOW, check.slo_target);
+      const slowActive = slowRates.length;
+      const slowN = check.min_fail_locations ?? (slowActive >= 2 ? 2 : 1);
+      const slowBurning = slowRates.filter((b) => b >= BURN_SLOW_THRESHOLD).length;
+      if (slowActive > 0 && slowBurning >= slowN) {
+        severity = 'warning'; routeStatus = 'warn'; label = 'slow burn'; windowLabel = '6h';
+        burn = Math.max(...slowRates);
       } else {
-        return; // budget burn within tolerance
+        return; // budget burn within tolerance (or not from enough locations)
       }
     }
 
