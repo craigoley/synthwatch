@@ -398,6 +398,11 @@ CREATE OR REPLACE VIEW sla_availability_7d AS
 CREATE OR REPLACE VIEW sla_availability_30d AS
     SELECT * FROM sla_availability(now() - interval '30 days', now());
 
+-- 90d (mirrors 0018_sla_90d.sql) — the SLA/SLO reporting window. GRANT SELECT to
+-- "synthwatch-api" is applied via the migration / ops (the snapshot has no MI role).
+CREATE OR REPLACE VIEW sla_availability_90d AS
+    SELECT * FROM sla_availability(now() - interval '90 days', now());
+
 -- ---------------------------------------------------------------------------
 -- slo_status: per-check SLO / error-budget / burn-rate over a window (mirrors
 -- 0016_slo.sql). Run-weighted, reusing sla_availability's up/down taxonomy and
