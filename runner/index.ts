@@ -133,18 +133,18 @@ async function reapStaleRunning(): Promise<void> {
 }
 
 /**
- * Candidate due checks FOR THIS LOCATION. Cadence is per-(check, location): a check
- * is due for this region when it has no check_locations cursor yet (never run here)
- * or its cursor for THIS location has aged past interval_seconds. Cheap pre-filter;
- * the claim below is the real gate. Each region only ever considers its own cursor,
- * so regions pace independently (no global active-location coordination).
+ * Candidate due checks FOR THIS LOCATION. ENFORCED assignment: the INNER JOIN means a
+ * check is a candidate ONLY if it has a check_locations cursor for THIS region — a
+ * check not assigned here is simply not selected (no lazy-insert auto-creates one;
+ * see claim()). Due when the cursor is NULL (freshly seeded => due-now) or aged past
+ * interval_seconds. Cheap pre-filter; claim() is the real (atomic) gate.
  */
 async function findDueChecks(): Promise<{ id: number }[]> {
   const { rows } = await pool.query<{ id: number }>(
     `SELECT c.id
        FROM checks c
-       LEFT JOIN check_locations cl
-              ON cl.check_id = c.id AND cl.location = $1
+       JOIN check_locations cl
+         ON cl.check_id = c.id AND cl.location = $1
       WHERE c.enabled
         AND (cl.last_run_at IS NULL
              OR now() - cl.last_run_at >= make_interval(secs => c.interval_seconds))`,
@@ -154,29 +154,29 @@ async function findDueChecks(): Promise<{ id: number }[]> {
 }
 
 /**
- * Atomically claim a check FOR THIS LOCATION. UPSERTs this region's cadence cursor:
- * a first run inserts the cursor (always wins); thereafter the ON CONFLICT DO UPDATE
- * advances last_run_at only if still due, so concurrent replicas of the SAME region
- * race the row and exactly one wins (RETURNING is empty for the losers / not-due).
- * Crucially this is keyed on (check_id, $LOCATION), so a DIFFERENT region claims
- * independently — the bug 0019 fixes. Mirrors checks.last_run_at for legacy readers.
- * Returns the full check row if we won, or null otherwise.
+ * Atomically claim a check FOR THIS LOCATION — ENFORCED: UPDATE the EXISTING
+ * (check_id, $LOCATION) cursor only; NO lazy-insert. If the check has no cursor for
+ * this region (not assigned here), zero rows update -> claim returns null and the
+ * check does NOT run here. The UPDATE advances last_run_at only if still due (NULL =>
+ * due-now, preserving #68's IS NULL arm; a freshly-seeded cursor claims on its first
+ * tick), so concurrent replicas of the SAME region race the row and exactly one wins
+ * (READ COMMITTED re-checks the predicate against the winner's new last_run_at). Keyed
+ * on (check_id, $LOCATION) => a DIFFERENT region claims its own cursor independently.
+ * Mirrors checks.last_run_at for legacy readers. Returns the check row if we won, else null.
  */
 async function claim(id: number): Promise<Check | null> {
   const { rows } = await pool.query<Check>(
     `WITH claimed AS (
-       INSERT INTO check_locations (check_id, location, last_run_at)
-       SELECT $1, $2, now() FROM checks WHERE id = $1 AND enabled
-       ON CONFLICT (check_id, location) DO UPDATE
-         SET last_run_at = now()
-         -- IS NULL arm mirrors findDueChecks: a backfilled cursor can be NULL
-         -- (checks.last_run_at is nullable); without this, now() - NULL is NULL,
-         -- the predicate is never true, and such a check is reported due every
-         -- tick but never claimed — a silent permanent stall.
-         WHERE check_locations.last_run_at IS NULL
-            OR now() - check_locations.last_run_at
-               >= make_interval(secs => (SELECT interval_seconds FROM checks WHERE id = $1))
-       RETURNING check_id
+       UPDATE check_locations cl
+          SET last_run_at = now()
+         FROM checks c
+        WHERE cl.check_id = $1
+          AND cl.location = $2
+          AND c.id = cl.check_id
+          AND c.enabled
+          AND (cl.last_run_at IS NULL
+               OR now() - cl.last_run_at >= make_interval(secs => c.interval_seconds))
+       RETURNING cl.check_id
      ),
      mirror AS (
        UPDATE checks SET last_run_at = now()
