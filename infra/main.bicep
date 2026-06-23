@@ -94,6 +94,13 @@ param migrateJobName string = 'synthwatch-migrate-job'
 @description('User-assigned managed identity name (used for ACR pull).')
 param identityName string = 'synthwatch-runner-id'
 
+// The Postgres Entra admin's objectId (a child resource NAME must be known at the
+// start of deployment, so it can't be derived from identity.properties.principalId at
+// runtime — hence a param). Default = the synthwatch-runner-id MI's principalId; the
+// API authenticates to Postgres as this principal. tenantId is derived (subscription).
+@description('objectId (principalId) of the synthwatch-runner-id MI — the Postgres Entra admin.')
+param aadAdminObjectId string = '5ca727ad-06a2-42a9-b31c-4e7b9382ab96'
+
 @description('Blob container for failure screenshots. Matches the runner default (AZURE_STORAGE_CONTAINER).')
 param artifactContainerName string = 'synthwatch-artifacts'
 
@@ -142,10 +149,31 @@ resource postgres 'Microsoft.DBforPostgreSQL/flexibleServers@2024-08-01' = {
     highAvailability: {
       mode: 'Disabled'
     }
+    // OWN THE COMPLETE auth state. The API authenticates to Postgres via the
+    // synthwatch-runner-id Managed Identity (AAD token), NOT a password — so a deploy
+    // must PRESERVE AAD auth. A partial authConfig (e.g. activeDirectoryAuth omitted /
+    // 'Disabled', no tenantId) RESETS the server to password-only and WIPES the Entra
+    // admins, 500-ing every DB endpoint. Keep BOTH enabled + the tenant pinned.
     authConfig: {
       passwordAuth: 'Enabled'
-      activeDirectoryAuth: 'Disabled'
+      activeDirectoryAuth: 'Enabled'
+      tenantId: subscription().tenantId
     }
+  }
+}
+
+// Entra (AAD) admin for the Postgres server — the synthwatch-runner-id MANAGED
+// IDENTITY (a ServicePrincipal). Declared so a deploy re-asserts it (the bug above
+// wiped it). objectId/tenantId are DERIVED (the MI's own principalId + the
+// subscription tenant), never hardcoded. Craig's personal user admin is intentionally
+// NOT in IaC — incremental deploys don't delete unlisted admins, so it's preserved.
+resource postgresEntraAdmin 'Microsoft.DBforPostgreSQL/flexibleServers/administrators@2024-08-01' = {
+  parent: postgres
+  name: aadAdminObjectId
+  properties: {
+    principalType: 'ServicePrincipal'
+    principalName: identityName
+    tenantId: subscription().tenantId
   }
 }
 
