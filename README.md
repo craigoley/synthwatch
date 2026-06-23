@@ -384,3 +384,5 @@ inspect the real DOM and replace them before trusting it.
 
 <!-- claude-review end-to-end validation: trivial docs touch, safe to merge. -->
 
+
+<!-- review-gate binding check: confirm merge waits for the Claude review required check (safe to revert) -->
