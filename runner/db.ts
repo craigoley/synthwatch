@@ -77,9 +77,10 @@ export interface Check {
   // Ordered step chain for kind='multistep'. null for all other kinds.
   steps: ChainStep[] | null;
   // Multi-location: open an incident only when failing from >= this many distinct
-  // locations. null => ALL SELECTED locations must fail (N-of-N, the default; computed
-  // from the check's check_locations count). An explicit INT = that absolute threshold.
-  // Single selected location => N=1 => pre-multi-location behaviour. See crossLocationDown.
+  // locations. null => ALL REPORTING locations must fail (N-of-N over what's currently
+  // reporting; a stale region is excluded so it can't block paging). An explicit INT =
+  // that absolute threshold, capped at the reporting count. One reporting location =>
+  // N=1 => pre-multi-location behaviour. See effectiveN()/crossLocationDown().
   min_fail_locations: number | null;
   interval_seconds: number;
   last_run_at: Date | null;

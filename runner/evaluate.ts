@@ -254,35 +254,48 @@ interface Verdict {
 }
 
 /**
- * Cross-location "down" decision: the check is DOWN only when >= effective-N of its
- * locations are in a failing state. effective-N:
- *   - explicit min_fail_locations (INT)  => that absolute threshold (e.g. 1 = page if
- *     ANY location fails, for a critical check).
- *   - NULL (unset, the default)          => ALL SELECTED locations must fail (N-of-N) —
- *     the conservative false-positive killer ("1 of N = likely network; N of N = real").
- * `selected` is the check's assigned-location count (its check_locations rows). With a
- * single selected location, N = 1, so the one location failing = down — EXACTLY the
- * pre-multi-location behaviour. The `failing >= 1` floor keeps a 0-failing check up
- * even if selected is 0.
+ * The effective cross-location threshold N — the failing/burning-location count must
+ * reach this to page. SHARED by the incident verdict (crossLocationDown) and the burn
+ * path so the two can never diverge.
+ *
+ * N is based on REPORTING locations (those with a recent run), NOT all-ASSIGNED. A
+ * stale/silent region (no recent runs — runner crash, region outage, deploy gap) can't
+ * be in the failing set, so counting it toward N would SILENTLY BLOCK paging whenever a
+ * selected region goes quiet, even when every region that IS reporting is down. That is
+ * a monitoring-self-failure; basing N on reporting locations fixes it.
+ *   - NULL override (the default) => N = all REPORTING locations (N-of-N over what we
+ *     can actually see — the conservative "1 of N = network, N of N = real" default).
+ *   - explicit INT => that absolute threshold, CAPPED at the reporting count (so an
+ *     override larger than the reporting set can't reintroduce the block-forever trap).
+ * Single reporting location => N=1 => exactly the pre-multi-location behaviour.
+ */
+export function effectiveN(reporting: number, minFailLocations: number | null): number {
+  return minFailLocations == null ? reporting : Math.min(minFailLocations, reporting);
+}
+
+/**
+ * Cross-location "down" decision: DOWN only when >= effectiveN(reporting) locations are
+ * failing. The `failing >= 1` floor keeps a check with nothing failing (incl. a fully
+ * silent check, reporting=0) UP. With one reporting location, N=1 => one failing = down.
  */
 export function crossLocationDown(
   failing: number,
-  selected: number,
+  reporting: number,
   minFailLocations: number | null,
 ): boolean {
-  const n = minFailLocations ?? selected;
-  return failing >= 1 && failing >= n;
+  return failing >= 1 && failing >= effectiveN(reporting, minFailLocations);
 }
 
 /**
  * The cross-location verdict. A location is "failing" when its most-recent
  * `failure_threshold` completed runs are ALL down (the old per-check debounce, now
- * scoped per location). DOWN per crossLocationDown(): >= effective-N locations failing,
- * where N defaults to ALL the check's SELECTED locations. Single-location => N=1 =>
- * exactly the old behaviour.
+ * scoped per location). DOWN per crossLocationDown(): >= effectiveN locations failing,
+ * where N defaults to all REPORTING locations (`total` — those with a run within
+ * STALE_LOCATION). A stale/silent selected region is NOT in `total`, so it can't block
+ * paging. Single reporting location => N=1 => exactly the old behaviour.
  */
 async function aggregateVerdict(check: Check): Promise<Verdict> {
-  const { rows } = await pool.query<{ total: string; failing: string; selected: string }>(
+  const { rows } = await pool.query<{ total: string; failing: string }>(
     `WITH recent AS (
        SELECT location, status,
               row_number() OVER (PARTITION BY location ORDER BY started_at DESC) AS rn,
@@ -302,16 +315,15 @@ async function aggregateVerdict(check: Check): Promise<Verdict> {
        count(*) FILTER (WHERE loc_last > now() - $3::interval) AS total,
        count(*) FILTER (
          WHERE all_down AND recent_count >= $2 AND loc_last > now() - $3::interval
-       ) AS failing,
-       -- N-of-N default basis: the check's SELECTED locations (its assignment).
-       (SELECT count(*) FROM check_locations WHERE check_id = $1) AS selected
+       ) AS failing
        FROM per_loc`,
     [check.id, check.failure_threshold, STALE_LOCATION],
   );
+  // N is over REPORTING locations (`total`), NOT assigned — a stale region must not
+  // veto paging (the silent-suppression bug). failing <= total always.
   const total = Number(rows[0]?.total ?? 0);
   const failing = Number(rows[0]?.failing ?? 0);
-  const selected = Number(rows[0]?.selected ?? 0);
-  return { down: crossLocationDown(failing, selected, check.min_fail_locations), failing, total };
+  return { down: crossLocationDown(failing, total, check.min_fail_locations), failing, total };
 }
 
 /**
@@ -497,17 +509,6 @@ function reportedBurn(rates: LocBurn[], floor: number): number {
 }
 
 /**
- * N for the BURN path's "burning from >= N locations" gate. NOTE: this keeps the older
- * (active>=2?2:1) default and is NOT the incident verdict's N-of-N-selected default
- * (crossLocationDown). They agree for a single location (both => 1); aligning the burn
- * path to all-selected is a flagged follow-up (it would need the selected count plumbed
- * into the burn path, which re-tunes #69's burn logic — out of this step's scope).
- */
-function minFailN(activeCount: number, minFailLocations: number | null): number {
-  return minFailLocations ?? (activeCount >= 2 ? 2 : 1);
-}
-
-/**
  * SLO burn-rate alerting — opt-in (only when the check has slo_target). Routes a
  * fast-burn (1h) page or slow-burn (6h) ticket through the EXISTING alert profiles
  * (fast => 'error'/critical, slow => 'warn'/warning), debounced via
@@ -528,14 +529,14 @@ export async function maybeBurnAlert(check: Check): Promise<void> {
     let windowLabel: string;
     let burn: number;
 
-    // Page only when burn crosses threshold from >= N locations (mirrors the
-    // cross-location verdict's min_fail_locations) AND each such location has a real
-    // sample (>= failure_threshold runs) — so one flaky region, or a single failed
-    // run on a low-cadence check, can't page. Single active location with enough
-    // samples reduces to the old pooled behaviour.
+    // Page only when burn crosses threshold from >= N locations — the SAME effectiveN()
+    // as the incident verdict (so the two never diverge), over the burn-REPORTING
+    // locations (those with samples in the window) — AND each burning location has a
+    // real sample (>= failure_threshold runs) so one flaky region / a single failed run
+    // can't page. Single reporting location reduces to the old behaviour.
     const floor = check.failure_threshold;
     const fastRates = await burnRatesByLocation(check.id, BURN_FAST_WINDOW, check.slo_target);
-    const fastN = minFailN(fastRates.length, check.min_fail_locations);
+    const fastN = effectiveN(fastRates.length, check.min_fail_locations);
     if (fastRates.length > 0 && burningLocations(fastRates, BURN_FAST_THRESHOLD, floor) >= fastN) {
       severity = 'critical'; routeStatus = 'error'; label = 'fast burn'; windowLabel = '1h';
       burn = reportedBurn(fastRates, floor);
@@ -546,8 +547,8 @@ export async function maybeBurnAlert(check: Check): Promise<void> {
       // still-elevated 6h window for hours.
       const slowLong = await burnRatesByLocation(check.id, BURN_SLOW_WINDOW, check.slo_target);
       const slowShort = await burnRatesByLocation(check.id, BURN_SLOW_SHORT_WINDOW, check.slo_target);
-      const longN = minFailN(slowLong.length, check.min_fail_locations);
-      const shortN = minFailN(slowShort.length, check.min_fail_locations);
+      const longN = effectiveN(slowLong.length, check.min_fail_locations);
+      const shortN = effectiveN(slowShort.length, check.min_fail_locations);
       if (
         slowLong.length > 0 &&
         slowShort.length > 0 &&

@@ -54,11 +54,12 @@ CREATE TABLE checks (
     steps              JSONB,
 
     -- Multi-location (mirrors 0014_multi_location.sql): open an incident only when
-    -- failing from >= this many distinct locations. NULL => ALL SELECTED locations
-    -- must fail (N-of-N, the conservative false-positive-killing default, computed at
-    -- verdict time from the check's check_locations count); an explicit INT = that
-    -- absolute threshold (e.g. 1 = page if ANY location fails). See evaluate.ts
-    -- crossLocationDown(). Single selected location => N=1 => pre-multi-location behaviour.
+    -- failing from >= this many distinct locations. NULL => ALL REPORTING locations
+    -- must fail (N-of-N over what's currently reporting — the conservative default; a
+    -- stale/silent region is excluded so it can't block paging); an explicit INT = that
+    -- absolute threshold (1 = page if ANY location fails), capped at the reporting count.
+    -- See evaluate.ts effectiveN()/crossLocationDown(). One reporting location => N=1 =>
+    -- pre-multi-location behaviour.
     min_fail_locations INTEGER,
 
     -- Cadence + claim bookkeeping. now() - last_run_at >= interval_seconds => due.
