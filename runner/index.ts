@@ -163,7 +163,12 @@ async function claim(id: number): Promise<Check | null> {
        SELECT $1, $2, now() FROM checks WHERE id = $1 AND enabled
        ON CONFLICT (check_id, location) DO UPDATE
          SET last_run_at = now()
-         WHERE now() - check_locations.last_run_at
+         -- IS NULL arm mirrors findDueChecks: a backfilled cursor can be NULL
+         -- (checks.last_run_at is nullable); without this, now() - NULL is NULL,
+         -- the predicate is never true, and such a check is reported due every
+         -- tick but never claimed — a silent permanent stall.
+         WHERE check_locations.last_run_at IS NULL
+            OR now() - check_locations.last_run_at
                >= make_interval(secs => (SELECT interval_seconds FROM checks WHERE id = $1))
        RETURNING check_id
      ),
