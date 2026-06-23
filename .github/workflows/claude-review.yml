@@ -21,6 +21,11 @@ permissions:
 jobs:
   review:
     runs-on: ubuntu-latest
+    # Explicit, deterministic check-run name so the branch-protection required
+    # context binds exactly (a bare job id emits the lowercase "review", which is
+    # NOT what's required; and "Review" is already taken by the Dependency Review
+    # workflow's job, so this gate uses the distinct "Claude review").
+    name: Claude review
     # claude-code-action rejects non-human actors and errors on them — skip bots
     # (dependabot gets no review but still auto-merges via the trusted allowlist below).
     if: github.event.pull_request.user.login != 'dependabot[bot]'
