@@ -386,7 +386,17 @@ async function countConsecutiveDown(
 const BURN_FAST_WINDOW = '1 hour';
 const BURN_FAST_THRESHOLD = 14.4;
 const BURN_SLOW_WINDOW = '6 hours';
+// Short confirmation window paired with the 6h slow window (Google multi-window):
+// slow only pages when BOTH the 6h AND this 30m window are burning, so a recovered
+// check stops alerting promptly instead of riding the still-elevated 6h window.
+const BURN_SLOW_SHORT_WINDOW = '30 minutes';
 const BURN_SLOW_THRESHOLD = 6;
+
+/** A location's burn over a window, plus its sample size (for the min-sample floor). */
+interface LocBurn {
+  burn: number;
+  total: number;
+}
 
 /**
  * Burn rate PER LOCATION over [now-window, now): (down/total)/(1-target) for each
@@ -394,13 +404,14 @@ const BURN_SLOW_THRESHOLD = 6;
  * slo_status). Pooling all locations into one rate (the old slo_status path) let a
  * single fully-down region trip a critical burn page that the cross-location verdict
  * deliberately suppresses — so we keep the rates separated and let the caller require
- * >= min_fail_locations regions to be burning before paging. caller guards slo_target.
+ * >= min_fail_locations regions to be burning before paging. `total` rides along so
+ * the caller can apply a minimum sample-size floor. caller guards slo_target.
  */
 async function burnRatesByLocation(
   checkId: number,
   windowInterval: string,
   target: number,
-): Promise<number[]> {
+): Promise<LocBurn[]> {
   const { rows } = await pool.query<{ total: string; down: string }>(
     `SELECT count(*) FILTER (WHERE r.status IN ('pass','warn','fail','error')) AS total,
             count(*) FILTER (WHERE r.status IN ('fail','error'))                AS down
@@ -417,7 +428,23 @@ async function burnRatesByLocation(
   return rows
     .map((r) => ({ total: Number(r.total), down: Number(r.down) }))
     .filter((r) => r.total > 0)
-    .map((r) => r.down / r.total / (1 - target));
+    .map((r) => ({ burn: r.down / r.total / (1 - target), total: r.total }));
+}
+
+/**
+ * How many locations are "burning" over threshold — but only counting locations with
+ * a real sample (>= `floor` runs in the window). The floor stops a noisy low-cadence
+ * check from paging on a single failed run (e.g. 1 down of 1 => burn 83x at 99.9%):
+ * a tight SLO must not bypass the failure_threshold debounce that the incident path
+ * relies on. Defaults to the check's failure_threshold (the same debounce knob).
+ */
+function burningLocations(rates: LocBurn[], threshold: number, floor: number): number {
+  return rates.filter((r) => r.total >= floor && r.burn >= threshold).length;
+}
+
+/** N for "down/burning from >= N locations" — mirrors aggregateVerdict's default. */
+function minFailN(activeCount: number, minFailLocations: number | null): number {
+  return minFailLocations ?? (activeCount >= 2 ? 2 : 1);
 }
 
 /**
@@ -442,25 +469,35 @@ export async function maybeBurnAlert(check: Check): Promise<void> {
     let burn: number;
 
     // Page only when burn crosses threshold from >= N locations (mirrors the
-    // cross-location verdict's min_fail_locations), so one flaky region can't page.
-    // With a single active location this reduces to exactly the old pooled behaviour.
+    // cross-location verdict's min_fail_locations) AND each such location has a real
+    // sample (>= failure_threshold runs) — so one flaky region, or a single failed
+    // run on a low-cadence check, can't page. Single active location with enough
+    // samples reduces to the old pooled behaviour.
+    const floor = check.failure_threshold;
     const fastRates = await burnRatesByLocation(check.id, BURN_FAST_WINDOW, check.slo_target);
-    const fastActive = fastRates.length;
-    const fastN = check.min_fail_locations ?? (fastActive >= 2 ? 2 : 1);
-    const fastBurning = fastRates.filter((b) => b >= BURN_FAST_THRESHOLD).length;
-    if (fastActive > 0 && fastBurning >= fastN) {
+    const fastN = minFailN(fastRates.length, check.min_fail_locations);
+    if (fastRates.length > 0 && burningLocations(fastRates, BURN_FAST_THRESHOLD, floor) >= fastN) {
       severity = 'critical'; routeStatus = 'error'; label = 'fast burn'; windowLabel = '1h';
-      burn = Math.max(...fastRates);
+      burn = Math.max(...fastRates.map((r) => r.burn));
     } else {
-      const slowRates = await burnRatesByLocation(check.id, BURN_SLOW_WINDOW, check.slo_target);
-      const slowActive = slowRates.length;
-      const slowN = check.min_fail_locations ?? (slowActive >= 2 ? 2 : 1);
-      const slowBurning = slowRates.filter((b) => b >= BURN_SLOW_THRESHOLD).length;
-      if (slowActive > 0 && slowBurning >= slowN) {
+      // Slow burn is multi-window: page only when BOTH the 6h AND the 30m window are
+      // burning from >= N locations. The short window decays quickly after recovery,
+      // so a one-off burst that already healed stops alerting instead of riding the
+      // still-elevated 6h window for hours.
+      const slowLong = await burnRatesByLocation(check.id, BURN_SLOW_WINDOW, check.slo_target);
+      const slowShort = await burnRatesByLocation(check.id, BURN_SLOW_SHORT_WINDOW, check.slo_target);
+      const longN = minFailN(slowLong.length, check.min_fail_locations);
+      const shortN = minFailN(slowShort.length, check.min_fail_locations);
+      if (
+        slowLong.length > 0 &&
+        slowShort.length > 0 &&
+        burningLocations(slowLong, BURN_SLOW_THRESHOLD, floor) >= longN &&
+        burningLocations(slowShort, BURN_SLOW_THRESHOLD, floor) >= shortN
+      ) {
         severity = 'warning'; routeStatus = 'warn'; label = 'slow burn'; windowLabel = '6h';
-        burn = Math.max(...slowRates);
+        burn = Math.max(...slowLong.map((r) => r.burn));
       } else {
-        return; // budget burn within tolerance (or not from enough locations)
+        return; // budget burn within tolerance, not from enough locations, or recovered
       }
     }
 
@@ -489,7 +526,7 @@ export async function maybeBurnAlert(check: Check): Promise<void> {
         severity,
         status: severity === 'critical' ? 'open' : 'warn',
         summary,
-        runId: 0, // budget-level, not tied to a single run
+        runId: null, // budget-level, not tied to a single run (no bogus "Run #0")
       },
       await profileChannels(check, routeStatus),
     );

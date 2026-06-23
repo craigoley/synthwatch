@@ -22,6 +22,27 @@
 // Fires on incident OPEN (alert) and RESOLVE (recovery) — both carry severity.
 import { EmailClient } from '@azure/communication-email';
 
+// Hard ceiling on any single outbound send. dispatchAlerts is awaited in the run
+// tick, and Promise.allSettled isolates REJECTIONS but not HANGS — a webhook (or
+// ACS endpoint) that accepts the TCP connection and never responds would otherwise
+// wedge the whole tick indefinitely. Guarded parse (NaN-safe) -> 10s default.
+const ALERT_TIMEOUT_MS = Number(process.env.ALERT_TIMEOUT_MS) || 10000;
+
+/**
+ * Reject if `p` doesn't settle within `ms`. The timer is unref'd so it can't keep
+ * the process alive, and a late timeout after `p` already settled is harmless (the
+ * race result is fixed). Used to bound outbound sends that have no native timeout.
+ */
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    p,
+    new Promise<T>((_, reject) => {
+      const t = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+      t.unref?.();
+    }),
+  ]);
+}
+
 export interface AlertPayload {
   checkId: number;
   checkName: string;
@@ -31,7 +52,9 @@ export interface AlertPayload {
   status: 'open' | 'resolved' | 'warn';
   /** Human summary; for an OPEN this carries the failure reason/step. */
   summary: string;
-  runId: number;
+  // The triggering run, or null for budget-level alerts (SLO burn) that aren't tied
+  // to a single run — rendered as omitted rather than a bogus "Run #0".
+  runId: number | null;
   failedStep?: string | null;
   screenshotUrl?: string | null;
 }
@@ -61,7 +84,8 @@ function dashboardLink(p: AlertPayload): string | null {
 }
 
 function bodyText(p: AlertPayload): string {
-  const lines = [subjectLine(p), '', p.summary, `Run: #${p.runId}`];
+  const lines = [subjectLine(p), '', p.summary];
+  if (p.runId != null) lines.push(`Run: #${p.runId}`);
   if (p.failedStep) lines.push(`Failed step: ${p.failedStep}`);
   if (p.screenshotUrl) lines.push(`Screenshot: ${p.screenshotUrl}`);
   const link = dashboardLink(p);
@@ -87,12 +111,20 @@ const emailChannel: AlertChannel = {
     if (!connectionString || !senderAddress || !to) return;
 
     const client = new EmailClient(connectionString);
-    const poller = await client.beginSend({
-      senderAddress,
-      content: { subject: subjectLine(p), plainText: bodyText(p) },
-      recipients: { to: to.split(',').map((address) => ({ address: address.trim() })) },
-    });
-    await poller.pollUntilDone();
+    // Bound the whole send (initial POST + poll) — a hung ACS endpoint must not
+    // stall the tick. The rejection is isolated by dispatchAlerts.
+    await withTimeout(
+      (async () => {
+        const poller = await client.beginSend({
+          senderAddress,
+          content: { subject: subjectLine(p), plainText: bodyText(p) },
+          recipients: { to: to.split(',').map((address) => ({ address: address.trim() })) },
+        });
+        await poller.pollUntilDone();
+      })(),
+      ALERT_TIMEOUT_MS,
+      'ACS email send',
+    );
   },
 };
 
@@ -109,7 +141,8 @@ const emailChannel: AlertChannel = {
 //     "checkId":      number,
 //     "checkName":    string,
 //     "summary":      string,          // failure reason/step for an open
-//     "runId":        number,
+//     "runId":        number | null,    // null for budget-level (SLO burn) alerts
+
 //     "failedStep":   string | null,
 //     "screenshotUrl":string | null,
 //     "dashboardUrl": string | null
@@ -127,6 +160,9 @@ const webhookChannel: AlertChannel = {
     const res = await fetch(url, {
       method: 'POST',
       headers,
+      // Bound the request — a webhook that accepts TCP but never responds would
+      // otherwise hang the tick (allSettled isolates rejections, not hangs).
+      signal: AbortSignal.timeout(ALERT_TIMEOUT_MS),
       body: JSON.stringify({
         event: p.status,
         severity: p.severity,
@@ -135,7 +171,8 @@ const webhookChannel: AlertChannel = {
         checkId: Number(p.checkId),
         checkName: p.checkName,
         summary: p.summary,
-        runId: Number(p.runId),
+        // null for budget-level (SLO burn) alerts not tied to a single run.
+        runId: p.runId == null ? null : Number(p.runId),
         failedStep: p.failedStep ?? null,
         screenshotUrl: p.screenshotUrl ?? null,
         dashboardUrl: dashboardLink(p),
