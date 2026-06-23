@@ -304,3 +304,5 @@ export async function runRca(
     return null;
   }
 }
+
+// union-verdict live-parse probe: harmless comment to make the Claude review run on a code PR.
