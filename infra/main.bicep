@@ -127,8 +127,53 @@ param aoaiApiVersion string = '2025-08-07'
 @description('RCA completion-token budget (RCA_MAX_TOKENS).')
 param rcaMaxTokens string = '4000'
 
+// Alert channels + OTel — the LAST out-of-band env (the cutover wiped these too;
+// alerts have delivered to NO channel since). Declared so the template owns the
+// COMPLETE runner env. All default '' => that channel/signal stays OFF (matching the
+// runner's isConfigured() gates), so a fork/deploy that doesn't configure alerting is
+// unaffected. ★ Like postgresAdminPassword, a deploy MUST pass the configured
+// channels' values or they reset to '' (channel off) — the recurrence contract. (No
+// Key Vault exists in the RG; KV references would be the stronger recurrence-proofing
+// — a recommended follow-up.)
+@secure()
+@description('Azure Communication Services email connection string (SECRET). Empty => email channel off.')
+param acsEmailConnectionString string = ''
+@description('ACS-verified sender address for alert email (ALERT_EMAIL_FROM).')
+param alertEmailFrom string = ''
+@description('Comma-separated alert email recipients (ALERT_EMAIL_TO).')
+param alertEmailTo string = ''
+@secure()
+@description('Generic webhook URL for alerts (SECRET — may embed a token). Empty => webhook channel off.')
+param alertWebhookUrl string = ''
+@secure()
+@description('Optional full Authorization header value for the webhook (SECRET).')
+param alertWebhookAuthHeader string = ''
+@description('Dashboard base URL for deep links in alerts (DASHBOARD_URL). Config, not secret.')
+param dashboardUrl string = ''
+@description('OTLP exporter endpoint (OTEL_EXPORTER_OTLP_ENDPOINT). Empty => OTel export off.')
+param otlpEndpoint string = ''
+
 // AcrPull built-in role.
 var acrPullRoleId = '7f951dda-4ed3-4680-a7ca-43fe172d538d'
+
+// Optional alert/OTel secrets + env, included ONLY when their param is set (empty =>
+// omitted => channel/signal off, matching the runner's isConfigured() gates). Shared
+// by BOTH region jobs so they stay identical. Secrets follow the DB pattern (job
+// secret + secretRef env); config vars are plain values.
+var alertSecrets = concat(
+  empty(acsEmailConnectionString) ? [] : [{ name: 'acs-email-conn', value: acsEmailConnectionString }],
+  empty(alertWebhookUrl) ? [] : [{ name: 'alert-webhook-url', value: alertWebhookUrl }],
+  empty(alertWebhookAuthHeader) ? [] : [{ name: 'alert-webhook-auth', value: alertWebhookAuthHeader }]
+)
+var alertEnv = concat(
+  empty(acsEmailConnectionString) ? [] : [{ name: 'ACS_EMAIL_CONNECTION_STRING', secretRef: 'acs-email-conn' }],
+  empty(alertEmailFrom) ? [] : [{ name: 'ALERT_EMAIL_FROM', value: alertEmailFrom }],
+  empty(alertEmailTo) ? [] : [{ name: 'ALERT_EMAIL_TO', value: alertEmailTo }],
+  empty(alertWebhookUrl) ? [] : [{ name: 'ALERT_WEBHOOK_URL', secretRef: 'alert-webhook-url' }],
+  empty(alertWebhookAuthHeader) ? [] : [{ name: 'ALERT_WEBHOOK_AUTH_HEADER', secretRef: 'alert-webhook-auth' }],
+  empty(dashboardUrl) ? [] : [{ name: 'DASHBOARD_URL', value: dashboardUrl }],
+  empty(otlpEndpoint) ? [] : [{ name: 'OTEL_EXPORTER_OTLP_ENDPOINT', value: otlpEndpoint }]
+)
 
 // ---------------------------------------------------------------------------
 // Observability: Log Analytics workspace backing the ACA environment.
@@ -362,6 +407,7 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
           name: 'storage-conn'
           value: 'DefaultEndpointsProtocol=https;AccountName=${storage.name};AccountKey=${storage.listKeys().keys[0].value};EndpointSuffix=${environment().suffixes.storage}'
         }
+        ...alertSecrets
       ]
     }
     template: {
@@ -414,11 +460,10 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
               name: 'RCA_MAX_TOKENS'
               value: rcaMaxTokens
             }
-            // STILL out-of-band (NOT owned here) — a redeploy will NOT restore them:
-            // alert channels (ACS_EMAIL_* / ALERT_EMAIL_*, ALERT_WEBHOOK_URL[/_AUTH_HEADER],
-            // DASHBOARD_URL) + OTel (OTEL_EXPORTER_OTLP_*). Currently UNSET => alerts
-            // deliver to no channel. See the PR's audit — declaring them needs their
-            // values (some secret) and is a tracked follow-up.
+            // Alert channels (ACS_EMAIL_* / ALERT_EMAIL_*, ALERT_WEBHOOK_*, DASHBOARD_URL)
+            // + OTel — now OWNED here, included only when their param is set (empty =>
+            // channel/signal off). No longer out-of-band.
+            ...alertEnv
           ]
         }
       ]
@@ -486,6 +531,7 @@ resource centralusJob 'Microsoft.App/jobs@2024-03-01' = {
           name: 'storage-conn'
           value: 'DefaultEndpointsProtocol=https;AccountName=${storage.name};AccountKey=${storage.listKeys().keys[0].value};EndpointSuffix=${environment().suffixes.storage}'
         }
+        ...alertSecrets
       ]
     }
     template: {
@@ -534,6 +580,8 @@ resource centralusJob 'Microsoft.App/jobs@2024-03-01' = {
               name: 'RCA_MAX_TOKENS'
               value: rcaMaxTokens
             }
+            // Alert channels + OTel (same as the primary job; empty param => off).
+            ...alertEnv
           ]
         }
       ]
