@@ -32,7 +32,7 @@ import { uploadScreenshot, uploadTrace } from './artifacts.js';
 import os from 'node:os';
 import path from 'node:path';
 import { unlink } from 'node:fs/promises';
-import { evaluate, perfBudgetBreach } from './evaluate.js';
+import { evaluate, maybeBurnAlert, perfBudgetBreach } from './evaluate.js';
 import {
   startMetricsCapture,
   writeRunMetrics,
@@ -242,6 +242,11 @@ async function runOne(check: Check): Promise<void> {
     location: LOCATION,
   };
   await evaluate(check, run);
+
+  // SLO error-budget burn-rate alerting (opt-in; no-op unless the check has an
+  // slo_target). Self-guards: skipped if an incident is already open, in a
+  // maintenance window, or debounced. Non-fatal.
+  await maybeBurnAlert(check);
 
   console.log(
     `[runner] check ${check.id} "${check.name}" -> ${status}` +
