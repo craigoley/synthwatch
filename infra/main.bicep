@@ -108,6 +108,25 @@ param artifactContainerName string = 'synthwatch-artifacts'
 @minValue(1)
 param artifactRetentionDays int = 90
 
+// AI root-cause analysis (RCA) — Azure OpenAI config. These are CONFIG, not secrets
+// (the runner authenticates to AOAI with the synthwatch-runner-id Managed Identity's
+// AAD token via its 'Cognitive Services OpenAI User' role — no API key). Declared
+// here so a deploy PRESERVES them: they were added out-of-band, so the multi-location
+// cutover's bicep redeploy WIPED them (resetting the env array), turning RCA off
+// fleet-wide (rcaEnabled() = AZURE_OPENAI_ENDPOINT && AZURE_OPENAI_DEPLOYMENT). The
+// template must own the complete env state (same fix shape as #78's AAD auth).
+@description('Azure OpenAI endpoint for RCA (AZURE_OPENAI_ENDPOINT).')
+param aoaiEndpoint string = 'https://synthwatch-aoai.openai.azure.com/'
+
+@description('Azure OpenAI deployment name for RCA (AZURE_OPENAI_DEPLOYMENT).')
+param aoaiDeployment string = 'gpt-5-mini'
+
+@description('Azure OpenAI API version for RCA (AZURE_OPENAI_API_VERSION). gpt-5-mini needs 2025-08-07 — NOT the rca.ts default of 2024-10-21.')
+param aoaiApiVersion string = '2025-08-07'
+
+@description('RCA completion-token budget (RCA_MAX_TOKENS).')
+param rcaMaxTokens string = '4000'
+
 // AcrPull built-in role.
 var acrPullRoleId = '7f951dda-4ed3-4680-a7ca-43fe172d538d'
 
@@ -377,9 +396,29 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
               name: 'SYNTHWATCH_LOCATION'
               value: location
             }
-            // Alert-channel vars (ACS_EMAIL_* / ALERT_EMAIL_*,
-            // ALERT_WEBHOOK_URL[/_AUTH_HEADER], DASHBOARD_URL) are added per
-            // deployment; absent => that channel is disabled.
+            {
+              // RCA via Azure OpenAI (MI auth — no key). Declared so a redeploy can't
+              // wipe RCA off (the cutover-wipe bug). rcaEnabled() needs ENDPOINT+DEPLOYMENT.
+              name: 'AZURE_OPENAI_ENDPOINT'
+              value: aoaiEndpoint
+            }
+            {
+              name: 'AZURE_OPENAI_DEPLOYMENT'
+              value: aoaiDeployment
+            }
+            {
+              name: 'AZURE_OPENAI_API_VERSION'
+              value: aoaiApiVersion
+            }
+            {
+              name: 'RCA_MAX_TOKENS'
+              value: rcaMaxTokens
+            }
+            // STILL out-of-band (NOT owned here) — a redeploy will NOT restore them:
+            // alert channels (ACS_EMAIL_* / ALERT_EMAIL_*, ALERT_WEBHOOK_URL[/_AUTH_HEADER],
+            // DASHBOARD_URL) + OTel (OTEL_EXPORTER_OTLP_*). Currently UNSET => alerts
+            // deliver to no channel. See the PR's audit — declaring them needs their
+            // values (some secret) and is a tracked follow-up.
           ]
         }
       ]
@@ -475,6 +514,25 @@ resource centralusJob 'Microsoft.App/jobs@2024-03-01' = {
               // The vantage label for this region — claims/runs as 'centralus'.
               name: 'SYNTHWATCH_LOCATION'
               value: centralusLocation
+            }
+            {
+              // RCA via Azure OpenAI (MI auth). Identical to the primary job — both
+              // regions open incidents, so both need RCA. Declared so a redeploy
+              // preserves it.
+              name: 'AZURE_OPENAI_ENDPOINT'
+              value: aoaiEndpoint
+            }
+            {
+              name: 'AZURE_OPENAI_DEPLOYMENT'
+              value: aoaiDeployment
+            }
+            {
+              name: 'AZURE_OPENAI_API_VERSION'
+              value: aoaiApiVersion
+            }
+            {
+              name: 'RCA_MAX_TOKENS'
+              value: rcaMaxTokens
             }
           ]
         }
