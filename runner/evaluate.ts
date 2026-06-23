@@ -93,23 +93,32 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
   // UP across locations (fewer than N locations failing) -> clear any incident.
   if (!verdict.down) {
     if (open) {
+      // Resolve the incident row regardless (the check IS up now). But gate the
+      // recovery ALERT on the maintenance window, symmetric with the open path: a
+      // maintenance endpoint serving 200 shouldn't fire a "recovered" page mid-window.
       await pool.query(
         `UPDATE incidents
             SET status = 'resolved', resolved_at = now(), resolved_run_id = $2
           WHERE id = $1`,
         [open.id, run.id],
       );
-      await dispatchAlerts(
-        {
-          checkId: check.id,
-          checkName: check.name,
-          severity: check.severity,
-          status: 'resolved',
-          summary: `Check "${check.name}" recovered.`,
-          runId: run.id,
-        },
-        await profileChannels(check, 'resolved'),
-      );
+      if (await inMaintenanceWindow(check.id)) {
+        console.log(
+          `[runner] check ${check.id} "${check.name}" recovered — recovery alert suppressed (maintenance window)`,
+        );
+      } else {
+        await dispatchAlerts(
+          {
+            checkId: check.id,
+            checkName: check.name,
+            severity: check.severity,
+            status: 'resolved',
+            summary: `Check "${check.name}" recovered.`,
+            runId: run.id,
+          },
+          await profileChannels(check, 'resolved'),
+        );
+      }
     }
 
     if (run.status === 'pass') {
@@ -308,7 +317,7 @@ async function maybeNotifyWarn(check: Check, run: RunRecord): Promise<void> {
     return;
   }
 
-  await dispatchAlerts(
+  const { active, delivered } = await dispatchAlerts(
     {
       checkId: check.id,
       checkName: check.name,
@@ -322,11 +331,21 @@ async function maybeNotifyWarn(check: Check, run: RunRecord): Promise<void> {
     await profileChannels(check, 'warn'),
   );
 
-  // Record the attempt (caps the notify rate even if a channel was unconfigured).
-  await pool.query(
-    `UPDATE checks SET last_warn_notified_at = now() WHERE id = $1`,
-    [check.id],
-  );
+  // Stamp the debounce UNLESS every configured channel failed. With no configured
+  // channel (active=0) we still stamp — nothing to retry, and the rate must be capped.
+  // But if channels were tried and ALL failed (e.g. an ACS outage), DON'T stamp, so
+  // the warn re-fires next tick instead of being silently dropped for
+  // warn_renotify_seconds (a warn has no persisted incident row to fall back on).
+  if (active > 0 && delivered === 0) {
+    console.warn(
+      `[runner] check ${check.id} "${check.name}" warn — all ${active} channel(s) failed; not debouncing (will retry next tick)`,
+    );
+  } else {
+    await pool.query(
+      `UPDATE checks SET last_warn_notified_at = now() WHERE id = $1`,
+      [check.id],
+    );
+  }
 }
 
 /**
@@ -442,6 +461,18 @@ function burningLocations(rates: LocBurn[], threshold: number, floor: number): n
   return rates.filter((r) => r.total >= floor && r.burn >= threshold).length;
 }
 
+/**
+ * The burn rate to REPORT in the alert — the max among locations that meet the sample
+ * floor. A sub-floor location (e.g. 1 down of 1 => burn 83x) is excluded from the
+ * decision by burningLocations(); it must also be excluded from the reported number,
+ * else the alert overstates severity with a burn the gate didn't actually act on.
+ * Returns 0 if no location meets the floor (callers only use this once a page fires).
+ */
+function reportedBurn(rates: LocBurn[], floor: number): number {
+  const atFloor = rates.filter((r) => r.total >= floor).map((r) => r.burn);
+  return atFloor.length > 0 ? Math.max(...atFloor) : 0;
+}
+
 /** N for "down/burning from >= N locations" — mirrors aggregateVerdict's default. */
 function minFailN(activeCount: number, minFailLocations: number | null): number {
   return minFailLocations ?? (activeCount >= 2 ? 2 : 1);
@@ -478,7 +509,7 @@ export async function maybeBurnAlert(check: Check): Promise<void> {
     const fastN = minFailN(fastRates.length, check.min_fail_locations);
     if (fastRates.length > 0 && burningLocations(fastRates, BURN_FAST_THRESHOLD, floor) >= fastN) {
       severity = 'critical'; routeStatus = 'error'; label = 'fast burn'; windowLabel = '1h';
-      burn = Math.max(...fastRates.map((r) => r.burn));
+      burn = reportedBurn(fastRates, floor);
     } else {
       // Slow burn is multi-window: page only when BOTH the 6h AND the 30m window are
       // burning from >= N locations. The short window decays quickly after recovery,
@@ -495,7 +526,7 @@ export async function maybeBurnAlert(check: Check): Promise<void> {
         burningLocations(slowShort, BURN_SLOW_THRESHOLD, floor) >= shortN
       ) {
         severity = 'warning'; routeStatus = 'warn'; label = 'slow burn'; windowLabel = '6h';
-        burn = Math.max(...slowLong.map((r) => r.burn));
+        burn = reportedBurn(slowLong, floor);
       } else {
         return; // budget burn within tolerance, not from enough locations, or recovered
       }

@@ -294,9 +294,17 @@ export async function runRca(
     console.log(
       `[rca] finish_reason=${finishReason} content_len=${content?.length ?? 0} usage=${JSON.stringify(json.usage ?? {})}`,
     );
+    // Truncation surfaces two ways on a reasoning model: empty content (all budget
+    // spent on hidden reasoning) OR a non-empty PARTIAL that then fails to parse.
+    // Emit the actionable hint whenever finish_reason='length', not only when empty,
+    // so a truncated-but-non-empty response isn't diagnosed as a generic parse error.
+    if (finishReason === 'length') {
+      console.warn(
+        `[rca] finish_reason=length — output TRUNCATED, raise RCA_MAX_TOKENS (content_len=${content?.length ?? 0})`,
+      );
+    }
     if (!content) {
-      const hint = finishReason === 'length' ? ' (TRUNCATED — raise RCA_MAX_TOKENS)' : '';
-      console.warn(`[rca] empty model content (finish_reason=${finishReason})${hint} — no RCA`);
+      console.warn(`[rca] empty model content (finish_reason=${finishReason}) — no RCA`);
       return null;
     }
     const result = parseResult(content, signature);

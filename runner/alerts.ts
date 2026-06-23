@@ -25,8 +25,13 @@ import { EmailClient } from '@azure/communication-email';
 // Hard ceiling on any single outbound send. dispatchAlerts is awaited in the run
 // tick, and Promise.allSettled isolates REJECTIONS but not HANGS — a webhook (or
 // ACS endpoint) that accepts the TCP connection and never responds would otherwise
-// wedge the whole tick indefinitely. Guarded parse (NaN-safe) -> 10s default.
-const ALERT_TIMEOUT_MS = Number(process.env.ALERT_TIMEOUT_MS) || 10000;
+// wedge the whole tick indefinitely. Guarded parse: only a FINITE POSITIVE override
+// wins — NaN ("abc"), 0, or a negative (which would make AbortSignal.timeout reject
+// immediately / throw) all fall back to the 10s default.
+const ALERT_TIMEOUT_MS = (() => {
+  const n = Number(process.env.ALERT_TIMEOUT_MS);
+  return Number.isFinite(n) && n > 0 ? n : 10000;
+})();
 
 /**
  * Reject if `p` doesn't settle within `ms`. The timer is unref'd so it can't keep
@@ -192,11 +197,21 @@ const CHANNELS: AlertChannel[] = [emailChannel, webhookChannel];
  *
  * Never throws: each channel is awaited independently and failures are logged, so
  * a dead channel cannot fail the run or block incident recording.
+ *
+ * Returns {active, delivered}: how many channels were tried and how many succeeded.
+ * Lets a debounced caller (the warn path) avoid stamping "notified" when EVERY
+ * configured channel failed — so the notice retries next tick instead of being
+ * silently dropped for the re-notify window.
  */
+export interface DispatchResult {
+  active: number;
+  delivered: number;
+}
+
 export async function dispatchAlerts(
   payload: AlertPayload,
   channelNames?: string[],
-): Promise<void> {
+): Promise<DispatchResult> {
   const want = channelNames === undefined ? null : new Set(channelNames);
   const active = CHANNELS.filter(
     (c) => (want === null || want.has(c.name)) && c.isConfigured(),
@@ -205,18 +220,21 @@ export async function dispatchAlerts(
     console.log(
       `[alerts] ${payload.status} "${payload.checkName}" — no matching configured channels (skipped)`,
     );
-    return;
+    return { active: 0, delivered: 0 };
   }
 
   const results = await Promise.allSettled(active.map((c) => c.send(payload)));
+  let delivered = 0;
   results.forEach((r, i) => {
     const channel = active[i].name;
     if (r.status === 'rejected') {
       console.error(`[alerts] channel "${channel}" failed:`, r.reason);
     } else {
+      delivered++;
       console.log(
         `[alerts] channel "${channel}" delivered ${payload.status} for "${payload.checkName}"`,
       );
     }
   });
+  return { active: active.length, delivered };
 }

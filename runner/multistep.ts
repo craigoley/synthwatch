@@ -47,12 +47,57 @@ function resolveTemplate(input: string, vars: Vars): { value: string; missing: s
   return { value, missing };
 }
 
-/** Parse a Set-Cookie value into [name, value] (everything before the first ';'). */
-function parseCookie(setCookie: string): [string, string] | null {
-  const first = setCookie.split(';', 1)[0];
+/**
+ * A cookie in the chain jar, with the scoping attributes we honor: the effective
+ * `domain` (lowercased, no leading dot), `hostOnly` (no Domain attr => only the exact
+ * host that set it), and `secure` (only replay over https). Path/Expires/SameSite are
+ * not enforced — chains are short-lived + operator-authored; scheme + Domain are the
+ * cross-origin-leak-relevant bits.
+ */
+interface StoredCookie {
+  name: string;
+  value: string;
+  domain: string;
+  hostOnly: boolean;
+  secure: boolean;
+}
+
+/**
+ * Parse a Set-Cookie into a StoredCookie scoped to `responseHost` (the hostname, no
+ * port). A Domain attribute is honored ONLY when responseHost actually belongs to it
+ * (host == domain or a subdomain) — otherwise a response could scope a cookie to an
+ * unrelated domain; we fall back to host-only in that case. Returns null on no name=.
+ */
+function parseSetCookie(setCookie: string, responseHost: string): StoredCookie | null {
+  const parts = setCookie.split(';');
+  const first = parts[0];
   const eq = first.indexOf('=');
   if (eq <= 0) return null;
-  return [first.slice(0, eq).trim(), first.slice(eq + 1).trim()];
+  const name = first.slice(0, eq).trim();
+  const value = first.slice(eq + 1).trim();
+  let domain = responseHost.toLowerCase();
+  let hostOnly = true;
+  let secure = false;
+  for (const attr of parts.slice(1)) {
+    const eqi = attr.indexOf('=');
+    const key = (eqi >= 0 ? attr.slice(0, eqi) : attr).trim().toLowerCase();
+    const val = eqi >= 0 ? attr.slice(eqi + 1).trim() : '';
+    if (key === 'secure') secure = true;
+    else if (key === 'domain' && val) {
+      const d = val.toLowerCase().replace(/^\./, '');
+      if (d && (responseHost === d || responseHost.endsWith('.' + d))) {
+        domain = d;
+        hostOnly = false;
+      }
+    }
+  }
+  return { name, value, domain, hostOnly, secure };
+}
+
+/** Does a stored cookie apply to a request to (host, https)? */
+function cookieMatches(c: StoredCookie, reqHost: string, isHttps: boolean): boolean {
+  if (c.secure && !isHttps) return false;
+  return c.hostOnly ? reqHost === c.domain : reqHost === c.domain || reqHost.endsWith('.' + c.domain);
 }
 
 async function recordStep(
@@ -86,10 +131,11 @@ export async function runMultistepChain(check: Check, runId: number): Promise<Mu
   }
 
   const vars: Vars = {};
-  // Cookie jar scoped by HOST (host -> name -> value). A cookie set by one step's host
-  // is replayed ONLY to later steps on the SAME host — not blindly to every step,
-  // which would leak a session cookie cross-origin (incl. across a followed redirect).
-  const cookies = new Map<string, Map<string, string>>();
+  // Cookie jar scoped by domain + scheme/Secure (RFC-6265-lite). A cookie is replayed
+  // to a later step only when the step's host domain-matches AND (the cookie isn't
+  // Secure OR the step is https) — so a session cookie never leaks cross-origin or
+  // downgrades onto http.
+  const cookies: StoredCookie[] = [];
 
   for (let i = 0; i < steps.length; i++) {
     const step: ChainStep = steps[i];
@@ -141,12 +187,15 @@ export async function runMultistepChain(check: Check, runId: number): Promise<Mu
       if (auth.error) return stop('error', auth.error);
       if (auth.header) headers.set(auth.header[0], auth.header[1]);
 
-      // carry cookies forward — ONLY those set by this request's host (set first so
-      // an explicit header can override). Throws here (e.g. bad URL) -> this catch.
-      reqHost = new URL(urlR.value).host;
-      const jar = cookies.get(reqHost);
-      if (jar && jar.size > 0 && !headers.has('cookie')) {
-        headers.set('cookie', [...jar].map(([k, v]) => `${k}=${v}`).join('; '));
+      // carry cookies forward — ONLY those that domain-match this request's host and
+      // aren't Secure-on-http (set first so an explicit header can override). Throws
+      // here (e.g. bad URL) -> this catch.
+      const reqUrl = new URL(urlR.value);
+      reqHost = reqUrl.hostname.toLowerCase();
+      const isHttps = reqUrl.protocol === 'https:';
+      const matched = cookies.filter((c) => cookieMatches(c, reqHost, isHttps));
+      if (matched.length > 0 && !headers.has('cookie')) {
+        headers.set('cookie', matched.map((c) => `${c.name}=${c.value}`).join('; '));
       }
     } catch (err) {
       return stop('error', `step "${name}" request build failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -170,7 +219,7 @@ export async function runMultistepChain(check: Check, runId: number): Promise<Mu
       const text = await res.text(); // chains are low-volume; always read for extract/assert
       setCookies = res.headers.getSetCookie();
       // Scope received cookies to the FINAL response host (after any redirect).
-      try { respHost = new URL(res.url || urlR.value).host; } catch { /* keep reqHost */ }
+      try { respHost = new URL(res.url || urlR.value).hostname.toLowerCase(); } catch { /* keep reqHost */ }
       facets = {
         status: res.status,
         responseTimeMs,
@@ -190,14 +239,16 @@ export async function runMultistepChain(check: Check, runId: number): Promise<Mu
       clearTimeout(timer);
     }
 
-    // update the cookie jar from this response, scoped to the response host
-    if (setCookies.length > 0) {
-      const jar = cookies.get(respHost) ?? new Map<string, string>();
-      for (const sc of setCookies) {
-        const parsed = parseCookie(sc);
-        if (parsed) jar.set(parsed[0], parsed[1]);
-      }
-      if (jar.size > 0) cookies.set(respHost, jar);
+    // update the cookie jar from this response — parse domain/Secure, upsert by
+    // (name, domain, hostOnly) so a re-set cookie replaces its prior value.
+    for (const sc of setCookies) {
+      const c = parseSetCookie(sc, respHost);
+      if (!c) continue;
+      const idx = cookies.findIndex(
+        (x) => x.name === c.name && x.domain === c.domain && x.hostOnly === c.hostOnly,
+      );
+      if (idx >= 0) cookies[idx] = c;
+      else cookies.push(c);
     }
 
     // --- assert (existing engine), per step ---
