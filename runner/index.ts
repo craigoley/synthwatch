@@ -302,20 +302,25 @@ async function runOne(check: Check): Promise<void> {
   // run (the run is already recorded above), and fully swallowed on any error.
   if (otelEnabled() || metricsEnabled()) {
     try {
-      const steps = (
-        await pool.query<{
-          step_index: number;
-          name: string;
-          status: string;
-          duration_ms: number;
-          started_at: Date;
-          error_message: string | null;
-        }>(
-          `SELECT step_index, name, status, duration_ms, started_at, error_message
-             FROM run_steps WHERE run_id = $1 ORDER BY step_index`,
-          [runId],
-        )
-      ).rows;
+      // Only multistep + browser checks ever write run_steps; for http/ssl/dns/tcp/
+      // ping this query is a guaranteed-empty round-trip every tick, so skip it.
+      const hasSteps = check.kind === 'multistep' || check.kind === 'browser';
+      const steps = !hasSteps
+        ? []
+        : (
+            await pool.query<{
+              step_index: number;
+              name: string;
+              status: string;
+              duration_ms: number;
+              started_at: Date;
+              error_message: string | null;
+            }>(
+              `SELECT step_index, name, status, duration_ms, started_at, error_message
+                 FROM run_steps WHERE run_id = $1 ORDER BY step_index`,
+              [runId],
+            )
+          ).rows;
       const otelRun = {
         checkId: check.id,
         checkName: check.name,

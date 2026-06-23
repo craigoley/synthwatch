@@ -205,12 +205,20 @@ export async function startMetricsCapture(
           const read = (): number =>
             (window as unknown as { __swLCP?: number }).__swLCP ?? 0;
           let prev = read();
-          // up to ~3s, exit as soon as LCP stabilises between samples
+          // up to ~3s; require TWO consecutive equal samples before declaring LCP
+          // settled. Exiting on the FIRST equal pair under-reports LCP when a larger
+          // element paints after a brief plateau (lazy hero image / late font) — one
+          // matching pair isn't enough evidence the largest paint has happened.
+          let stable = 0;
           for (let i = 0; i < 6; i++) {
             await new Promise((r) => setTimeout(r, 500));
             const cur = read();
-            if (cur === prev) break;
-            prev = cur;
+            if (cur === prev) {
+              if (++stable >= 2) break;
+            } else {
+              stable = 0;
+              prev = cur;
+            }
           }
         })
         .catch(() => {

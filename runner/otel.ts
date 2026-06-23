@@ -67,8 +67,16 @@ export function metricsEnabled(): boolean {
  * (for backend auth) from the environment itself. Never throws.
  */
 export function initOtel(): void {
-  if (!process.env.OTEL_EXPORTER_OTLP_ENDPOINT) return; // opt-in: off by default
-  try {
+  // Opt-in, per OTLP spec: a signal is exported if EITHER the generic
+  // OTEL_EXPORTER_OTLP_ENDPOINT or that signal's specific endpoint is set. Honouring
+  // only the generic var meant a valid traces-only (or metrics-only) setup silently
+  // no-op'd. Gate each signal independently so neither falls back to localhost.
+  const generic = process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
+  const tracesOn = Boolean(generic || process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT);
+  const metricsOn = Boolean(generic || process.env.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT);
+  if (!tracesOn && !metricsOn) return; // nothing configured — off by default
+
+  if (tracesOn) try {
     const resource = resourceFromAttributes({
       [ATTR_SERVICE_NAME]: process.env.SYNTHWATCH_OTEL_SERVICE_NAME ?? 'synthwatch-runner',
       'deployment.environment': process.env.SYNTHWATCH_ENV ?? 'production',
@@ -89,10 +97,11 @@ export function initOtel(): void {
     provider = null;
   }
 
-  // Metrics — same endpoint/headers, its own try so a metrics failure can't
-  // disable traces (or the runner). DELTA temporality suits the ephemeral job:
-  // each tick is a fresh process, so an export carries that tick's counts.
-  try {
+  // Metrics — its own try so a metrics failure can't disable traces (or the runner).
+  // Gated on a metrics-capable endpoint so a traces-only setup doesn't spin up a
+  // metric exporter that defaults to localhost. DELTA temporality suits the ephemeral
+  // job: each tick is a fresh process, so an export carries that tick's counts.
+  if (metricsOn) try {
     const resource = resourceFromAttributes({
       [ATTR_SERVICE_NAME]: process.env.SYNTHWATCH_OTEL_SERVICE_NAME ?? 'synthwatch-runner',
       'deployment.environment': process.env.SYNTHWATCH_ENV ?? 'production',

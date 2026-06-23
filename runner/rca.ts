@@ -20,12 +20,15 @@ const ENDPOINT = process.env.AZURE_OPENAI_ENDPOINT; // e.g. https://my-aoai.open
 const DEPLOYMENT = process.env.RCA_MODEL_DEPLOYMENT ?? process.env.AZURE_OPENAI_DEPLOYMENT;
 // GA chat-completions version (learn.microsoft.com); override if a fork needs newer.
 const API_VERSION = process.env.AZURE_OPENAI_API_VERSION ?? '2024-10-21';
-const TIMEOUT_MS = Number(process.env.RCA_TIMEOUT_MS ?? 30000);
+// `Number(env) || default` (not `?? default`): a malformed value (e.g. "30s") makes
+// Number() return NaN; NaN is falsy so we fall back to the default rather than
+// propagating NaN into a setTimeout / the API request (which would 400).
+const TIMEOUT_MS = Number(process.env.RCA_TIMEOUT_MS) || 30000;
 // Completion budget. gpt-5-mini is a REASONING model: hidden reasoning tokens count
 // against this BEFORE the visible JSON is emitted (commonly 1000-2000), so a tight
 // budget truncates the output (finish_reason='length' -> empty content). Default
 // 4000 leaves ample room for reasoning + the small classification JSON.
-const MAX_TOKENS = Number(process.env.RCA_MAX_TOKENS ?? 4000);
+const MAX_TOKENS = Number(process.env.RCA_MAX_TOKENS) || 4000;
 // OPT-IN reasoning_effort (minimal|low|medium|high) to cap reasoning spend. Sent
 // ONLY when set: api-version 2024-10-21 predates GPT-5 and may 400 on this param, so
 // it stays off by default; a fork on a newer api-version / the v1 API can enable it.
