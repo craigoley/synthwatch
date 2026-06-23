@@ -245,7 +245,7 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
 const STALE_LOCATION = '1 hour';
 
 interface Verdict {
-  /** down = failing from >= N distinct active locations. */
+  /** down = failing from >= effective-N distinct active locations. */
   down: boolean;
   /** active locations whose latest `failure_threshold` runs are all down. */
   failing: number;
@@ -254,14 +254,35 @@ interface Verdict {
 }
 
 /**
+ * Cross-location "down" decision: the check is DOWN only when >= effective-N of its
+ * locations are in a failing state. effective-N:
+ *   - explicit min_fail_locations (INT)  => that absolute threshold (e.g. 1 = page if
+ *     ANY location fails, for a critical check).
+ *   - NULL (unset, the default)          => ALL SELECTED locations must fail (N-of-N) —
+ *     the conservative false-positive killer ("1 of N = likely network; N of N = real").
+ * `selected` is the check's assigned-location count (its check_locations rows). With a
+ * single selected location, N = 1, so the one location failing = down — EXACTLY the
+ * pre-multi-location behaviour. The `failing >= 1` floor keeps a 0-failing check up
+ * even if selected is 0.
+ */
+export function crossLocationDown(
+  failing: number,
+  selected: number,
+  minFailLocations: number | null,
+): boolean {
+  const n = minFailLocations ?? selected;
+  return failing >= 1 && failing >= n;
+}
+
+/**
  * The cross-location verdict. A location is "failing" when its most-recent
  * `failure_threshold` completed runs are ALL down (the old per-check debounce, now
- * scoped per location). The check is DOWN when failing locations >= N, where
- * N = min_fail_locations, else 2 when >= 2 locations are active, else 1. With a
- * single active location this reduces to exactly the old behaviour.
+ * scoped per location). DOWN per crossLocationDown(): >= effective-N locations failing,
+ * where N defaults to ALL the check's SELECTED locations. Single-location => N=1 =>
+ * exactly the old behaviour.
  */
 async function aggregateVerdict(check: Check): Promise<Verdict> {
-  const { rows } = await pool.query<{ total: string; failing: string }>(
+  const { rows } = await pool.query<{ total: string; failing: string; selected: string }>(
     `WITH recent AS (
        SELECT location, status,
               row_number() OVER (PARTITION BY location ORDER BY started_at DESC) AS rn,
@@ -281,14 +302,16 @@ async function aggregateVerdict(check: Check): Promise<Verdict> {
        count(*) FILTER (WHERE loc_last > now() - $3::interval) AS total,
        count(*) FILTER (
          WHERE all_down AND recent_count >= $2 AND loc_last > now() - $3::interval
-       ) AS failing
+       ) AS failing,
+       -- N-of-N default basis: the check's SELECTED locations (its assignment).
+       (SELECT count(*) FROM check_locations WHERE check_id = $1) AS selected
        FROM per_loc`,
     [check.id, check.failure_threshold, STALE_LOCATION],
   );
   const total = Number(rows[0]?.total ?? 0);
   const failing = Number(rows[0]?.failing ?? 0);
-  const n = check.min_fail_locations ?? (total >= 2 ? 2 : 1);
-  return { down: failing >= 1 && failing >= n, failing, total };
+  const selected = Number(rows[0]?.selected ?? 0);
+  return { down: crossLocationDown(failing, selected, check.min_fail_locations), failing, total };
 }
 
 /**
@@ -473,7 +496,13 @@ function reportedBurn(rates: LocBurn[], floor: number): number {
   return atFloor.length > 0 ? Math.max(...atFloor) : 0;
 }
 
-/** N for "down/burning from >= N locations" — mirrors aggregateVerdict's default. */
+/**
+ * N for the BURN path's "burning from >= N locations" gate. NOTE: this keeps the older
+ * (active>=2?2:1) default and is NOT the incident verdict's N-of-N-selected default
+ * (crossLocationDown). They agree for a single location (both => 1); aligning the burn
+ * path to all-selected is a flagged follow-up (it would need the selected count plumbed
+ * into the burn path, which re-tunes #69's burn logic — out of this step's scope).
+ */
 function minFailN(activeCount: number, minFailLocations: number | null): number {
   return minFailLocations ?? (activeCount >= 2 ? 2 : 1);
 }
