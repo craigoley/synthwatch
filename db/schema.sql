@@ -128,6 +128,20 @@ CREATE TABLE check_locations (
 );
 
 -- ---------------------------------------------------------------------------
+-- locations: registry of deployed regions (mirrors 0020_location_registry.sql).
+-- The check_locations rows ARE a check's assignment; this registry says which
+-- locations exist / are active and what a new check defaults to (one cursor per
+-- active location). Seeded with 'default' (the live single region). The dashboard's
+-- location-selector reads this for its options.
+-- ---------------------------------------------------------------------------
+CREATE TABLE locations (
+    name       text        PRIMARY KEY,
+    enabled    boolean     NOT NULL DEFAULT true,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+INSERT INTO locations (name, enabled) VALUES ('default', true);
+
+-- ---------------------------------------------------------------------------
 -- runs: one row per execution of a check (one row per claim).
 -- ---------------------------------------------------------------------------
 CREATE TABLE runs (
