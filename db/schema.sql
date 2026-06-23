@@ -326,6 +326,44 @@ INSERT INTO alert_profiles (name, rules) VALUES (
 ON CONFLICT (name) DO NOTHING;
 
 -- ---------------------------------------------------------------------------
+-- channels + alert_routes: dashboard-managed alerting v1 (mirrors 0023). CHANNELS
+-- are delivery TARGETS (NO transport secret — the ACS connection string stays env);
+-- alert_routes is the ROUTING (severity-default XOR per-check override). Supersedes
+-- alert_profiles above (kept for back-compat; the runner reads these now). See
+-- runner/alerts.ts resolveChannels().
+-- ---------------------------------------------------------------------------
+CREATE TABLE channels (
+    id         BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name       TEXT        NOT NULL UNIQUE,
+    type       TEXT        NOT NULL CHECK (type IN ('email', 'webhook')),
+    -- email -> {to:[...], from}; webhook -> {url, authHeader?}. No secrets.
+    config     JSONB       NOT NULL DEFAULT '{}'::jsonb,
+    enabled    BOOLEAN     NOT NULL DEFAULT true,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE alert_routes (
+    id         BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    severity   TEXT        CHECK (severity IS NULL OR severity IN ('critical', 'warning')),
+    check_id   BIGINT      REFERENCES checks(id) ON DELETE CASCADE,
+    channel_id BIGINT      NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT alert_route_one_dimension
+        CHECK ((severity IS NOT NULL AND check_id IS NULL)
+            OR (severity IS NULL AND check_id IS NOT NULL))
+);
+CREATE UNIQUE INDEX alert_routes_severity_uq ON alert_routes (severity, channel_id) WHERE check_id IS NULL;
+CREATE UNIQUE INDEX alert_routes_check_uq ON alert_routes (check_id, channel_id) WHERE check_id IS NOT NULL;
+
+-- Default channels (empty config => dashboard fills targets) + severity-default routes.
+INSERT INTO channels (name, type, config, enabled) VALUES
+    ('email',   'email',   '{}'::jsonb, true),
+    ('webhook', 'webhook', '{}'::jsonb, true);
+INSERT INTO alert_routes (severity, channel_id)
+SELECT s.sev, c.id FROM (VALUES ('critical'), ('warning')) AS s(sev)
+  CROSS JOIN channels c WHERE c.name IN ('email', 'webhook');
+
+-- ---------------------------------------------------------------------------
 -- flow_manifest: available browser flows (mirrors 0009_flow_manifest.sql).
 -- Populated by the runner (it discovers its own flow modules at tick start and
 -- upserts here); the API/dashboard read this instead of distinct checks.flow_name.
