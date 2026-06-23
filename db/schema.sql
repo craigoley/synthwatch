@@ -67,6 +67,12 @@ CREATE TABLE checks (
     -- Flap debounce: open an incident only after this many CONSECUTIVE failures.
     failure_threshold  INTEGER     NOT NULL DEFAULT 3 CHECK (failure_threshold > 0),
 
+    -- Fast-retry (mirrors 0021_retries.sql): within ONE run, re-run up to `retries`
+    -- times when the run ERRORS (couldn't complete — never on an assertion 'fail');
+    -- only the final attempt counts. Sits IN FRONT of failure_threshold. Default 1
+    -- (transient-blip absorption on); 0 = no retry. Distinct from failure_threshold.
+    retries            INTEGER     NOT NULL DEFAULT 1 CHECK (retries >= 0),
+
     -- For kind='ssl': days-until-expiry threshold. Cert with more days -> pass;
     -- within this window -> warn; expired/invalid -> fail; unreachable -> error.
     -- Harmless on http/browser rows. (Mirrors db/migrations/0005_ssl_checks.sql.)

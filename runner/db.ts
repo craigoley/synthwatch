@@ -83,6 +83,9 @@ export interface Check {
   last_run_at: Date | null;
   timeout_ms: number;
   failure_threshold: number;
+  // Fast-retry: within-run re-attempts on a transient 'error' (not 'fail'). The final
+  // attempt is the run's verdict; intermediate attempts don't persist. 0 = no retry.
+  retries: number;
   severity: 'critical' | 'warning';
   enabled: boolean;
   // Perf budgets (Tier-1). A browser run that otherwise passes is downgraded to
