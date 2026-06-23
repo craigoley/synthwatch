@@ -114,6 +114,20 @@ CREATE TABLE checks (
 );
 
 -- ---------------------------------------------------------------------------
+-- check_locations: per-(check, location) cadence cursor (mirrors 0019).
+-- Multi-location was inert because due/claim keyed on the single global
+-- checks.last_run_at. Each region runner claims ONLY its own $LOCATION here,
+-- UPSERTing its own last_run_at, so regions pace independently (no global
+-- active-location list). checks.last_run_at is kept as a legacy mirror.
+-- ---------------------------------------------------------------------------
+CREATE TABLE check_locations (
+    check_id    bigint      NOT NULL REFERENCES checks(id) ON DELETE CASCADE,
+    location    text        NOT NULL,
+    last_run_at timestamptz,
+    PRIMARY KEY (check_id, location)
+);
+
+-- ---------------------------------------------------------------------------
 -- runs: one row per execution of a check (one row per claim).
 -- ---------------------------------------------------------------------------
 CREATE TABLE runs (
