@@ -103,6 +103,11 @@ CREATE TABLE checks (
     slo_target            REAL CHECK (slo_target IS NULL OR (slo_target > 0 AND slo_target < 1)),
     last_burn_notified_at TIMESTAMPTZ,
 
+    -- Most-recent-passing browser screenshot baseline (mirrors 0017). A stable
+    -- per-check Blob key (baselines/check-<id>.png) overwritten on each passing
+    -- browser run; RCA reads this as the visual-diff baseline. NULL = none yet.
+    baseline_screenshot_url TEXT,
+
     -- A browser check is meaningless without a flow to run.
     CONSTRAINT browser_needs_flow
         CHECK (kind <> 'browser' OR flow_name IS NOT NULL)
