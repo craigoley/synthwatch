@@ -102,6 +102,9 @@ export interface Check {
   // last_burn_notified_at debounces burn-rate alerts (reuses warn_renotify_seconds).
   slo_target: number | null;
   last_burn_notified_at: Date | null;
+  // Most-recent-passing browser screenshot baseline (Blob URL); RCA's visual-diff
+  // reference. Overwritten on each passing browser run; null = none yet.
+  baseline_screenshot_url: string | null;
 }
 
 /** A row from the `runs` table after we've finished executing a check. */

@@ -130,19 +130,12 @@ async function gatherContext(
     )
   ).rows.map((r) => r.status);
 
-  // Last PASSING screenshot as a visual-diff baseline (currently rare: screenshots
-  // are only captured on failure — see executeBrowser — so this is usually absent;
-  // capturing a pass baseline is a flagged follow-up). Use it if it exists.
-  const baselineUrl = (
-    await pool.query<{ screenshot_url: string | null }>(
-      `SELECT screenshot_url FROM runs WHERE check_id = $1 AND status = 'pass'
-         AND screenshot_url IS NOT NULL ORDER BY started_at DESC LIMIT 1`,
-      [check.id],
-    )
-  ).rows[0]?.screenshot_url ?? null;
-
+  // Most-recent-passing screenshot as the visual-diff baseline. The runner stores it
+  // per check (checks.baseline_screenshot_url), overwritten on each passing browser
+  // run (see executeBrowser/runOne) — so a browser check that has passed since the
+  // feature shipped has a baseline to compare the failure against. NULL otherwise.
   const failureB64 = await downloadBlobBase64(runRow?.screenshot_url ?? null);
-  const baselineB64 = await downloadBlobBase64(baselineUrl);
+  const baselineB64 = await downloadBlobBase64(check.baseline_screenshot_url);
 
   const text = [
     `Check: "${check.name}" (kind=${check.kind}, target=${check.target_url})`,

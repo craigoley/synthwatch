@@ -28,7 +28,7 @@ import {
 import { StepRecorder } from './stepRecorder.js';
 import { loadFlow } from './checks/index.js';
 import { syncFlowManifest } from './flowManifest.js';
-import { uploadScreenshot, uploadTrace } from './artifacts.js';
+import { uploadScreenshot, uploadTrace, uploadBaselineScreenshot } from './artifacts.js';
 import os from 'node:os';
 import path from 'node:path';
 import { unlink } from 'node:fs/promises';
@@ -60,6 +60,9 @@ interface Outcome {
   // Failed browser runs only: temp-file path of the captured Playwright trace.zip
   // (runOne uploads it, then deletes the temp file). null otherwise.
   tracePath: string | null;
+  // PASSING browser runs only: the screenshot to store as the check's RCA visual-diff
+  // baseline (runOne uploads it to a stable per-check key). null otherwise.
+  baselineScreenshot: Buffer | null;
 }
 
 // A 'running' row older than this is assumed orphaned by a hard crash (the ACA
@@ -185,6 +188,7 @@ async function runOne(check: Check): Promise<void> {
       metrics: null,
       certDaysRemaining: null,
       tracePath: null,
+      baselineScreenshot: null,
     };
   }
 
@@ -211,6 +215,20 @@ async function runOne(check: Check): Promise<void> {
   if (outcome.tracePath) {
     traceUrl = await uploadTrace(runId, outcome.tracePath);
     await unlink(outcome.tracePath).catch(() => {});
+  }
+
+  // Store the RCA visual-diff baseline ONLY on a clean pass (not warn/fail), to a
+  // stable per-check key (overwrite). Non-fatal — a baseline failure never affects
+  // the run.
+  if (status === 'pass' && outcome.baselineScreenshot) {
+    try {
+      const url = await uploadBaselineScreenshot(check.id, outcome.baselineScreenshot);
+      if (url) {
+        await pool.query(`UPDATE checks SET baseline_screenshot_url = $2 WHERE id = $1`, [check.id, url]);
+      }
+    } catch (err) {
+      console.warn(`[runner] check ${check.id} baseline screenshot skipped (non-fatal):`, err);
+    }
   }
 
   await pool.query(
@@ -315,6 +333,7 @@ async function executeHttp(check: Check): Promise<Outcome> {
     metrics: null,
     certDaysRemaining: null,
     tracePath: null,
+    baselineScreenshot: null,
   };
 }
 
@@ -332,6 +351,7 @@ async function executeMultistep(check: Check, runId: number): Promise<Outcome> {
     metrics: null,
     certDaysRemaining: null,
     tracePath: null,
+    baselineScreenshot: null,
   };
 }
 
@@ -354,6 +374,7 @@ async function executeNet(check: Check): Promise<Outcome> {
     metrics: null,
     certDaysRemaining: null,
     tracePath: null,
+    baselineScreenshot: null,
   };
 }
 
@@ -371,6 +392,7 @@ async function executeSsl(check: Check): Promise<Outcome> {
     metrics: null,
     certDaysRemaining: r.daysRemaining,
     tracePath: null,
+    baselineScreenshot: null,
   };
 }
 
@@ -381,6 +403,7 @@ async function executeBrowser(check: Check, runId: number): Promise<Outcome> {
       status: 'error', httpStatus: null, durationMs: 0,
       error: 'browser check has no flow_name', failedStep: null,
       screenshot: null, metrics: null, certDaysRemaining: null, tracePath: null,
+      baselineScreenshot: null,
     };
   }
 
@@ -418,6 +441,7 @@ async function executeBrowser(check: Check, runId: number): Promise<Outcome> {
   let metrics: RunMetrics;
   let tracePath: string | null = null;
   let failed = false;
+  let baselineScreenshot: Buffer | null = null;
 
   try {
     const rec = new StepRecorder(runId, page, check.target_url);
@@ -425,6 +449,10 @@ async function executeBrowser(check: Check, runId: number): Promise<Outcome> {
       const flow = await loadFlow(check.flow_name);
       await flow(rec);
       status = 'pass';
+      // Capture the RCA visual-diff baseline from the just-rendered page (cheap —
+      // it's already rendered; we'd otherwise discard it). Non-fatal; runOne only
+      // stores it if the final verdict is 'pass' (not a perf-budget 'warn').
+      baselineScreenshot = await page.screenshot().catch(() => null);
     } catch (err) {
       // A flow ExpectationError is a clean assertion miss ('fail'); any other
       // throw (Playwright timeout, navigation crash, loader error) is 'error'.
@@ -477,6 +505,7 @@ async function executeBrowser(check: Check, runId: number): Promise<Outcome> {
     metrics,
     certDaysRemaining: null,
     tracePath,
+    baselineScreenshot,
   };
 }
 

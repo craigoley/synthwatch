@@ -37,6 +37,33 @@ export async function uploadScreenshot(runId: number, data: Buffer): Promise<str
 }
 
 /**
+ * Upload a check's most-recent-PASSING browser screenshot to a STABLE per-check key
+ * (baselines/check-<id>.png) — OVERWRITING the previous baseline, so there's exactly
+ * one object per check (most-recent-passing, not history). Returns the blob URL, or
+ * null if storage is unconfigured / the upload fails. Never throws into the run.
+ */
+export async function uploadBaselineScreenshot(checkId: number, data: Buffer): Promise<string | null> {
+  if (!CONNECTION_STRING) return null; // storage disabled
+
+  try {
+    const service = BlobServiceClient.fromConnectionString(CONNECTION_STRING);
+    const container = service.getContainerClient(CONTAINER);
+    await container.createIfNotExists();
+
+    // Stable key (no timestamp) => uploadData overwrites the prior baseline.
+    const blobName = `baselines/check-${checkId}.png`;
+    const blob = container.getBlockBlobClient(blobName);
+    await blob.uploadData(data, {
+      blobHTTPHeaders: { blobContentType: 'image/png' },
+    });
+    return blob.url;
+  } catch (err) {
+    console.error(`[artifacts] baseline screenshot upload failed for check ${checkId}:`, err);
+    return null;
+  }
+}
+
+/**
  * Upload a failed browser run's Playwright trace.zip (from a temp file path).
  * Streams the file (traces are 1-50MB). Returns the blob URL, or null if storage
  * is unconfigured or the upload fails — never throws into the run.
