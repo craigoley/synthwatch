@@ -365,3 +365,94 @@ async function countConsecutiveDown(
   }
   return count;
 }
+
+// Multi-window multi-burn-rate (Google SRE). Fast=1h page (burns ~2% of a 30d
+// budget in 1h); slow=6h ticket. burn_rate is normalized: (down/total)/(1-target),
+// so 1.0 = on track to exactly exhaust the budget over the SLO window.
+const BURN_FAST_WINDOW = '1 hour';
+const BURN_FAST_THRESHOLD = 14.4;
+const BURN_SLOW_WINDOW = '6 hours';
+const BURN_SLOW_THRESHOLD = 6;
+
+async function sloBurnRate(checkId: number, windowInterval: string): Promise<number | null> {
+  const { rows } = await pool.query<{ burn_rate: string | null }>(
+    `SELECT burn_rate FROM slo_status($1, now() - $2::interval, now())`,
+    [checkId, windowInterval],
+  );
+  // No row => the check has no slo_target (opt-in). burn_rate is numeric (string via pg).
+  if (rows.length === 0) return null;
+  return rows[0].burn_rate == null ? 0 : Number(rows[0].burn_rate);
+}
+
+/**
+ * SLO burn-rate alerting — opt-in (only when the check has slo_target). Routes a
+ * fast-burn (1h) page or slow-burn (6h) ticket through the EXISTING alert profiles
+ * (fast => 'error'/critical, slow => 'warn'/warning), debounced via
+ * last_burn_notified_at, and SUPPRESSED when an incident already pages the check or
+ * inside a maintenance window. Non-fatal — never throws into the run path.
+ */
+export async function maybeBurnAlert(check: Check): Promise<void> {
+  if (check.slo_target == null) return; // SLO off — nothing to burn
+  try {
+    // Reconcile with incidents: an open incident already pages this check's
+    // down-runs, so don't double-page on the same problem.
+    if (await getOpenIncident(check.id)) return;
+    if (await inMaintenanceWindow(check.id)) return;
+
+    let severity: 'critical' | 'warning';
+    let routeStatus: RouteStatus;
+    let label: string;
+    let windowLabel: string;
+    let burn: number;
+
+    const fast = await sloBurnRate(check.id, BURN_FAST_WINDOW);
+    if (fast === null) return; // no slo_target row (shouldn't happen given the guard)
+    if (fast >= BURN_FAST_THRESHOLD) {
+      severity = 'critical'; routeStatus = 'error'; label = 'fast burn'; windowLabel = '1h'; burn = fast;
+    } else {
+      const slow = (await sloBurnRate(check.id, BURN_SLOW_WINDOW)) ?? 0;
+      if (slow >= BURN_SLOW_THRESHOLD) {
+        severity = 'warning'; routeStatus = 'warn'; label = 'slow burn'; windowLabel = '6h'; burn = slow;
+      } else {
+        return; // budget burn within tolerance
+      }
+    }
+
+    // Debounce: reuse the warn re-notify cadence so a sustained burn doesn't alert
+    // every tick.
+    const { rows } = await pool.query<{ due: boolean }>(
+      `SELECT (last_burn_notified_at IS NULL
+               OR now() - last_burn_notified_at >= make_interval(secs => warn_renotify_seconds)) AS due
+         FROM checks WHERE id = $1`,
+      [check.id],
+    );
+    if (!rows[0]?.due) {
+      console.log(`[runner] check ${check.id} "${check.name}" SLO ${label} — alert debounced`);
+      return;
+    }
+
+    const pct = (check.slo_target * 100).toFixed(check.slo_target >= 0.999 ? 2 : 1);
+    const summary =
+      `Check "${check.name}" SLO ${label}: error budget burning at ${burn.toFixed(1)}x over ` +
+      `${windowLabel} (target ${pct}%) — budget will exhaust before the SLO window if sustained.`;
+
+    await dispatchAlerts(
+      {
+        checkId: check.id,
+        checkName: check.name,
+        severity,
+        status: severity === 'critical' ? 'open' : 'warn',
+        summary,
+        runId: 0, // budget-level, not tied to a single run
+      },
+      await profileChannels(check, routeStatus),
+    );
+    await pool.query(`UPDATE checks SET last_burn_notified_at = now() WHERE id = $1`, [check.id]);
+    console.log(`[runner] check ${check.id} "${check.name}" SLO ${label} alert (burn ${burn.toFixed(1)}x/${windowLabel})`);
+  } catch (err) {
+    console.warn(
+      `[runner] check ${check.id} SLO burn check failed (non-fatal):`,
+      err instanceof Error ? err.message : err,
+    );
+  }
+}

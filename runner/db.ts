@@ -98,6 +98,10 @@ export interface Check {
   // re-notify interval (so a persistent warn doesn't notify every tick).
   last_warn_notified_at: Date | null;
   warn_renotify_seconds: number;
+  // SLO / error budget. slo_target in (0,1) e.g. 0.999; null => SLO off (opt-in).
+  // last_burn_notified_at debounces burn-rate alerts (reuses warn_renotify_seconds).
+  slo_target: number | null;
+  last_burn_notified_at: Date | null;
 }
 
 /** A row from the `runs` table after we've finished executing a check. */
