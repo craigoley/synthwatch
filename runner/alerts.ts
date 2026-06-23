@@ -1,26 +1,20 @@
-// Alert delivery — a small channel abstraction.
+// Alert delivery — dashboard-managed channels (v1).
 //
-// This open-source engine ships only VENDOR-NEUTRAL channels: EMAIL (Azure
-// Communication Services) and a GENERIC WEBHOOK. Vendor-specific chat/paging
-// channels (PagerDuty, Slack, etc.) are intentionally NOT in core — wire them
-// either:
-//   1. via the generic webhook (point ALERT_WEBHOOK_URL at the vendor's inbound
-//      endpoint; it receives the documented JSON payload), or
-//   2. in a fork, by implementing the AlertChannel interface below and adding it
-//      to CHANNELS — no change to core needed.
+// THE SPLIT: a channel's TARGET (recipients / webhook URL) + the ROUTING (which alert
+// -> which channel) live in the DB (channels + alert_routes tables, dashboard-managed).
+// Only the TRANSPORT CREDENTIAL — the ACS email connection string — stays an infra
+// secret in env (ACS_EMAIL_CONNECTION_STRING). resolveChannels() reads the DB; the
+// caller passes the resolved Channel[] to dispatchAlerts(). (Previously recipients/URL
+// came from env — that conflation is what this removes.)
 //
-// Every channel is enabled ONLY when its env config is present; an absent var
-// means the channel is silently off. NOTHING tenant-specific lives in source
-// (this repo is public OSS) — all URLs, addresses and connection strings come
-// from the runner's environment.
+// Vendor chat/paging (PagerDuty/Slack/...) is reached via a webhook channel whose URL
+// points at the vendor's inbound endpoint.
 //
-// Delivery is NON-FATAL by construction: dispatchAlerts() never throws, and one
-// dead channel never blocks the others or the incident. The incident is recorded
-// BEFORE alerts fire (see evaluate.ts), so alerting can never become a new
-// failure mode for a run.
-//
-// Fires on incident OPEN (alert) and RESOLVE (recovery) — both carry severity.
+// Delivery is NON-FATAL: dispatchAlerts() never throws, and one dead channel never
+// blocks the others or the incident (recorded BEFORE alerts fire — see evaluate.ts).
+// Fires on incident OPEN / RESOLVE and the warn path.
 import { EmailClient } from '@azure/communication-email';
+import { pool } from './db.js';
 
 // Hard ceiling on any single outbound send. dispatchAlerts is awaited in the run
 // tick, and Promise.allSettled isolates REJECTIONS but not HANGS — a webhook (or
@@ -65,14 +59,17 @@ export interface AlertPayload {
 }
 
 /**
- * One delivery channel. Configured purely from env; send() may throw — the
- * dispatcher isolates it. This is the fork extension point: implement this and
- * add the channel to CHANNELS to support any vendor without touching core.
+ * A delivery channel — a TARGET loaded from the DB `channels` table (NOT env). `config`
+ * holds the target: email -> {to, from}; webhook -> {url, authHeader?}. The transport
+ * SECRET (ACS connection string) still comes from env — only targets + routing are DB.
+ * `type` drives which send fn runs.
  */
-interface AlertChannel {
-  readonly name: string;
-  isConfigured(): boolean;
-  send(p: AlertPayload): Promise<void>;
+export interface Channel {
+  id: number;
+  name: string;
+  type: 'email' | 'webhook';
+  config: { to?: string[]; from?: string; url?: string; authHeader?: string };
+  enabled: boolean;
 }
 
 function subjectLine(p: AlertPayload): string {
@@ -98,110 +95,135 @@ function bodyText(p: AlertPayload): string {
   return lines.join('\n');
 }
 
-// --- Channel: Azure Communication Services email ---------------------------
-// Env: ACS_EMAIL_CONNECTION_STRING, ALERT_EMAIL_FROM, ALERT_EMAIL_TO
-// (ALERT_EMAIL_TO may be a comma-separated list).
-const emailChannel: AlertChannel = {
-  name: 'email',
-  isConfigured: () =>
-    Boolean(
-      process.env.ACS_EMAIL_CONNECTION_STRING &&
-        process.env.ALERT_EMAIL_FROM &&
-        process.env.ALERT_EMAIL_TO,
-    ),
-  async send(p: AlertPayload): Promise<void> {
-    const connectionString = process.env.ACS_EMAIL_CONNECTION_STRING;
-    const senderAddress = process.env.ALERT_EMAIL_FROM;
-    const to = process.env.ALERT_EMAIL_TO;
-    if (!connectionString || !senderAddress || !to) return;
+// --- Delivery: Azure Communication Services email --------------------------
+// Transport SECRET (ACS connection string) from env; sender + recipients from the
+// channel's DB config. Builder is exported so a test can assert the recipients without
+// touching ACS.
+export function buildEmailMessage(from: string, to: string[], p: AlertPayload) {
+  return {
+    senderAddress: from,
+    content: { subject: subjectLine(p), plainText: bodyText(p) },
+    recipients: { to: to.map((address) => ({ address: address.trim() })) },
+  };
+}
 
-    const client = new EmailClient(connectionString);
-    // Bound the whole send (initial POST + poll) — a hung ACS endpoint must not
-    // stall the tick. The rejection is isolated by dispatchAlerts.
-    await withTimeout(
-      (async () => {
-        const poller = await client.beginSend({
-          senderAddress,
-          content: { subject: subjectLine(p), plainText: bodyText(p) },
-          recipients: { to: to.split(',').map((address) => ({ address: address.trim() })) },
-        });
-        await poller.pollUntilDone();
-      })(),
-      ALERT_TIMEOUT_MS,
-      'ACS email send',
-    );
-  },
-};
+async function sendEmail(c: Channel, p: AlertPayload): Promise<void> {
+  const connectionString = process.env.ACS_EMAIL_CONNECTION_STRING;
+  const from = c.config.from;
+  const to = c.config.to ?? [];
+  if (!connectionString || !from || to.length === 0) return;
+  const client = new EmailClient(connectionString);
+  // Bound the whole send (initial POST + poll) — a hung ACS endpoint must not stall
+  // the tick. The rejection is isolated by dispatchAlerts.
+  await withTimeout(
+    (async () => {
+      const poller = await client.beginSend(buildEmailMessage(from, to, p));
+      await poller.pollUntilDone();
+    })(),
+    ALERT_TIMEOUT_MS,
+    'ACS email send',
+  );
+}
 
-// --- Channel: generic webhook ----------------------------------------------
-// The vendor-neutral escape hatch — point it at PagerDuty / Slack / any HTTP
-// endpoint that ingests a POST. Env: ALERT_WEBHOOK_URL (+ optional
-// ALERT_WEBHOOK_AUTH_HEADER, the full Authorization header value, e.g.
-// "Bearer <token>" or "Basic <base64>").
-//
-// Payload (application/json):
-//   {
-//     "event":        "open" | "resolved" | "warn",
-//     "severity":     "critical" | "warning",
-//     "checkId":      number,
-//     "checkName":    string,
-//     "summary":      string,          // failure reason/step for an open
-//     "runId":        number | null,    // null for budget-level (SLO burn) alerts
-
-//     "failedStep":   string | null,
-//     "screenshotUrl":string | null,
-//     "dashboardUrl": string | null
-//   }
-const webhookChannel: AlertChannel = {
-  name: 'webhook',
-  isConfigured: () => Boolean(process.env.ALERT_WEBHOOK_URL),
-  async send(p: AlertPayload): Promise<void> {
-    const url = process.env.ALERT_WEBHOOK_URL;
-    if (!url) return;
-    const headers: Record<string, string> = { 'content-type': 'application/json' };
-    const auth = process.env.ALERT_WEBHOOK_AUTH_HEADER;
-    if (auth) headers.authorization = auth;
-
-    const res = await fetch(url, {
-      method: 'POST',
-      headers,
-      // Bound the request — a webhook that accepts TCP but never responds would
-      // otherwise hang the tick (allSettled isolates rejections, not hangs).
-      signal: AbortSignal.timeout(ALERT_TIMEOUT_MS),
-      body: JSON.stringify({
-        event: p.status,
-        severity: p.severity,
-        // pg returns BIGINT as a string; coerce so the JSON matches the
-        // documented numeric contract.
-        checkId: Number(p.checkId),
-        checkName: p.checkName,
-        summary: p.summary,
-        // null for budget-level (SLO burn) alerts not tied to a single run.
-        runId: p.runId == null ? null : Number(p.runId),
-        failedStep: p.failedStep ?? null,
-        screenshotUrl: p.screenshotUrl ?? null,
-        dashboardUrl: dashboardLink(p),
-      }),
-    });
-    if (!res.ok) throw new Error(`webhook returned ${res.status}`);
-  },
-};
-
-const CHANNELS: AlertChannel[] = [emailChannel, webhookChannel];
+// --- Delivery: generic webhook ---------------------------------------------
+// URL (+ optional full Authorization header) from the channel's DB config. The URL may
+// embed a token (acceptable for v1). Payload (application/json):
+//   { event, severity, checkId, checkName, summary, runId|null, failedStep, screenshotUrl, dashboardUrl }
+async function sendWebhook(c: Channel, p: AlertPayload): Promise<void> {
+  const url = c.config.url;
+  if (!url) return;
+  const headers: Record<string, string> = { 'content-type': 'application/json' };
+  if (c.config.authHeader) headers.authorization = c.config.authHeader;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers,
+    // Bound the request — a webhook that accepts TCP but never responds would
+    // otherwise hang the tick (allSettled isolates rejections, not hangs).
+    signal: AbortSignal.timeout(ALERT_TIMEOUT_MS),
+    body: JSON.stringify({
+      event: p.status,
+      severity: p.severity,
+      checkId: Number(p.checkId),
+      checkName: p.checkName,
+      summary: p.summary,
+      runId: p.runId == null ? null : Number(p.runId),
+      failedStep: p.failedStep ?? null,
+      screenshotUrl: p.screenshotUrl ?? null,
+      dashboardUrl: dashboardLink(p),
+    }),
+  });
+  if (!res.ok) throw new Error(`webhook returned ${res.status}`);
+}
 
 /**
- * Fan out an alert to the requested channels that are also CONFIGURED. The
- * caller (evaluate.ts) decides `channelNames` from the check's alert profile;
- * `undefined` means "all channels" (legacy fallback when no profile exists). A
- * channel named by a profile but missing its env config is silently skipped.
+ * A channel is DELIVERABLE when enabled AND its transport is available: email needs the
+ * ACS connection string (env) + a sender + >=1 recipient; webhook needs a URL. (The
+ * target came from the DB; the transport secret from env.)
+ */
+export function channelDeliverable(c: Channel): boolean {
+  if (!c.enabled) return false;
+  if (c.type === 'email') {
+    return Boolean(
+      process.env.ACS_EMAIL_CONNECTION_STRING && c.config.from && c.config.to && c.config.to.length > 0,
+    );
+  }
+  if (c.type === 'webhook') return Boolean(c.config.url);
+  return false;
+}
+
+interface ChannelRow { id: string; name: string; type: string; config: unknown; enabled: boolean }
+function mapChannel(r: ChannelRow): Channel {
+  const cfg = (typeof r.config === 'object' && r.config !== null ? r.config : {}) as Channel['config'];
+  return { id: Number(r.id), name: r.name, type: r.type as Channel['type'], config: cfg, enabled: r.enabled };
+}
+
+/**
+ * Resolve the channel set for an alert on (checkId, severity) from the DB:
+ *   - a PER-CHECK route (alert_routes.check_id = checkId) OVERRIDES, if any exist;
+ *   - else the SEVERITY default (alert_routes.severity = severity, check_id IS NULL).
+ * Override (per-check REPLACES the severity default), not union. De-duped by channel id;
+ * only enabled channels returned (transport/deliverability is checked at dispatch).
+ */
+export async function resolveChannels(checkId: number, severity: 'critical' | 'warning'): Promise<Channel[]> {
+  const perCheck = await pool.query<ChannelRow>(
+    `SELECT ch.id, ch.name, ch.type, ch.config, ch.enabled
+       FROM alert_routes r JOIN channels ch ON ch.id = r.channel_id
+      WHERE r.check_id = $1 AND ch.enabled`,
+    [checkId],
+  );
+  const rows = perCheck.rows.length > 0
+    ? perCheck.rows
+    : (
+        await pool.query<ChannelRow>(
+          `SELECT ch.id, ch.name, ch.type, ch.config, ch.enabled
+             FROM alert_routes r JOIN channels ch ON ch.id = r.channel_id
+            WHERE r.severity = $1 AND r.check_id IS NULL AND ch.enabled`,
+          [severity],
+        )
+      ).rows;
+  const seen = new Set<number>();
+  const out: Channel[] = [];
+  for (const r of rows) {
+    const c = mapChannel(r);
+    if (!seen.has(c.id)) {
+      seen.add(c.id);
+      out.push(c);
+    }
+  }
+  return out;
+}
+
+/**
+ * Fan out an alert to the resolved channels (from resolveChannels) that are also
+ * DELIVERABLE (transport available — see channelDeliverable). A routed channel whose
+ * transport is missing (e.g. email with no ACS connection string yet) is silently
+ * skipped, same as before — but the TARGET now came from the DB, not env.
  *
- * Never throws: each channel is awaited independently and failures are logged, so
- * a dead channel cannot fail the run or block incident recording.
+ * Never throws: each send is awaited independently and failures are logged, so a dead
+ * channel cannot fail the run or block incident recording.
  *
- * Returns {active, delivered}: how many channels were tried and how many succeeded.
- * Lets a debounced caller (the warn path) avoid stamping "notified" when EVERY
- * configured channel failed — so the notice retries next tick instead of being
- * silently dropped for the re-notify window.
+ * Returns {active, delivered}: how many were tried and how many succeeded — lets the
+ * warn path avoid stamping "notified" when every channel failed (retry next tick).
  */
 export interface DispatchResult {
   active: number;
@@ -210,29 +232,28 @@ export interface DispatchResult {
 
 export async function dispatchAlerts(
   payload: AlertPayload,
-  channelNames?: string[],
+  channels: Channel[],
 ): Promise<DispatchResult> {
-  const want = channelNames === undefined ? null : new Set(channelNames);
-  const active = CHANNELS.filter(
-    (c) => (want === null || want.has(c.name)) && c.isConfigured(),
-  );
+  const active = channels.filter(channelDeliverable);
   if (active.length === 0) {
     console.log(
-      `[alerts] ${payload.status} "${payload.checkName}" — no matching configured channels (skipped)`,
+      `[alerts] ${payload.status} "${payload.checkName}" — no deliverable channels (skipped)`,
     );
     return { active: 0, delivered: 0 };
   }
 
-  const results = await Promise.allSettled(active.map((c) => c.send(payload)));
+  const results = await Promise.allSettled(
+    active.map((c) => (c.type === 'email' ? sendEmail(c, payload) : sendWebhook(c, payload))),
+  );
   let delivered = 0;
   results.forEach((r, i) => {
-    const channel = active[i].name;
+    const ch = active[i];
     if (r.status === 'rejected') {
-      console.error(`[alerts] channel "${channel}" failed:`, r.reason);
+      console.error(`[alerts] channel "${ch.name}" (${ch.type}) failed:`, r.reason);
     } else {
       delivered++;
       console.log(
-        `[alerts] channel "${channel}" delivered ${payload.status} for "${payload.checkName}"`,
+        `[alerts] channel "${ch.name}" (${ch.type}) delivered ${payload.status} for "${payload.checkName}"`,
       );
     }
   });

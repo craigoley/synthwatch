@@ -9,7 +9,7 @@
 // partial unique index (one_open_incident_per_check) is a belt-and-braces backstop.
 import { pool, type Check, type RunRecord } from './db.js';
 import type { RunMetrics } from './metrics.js';
-import { dispatchAlerts } from './alerts.js';
+import { dispatchAlerts, resolveChannels } from './alerts.js';
 import { rcaEnabled, runRca } from './rca.js';
 
 interface OpenIncident {
@@ -44,42 +44,9 @@ export function perfBudgetBreach(check: Check, m: RunMetrics): string | null {
   return breaches.length > 0 ? `perf budget breached: ${breaches.join('; ')}` : null;
 }
 
-// A profile rule: route an alert class to a channel set. Missing fields are
-// treated as wildcards; channels not also CONFIGURED are silently skipped.
-interface AlertRule {
-  severity?: 'critical' | 'warning' | 'any';
-  status?: 'fail' | 'error' | 'warn' | 'resolved' | 'any';
-  channels?: string[];
-}
-
-/** The class an alert routes by — distinct from the message verb (open/resolved/warn). */
-type RouteStatus = 'fail' | 'error' | 'warn' | 'resolved';
-
-/**
- * Resolve which channels should fire for (check.severity, routeStatus) from the
- * check's alert profile (or the 'default' profile when unassigned). Returns the
- * unioned channel names, an EMPTY array if the profile matches no rule (route
- * nothing), or `undefined` if no profile exists at all (=> legacy: all channels).
- */
-async function profileChannels(
-  check: Check,
-  routeStatus: RouteStatus,
-): Promise<string[] | undefined> {
-  const { rows } = await pool.query<{ rules: AlertRule[] | null }>(
-    `SELECT rules FROM alert_profiles
-      WHERE id = COALESCE($1, (SELECT id FROM alert_profiles WHERE name = 'default'))`,
-    [check.alert_profile_id],
-  );
-  if (rows.length === 0) return undefined; // no assigned + no 'default' -> legacy all
-  const rules = Array.isArray(rows[0].rules) ? rows[0].rules : [];
-  const channels = new Set<string>();
-  for (const r of rules) {
-    const sevOk = !r.severity || r.severity === 'any' || r.severity === check.severity;
-    const stOk = !r.status || r.status === 'any' || r.status === routeStatus;
-    if (sevOk && stOk) for (const ch of r.channels ?? []) channels.add(ch);
-  }
-  return [...channels];
-}
+// Channel routing now lives in the DB (channels + alert_routes), resolved by
+// resolveChannels(checkId, check.severity) in alerts.ts — severity-default with a
+// per-check override. (Replaces the old env-targets + alert_profiles status-routing.)
 
 export async function evaluate(check: Check, run: RunRecord): Promise<void> {
   const open = await getOpenIncident(check.id);
@@ -116,7 +83,7 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
             summary: `Check "${check.name}" recovered.`,
             runId: run.id,
           },
-          await profileChannels(check, 'resolved'),
+          await resolveChannels(check.id, check.severity),
         );
       }
     }
@@ -199,10 +166,6 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
   }
   const incidentId = incidentRows[0].id;
 
-  // Route by the down status (fail|error) so a profile can split them. On the open
-  // path the triggering run is always down; map defensively (pass/warn can't reach
-  // here, but the verdict is cross-location so TS can't prove run.status is down).
-  const routeStatus: RouteStatus = run.status === 'error' ? 'error' : 'fail';
   await dispatchAlerts(
     {
       checkId: check.id,
@@ -214,7 +177,7 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
       failedStep: run.failed_step,
       screenshotUrl: run.screenshot_url,
     },
-    await profileChannels(check, routeStatus),
+    await resolveChannels(check.id, check.severity),
   );
 
   // AI root-cause analysis (opt-in, non-fatal) — fires ONLY here, on incident-open
@@ -363,7 +326,7 @@ async function maybeNotifyWarn(check: Check, run: RunRecord): Promise<void> {
       failedStep: run.failed_step,
       screenshotUrl: run.screenshot_url,
     },
-    await profileChannels(check, 'warn'),
+    await resolveChannels(check.id, check.severity),
   );
 
   // Stamp the debounce UNLESS every configured channel failed. With no configured
@@ -524,7 +487,6 @@ export async function maybeBurnAlert(check: Check): Promise<void> {
     if (await inMaintenanceWindow(check.id)) return;
 
     let severity: 'critical' | 'warning';
-    let routeStatus: RouteStatus;
     let label: string;
     let windowLabel: string;
     let burn: number;
@@ -538,7 +500,7 @@ export async function maybeBurnAlert(check: Check): Promise<void> {
     const fastRates = await burnRatesByLocation(check.id, BURN_FAST_WINDOW, check.slo_target);
     const fastN = effectiveN(fastRates.length, check.min_fail_locations);
     if (fastRates.length > 0 && burningLocations(fastRates, BURN_FAST_THRESHOLD, floor) >= fastN) {
-      severity = 'critical'; routeStatus = 'error'; label = 'fast burn'; windowLabel = '1h';
+      severity = 'critical'; label = 'fast burn'; windowLabel = '1h';
       burn = reportedBurn(fastRates, floor);
     } else {
       // Slow burn is multi-window: page only when BOTH the 6h AND the 30m window are
@@ -555,7 +517,7 @@ export async function maybeBurnAlert(check: Check): Promise<void> {
         burningLocations(slowLong, BURN_SLOW_THRESHOLD, floor) >= longN &&
         burningLocations(slowShort, BURN_SLOW_THRESHOLD, floor) >= shortN
       ) {
-        severity = 'warning'; routeStatus = 'warn'; label = 'slow burn'; windowLabel = '6h';
+        severity = 'warning'; label = 'slow burn'; windowLabel = '6h';
         burn = reportedBurn(slowLong, floor);
       } else {
         return; // budget burn within tolerance, not from enough locations, or recovered
@@ -589,7 +551,7 @@ export async function maybeBurnAlert(check: Check): Promise<void> {
         summary,
         runId: null, // budget-level, not tied to a single run (no bogus "Run #0")
       },
-      await profileChannels(check, routeStatus),
+      await resolveChannels(check.id, check.severity),
     );
     await pool.query(`UPDATE checks SET last_burn_notified_at = now() WHERE id = $1`, [check.id]);
     console.log(`[runner] check ${check.id} "${check.name}" SLO ${label} alert (burn ${burn.toFixed(1)}x/${windowLabel})`);
