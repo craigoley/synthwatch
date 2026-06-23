@@ -36,6 +36,10 @@ jobs:
           fetch-depth: 1
 
       - name: Claude review
+        # FAIL-OPEN: a review crash / timeout must NOT fail the job on its own — the
+        # Verdict gate below is the sole arbiter of the conclusion (no/garbled
+        # verdict => PASS). Only a parsed BLOCK fails the check.
+        continue-on-error: true
         uses: anthropics/claude-code-action@2fee15510437d71399d9139ed60433470484a8fb # v1
         env:
           # Authenticate the `gh` CLI used by the Bash tool (comments are posted via
@@ -72,6 +76,18 @@ jobs:
                  the PR branch (verify with `npx tsc` / `npm test` where relevant).
             Do NOT merge the PR — merging is handled deterministically by a separate
             workflow job that is gated to trusted authors. You have no merge tools.
+
+            FINALLY — end your final message with EXACTLY ONE line, on its own line,
+            with nothing after it, choosing one:
+              REVIEW_VERDICT: BLOCK
+              REVIEW_VERDICT: PASS
+            BLOCK ONLY for: (a) a bug that ships broken/incorrect behaviour, (b) a
+            security issue, (c) a data-loss/corruption risk, or (d) a breaking change.
+            EVERYTHING ELSE IS PASS — style, naming, structure, "consider…",
+            suggestions, nits (still POST those as comments; they do NOT block). When
+            unsure whether a finding is blocking, choose PASS — Layer 1 already
+            ensured this review ran and its comments are visible; over-blocking
+            deadlocks merges, so bias to PASS.
           # --allowedTools MUST be a single QUOTED value (claude_args is shell-quote
           # parsed, which splits on UNQUOTED whitespace). The review job is review+fix
           # ONLY: it has git (to commit fixes) but deliberately NO `gh pr` / `gh api`
@@ -81,6 +97,42 @@ jobs:
             --model claude-opus-4-8
             --max-turns 50
             --allowedTools "Edit,Write,Read,Bash(git:*),Bash(npx tsc:*),Bash(npm test:*),mcp__github_inline_comment__create_inline_comment"
+
+      # Layer 2 — findings gate. The review's final message (posted as the
+      # github-actions[bot] tracking comment) ends with `REVIEW_VERDICT: BLOCK|PASS`.
+      # This step is the SOLE arbiter of the "Claude review" check-run conclusion:
+      #   BLOCK              -> exit 1 -> check FAILS -> branch protection holds merge.
+      #   PASS               -> exit 0 -> check passes.
+      #   missing / garbled / review errored -> FAIL-OPEN -> exit 0 (a transient LLM
+      #     hiccup must never deadlock merge; Layer 1 already guaranteed the review ran).
+      # Runs on a normal bash shell (NOT the LLM) so it may use gh; if: always() so it
+      # decides even when the review step (continue-on-error) failed.
+      - name: Verdict gate
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          # Grep the LAST REVIEW_VERDICT across the bot's PR comments (the review is
+          # the only source of the marker; "last match" = the latest verdict even if
+          # another bot comment was posted after the tracking comment).
+          VERDICT=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+                      --jq '.[] | select(.user.login=="github-actions[bot]") | .body' 2>/dev/null \
+                    | grep -oiE 'REVIEW_VERDICT:[[:space:]]*(BLOCK|PASS)' \
+                    | tail -1 | grep -oiE '(BLOCK|PASS)' | tr '[:lower:]' '[:upper:]' || true)
+          echo "[review] parsed verdict: '${VERDICT:-<none>}'"
+          if [ "$VERDICT" = "BLOCK" ]; then
+            echo "::error::Claude review verdict: BLOCK — a blocking finding holds this merge until resolved."
+            exit 1
+          fi
+          if [ "$VERDICT" = "PASS" ]; then
+            echo "[review] verdict PASS — merge may proceed."
+            exit 0
+          fi
+          echo "::warning::[review] no verdict parsed — failing open to PASS (an LLM hiccup must not deadlock merge)."
+          exit 0
 
   # Deterministic hands-free merge — TRUSTED AUTHORS ONLY. This `if:` is the security
   # gate: it fires only when the PR author's login is in the allowlist (the operator
