@@ -95,7 +95,7 @@ function looseEq(a: unknown, b: unknown): boolean {
 function compare(cmp: AssertionComparison, actual: unknown, expected: unknown): boolean {
   switch (cmp) {
     case 'eq':
-      return looseEq(actual, expected);
+      return !looseEq(actual, expected); // BUG: inverted — eq assertions now match the WRONG value
     case 'ne':
       return !looseEq(actual, expected);
     case 'lt':
