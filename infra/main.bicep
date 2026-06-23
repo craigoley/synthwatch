@@ -72,6 +72,22 @@ param managedEnvironmentName string = 'synthwatch-env-e2'
 @description('Container Apps Job name.')
 param jobName string = 'synthwatch-runner-job'
 
+// --- Second region: centralus (multi-location activation) -------------------
+// A 2nd runner region. ACA managed environments are REGIONAL, so centralus needs
+// its own env + job. Same image/identity/DB-secret as the primary; the only
+// difference is region + SYNTHWATCH_LOCATION=centralus. The DB is reached via its
+// FQDN + the AllowAllAzureServices firewall rule (region-agnostic, admin creds in
+// the same secret — NOT MI-to-Postgres), and the SAME user-assigned identity pulls
+// from the SAME ACR cross-region — so NO new MI and NO new Postgres grant.
+@description('Second runner region.')
+param centralusLocation string = 'centralus'
+
+@description('Container Apps managed environment for the centralus runner.')
+param centralusEnvName string = 'synthwatch-env-centralus'
+
+@description('centralus Container Apps Job name.')
+param centralusJobName string = 'synthwatch-runner-job-centralus'
+
 @description('One-off Container Apps Job that applies DB migrations (started by CD).')
 param migrateJobName string = 'synthwatch-migrate-job'
 
@@ -325,6 +341,14 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
               name: 'AZURE_STORAGE_CONTAINER'
               value: artifactContainerName
             }
+            {
+              // This region's vantage label, stamped onto every run + used for
+              // per-location claiming. The original region is physically eastus2;
+              // applying this template retires the legacy unset (='default') label.
+              // ★ Must land WITH db/ops/relabel_default_to_eastus2.sql at cutover.
+              name: 'SYNTHWATCH_LOCATION'
+              value: location
+            }
             // Alert-channel vars (ACS_EMAIL_* / ALERT_EMAIL_*,
             // ALERT_WEBHOOK_URL[/_AUTH_HEADER], DASHBOARD_URL) are added per
             // deployment; absent => that channel is disabled.
@@ -334,6 +358,101 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
     }
   }
   // Ensure AcrPull is in place before the job attempts its first image pull.
+  dependsOn: [
+    acrPull
+  ]
+}
+
+// ---------------------------------------------------------------------------
+// Second region (centralus): its own regional managed environment + runner job.
+// Logs to the SAME Log Analytics workspace (cross-region shipping is allowed).
+// Identical to the primary job except region + SYNTHWATCH_LOCATION=centralus.
+// ---------------------------------------------------------------------------
+resource centralusEnvironment 'Microsoft.App/managedEnvironments@2024-03-01' = {
+  name: centralusEnvName
+  location: centralusLocation
+  properties: {
+    appLogsConfiguration: {
+      destination: 'log-analytics'
+      logAnalyticsConfiguration: {
+        customerId: logAnalytics.properties.customerId
+        sharedKey: logAnalytics.listKeys().primarySharedKey
+      }
+    }
+  }
+}
+
+resource centralusJob 'Microsoft.App/jobs@2024-03-01' = {
+  name: centralusJobName
+  location: centralusLocation
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${identity.id}': {}
+    }
+  }
+  properties: {
+    environmentId: centralusEnvironment.id
+    configuration: {
+      triggerType: 'Schedule'
+      replicaTimeout: 240
+      replicaRetryLimit: 0
+      scheduleTriggerConfig: {
+        cronExpression: '*/5 * * * *'
+        parallelism: 1
+        replicaCompletionCount: 1
+      }
+      registries: [
+        {
+          server: acr.properties.loginServer
+          identity: identity.id
+        }
+      ]
+      secrets: [
+        {
+          // Same admin creds + Postgres FQDN as the primary — reachable cross-region
+          // via the AllowAllAzureServices firewall rule.
+          name: 'database-url'
+          value: 'postgresql://${postgresAdminLogin}:${postgresAdminPassword}@${postgres.properties.fullyQualifiedDomainName}:5432/synthwatch?sslmode=require'
+        }
+        {
+          name: 'storage-conn'
+          value: 'DefaultEndpointsProtocol=https;AccountName=${storage.name};AccountKey=${storage.listKeys().keys[0].value};EndpointSuffix=${environment().suffixes.storage}'
+        }
+      ]
+    }
+    template: {
+      containers: [
+        {
+          name: 'runner'
+          image: runnerImage
+          resources: {
+            cpu: json('1.0')
+            memory: '2Gi'
+          }
+          env: [
+            {
+              name: 'DATABASE_URL'
+              secretRef: 'database-url'
+            }
+            {
+              name: 'AZURE_STORAGE_CONNECTION_STRING'
+              secretRef: 'storage-conn'
+            }
+            {
+              name: 'AZURE_STORAGE_CONTAINER'
+              value: artifactContainerName
+            }
+            {
+              // The vantage label for this region — claims/runs as 'centralus'.
+              name: 'SYNTHWATCH_LOCATION'
+              value: centralusLocation
+            }
+          ]
+        }
+      ]
+    }
+  }
   dependsOn: [
     acrPull
   ]
