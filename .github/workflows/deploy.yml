@@ -114,10 +114,14 @@ jobs:
         with:
           azcliversion: latest
           # This is an ACA JOB, not a Container App — use `containerapp job update`,
-          # never `containerapp update`.
+          # never `containerapp update`. Roll BOTH region jobs to the same image so the
+          # regions never drift. The centralus job is tolerated-missing (|| true) until
+          # its bicep deploy lands, so CD doesn't fail before the 2nd region exists.
           inlineScript: |
-            az containerapp job update -n synthwatch-runner-job -g synthwatch-rg \
-              --image synthwatcholey0620.azurecr.io/synthwatch-runner:${{ github.sha }}
+            IMAGE=synthwatcholey0620.azurecr.io/synthwatch-runner:${{ github.sha }}
+            az containerapp job update -n synthwatch-runner-job -g synthwatch-rg --image "$IMAGE"
+            az containerapp job update -n synthwatch-runner-job-centralus -g synthwatch-rg --image "$IMAGE" \
+              || echo "::notice::centralus runner job not present yet — skipping (deploy its bicep to create it)."
 
       - name: Write deployment summary
         run: |
