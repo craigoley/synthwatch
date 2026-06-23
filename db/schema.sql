@@ -336,7 +336,8 @@ CREATE TABLE channels (
     id         BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     name       TEXT        NOT NULL UNIQUE,
     type       TEXT        NOT NULL CHECK (type IN ('email', 'webhook')),
-    -- email -> {to:[...], from}; webhook -> {url, authHeader?}. No secrets.
+    -- email -> {to:[...]}; webhook -> {url, authHeader?}. No secrets, no sender:
+    -- the email FROM + ACS conn string are runner env (ALERT_EMAIL_FROM / ACS_EMAIL_CONNECTION_STRING).
     config     JSONB       NOT NULL DEFAULT '{}'::jsonb,
     enabled    BOOLEAN     NOT NULL DEFAULT true,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()

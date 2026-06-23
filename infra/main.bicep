@@ -127,6 +127,9 @@ param aoaiApiVersion string = '2025-08-07'
 @description('RCA completion-token budget (RCA_MAX_TOKENS).')
 param rcaMaxTokens string = '4000'
 
+@description('Verified ACS sender for alert emails (ALERT_EMAIL_FROM). NON-secret — a property of the ACS-owned domain, set once here; the ACS connection string stays out-of-band (secret).')
+param alertEmailFrom string = 'donotreply@0ad660ff-ac71-4b63-a5f6-ce885666c796.azurecomm.net'
+
 // AcrPull built-in role.
 var acrPullRoleId = '7f951dda-4ed3-4680-a7ca-43fe172d538d'
 
@@ -414,11 +417,16 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
               name: 'RCA_MAX_TOKENS'
               value: rcaMaxTokens
             }
+            {
+              // Email sender — non-secret transport property, now template-owned. Recipients (to[])
+              // are DB-managed per channel; the ACS connection string stays out-of-band (secret).
+              name: 'ALERT_EMAIL_FROM'
+              value: alertEmailFrom
+            }
             // STILL out-of-band (NOT owned here) — a redeploy will NOT restore them:
-            // alert channels (ACS_EMAIL_* / ALERT_EMAIL_*, ALERT_WEBHOOK_URL[/_AUTH_HEADER],
-            // DASHBOARD_URL) + OTel (OTEL_EXPORTER_OTLP_*). Currently UNSET => alerts
-            // deliver to no channel. See the PR's audit — declaring them needs their
-            // values (some secret) and is a tracked follow-up.
+            // the ACS connection string (ACS_EMAIL_CONNECTION_STRING, secret) + webhook channel
+            // (ALERT_WEBHOOK_URL[/_AUTH_HEADER]) + DASHBOARD_URL + OTel (OTEL_EXPORTER_OTLP_*).
+            // Unset => those channels don't deliver. Declaring the secret ones is a tracked follow-up.
           ]
         }
       ]
@@ -533,6 +541,11 @@ resource centralusJob 'Microsoft.App/jobs@2024-03-01' = {
             {
               name: 'RCA_MAX_TOKENS'
               value: rcaMaxTokens
+            }
+            {
+              // Email sender — non-secret transport property, template-owned (see the eastus2 job).
+              name: 'ALERT_EMAIL_FROM'
+              value: alertEmailFrom
             }
           ]
         }
