@@ -40,6 +40,7 @@ import {
   type RunMetrics,
 } from './metrics.js';
 import { isExpectationError } from './errors.js';
+import { runWithRetry } from './retry.js';
 
 // A run's terminal outcome. `status` is the real taxonomy, not a boolean:
 //   pass / fail / error come from execution; `warn` is derived later in runOne
@@ -70,6 +71,11 @@ interface Outcome {
 // reaped to 'error' so the failure is visible to SLA/incidents rather than
 // lingering as in-flight forever.
 const STALE_RUNNING = "30 minutes";
+
+// Fixed backoff between fast-retry attempts — a short pause so an instant re-run
+// doesn't just hit the same in-flight transient blip. Fixed (not exponential): retry
+// counts are tiny and the tick is time-bounded by the ACA replicaTimeout.
+const RETRY_BACKOFF_MS = 2000;
 
 // This runner's vantage point, stamped onto every run it writes. The primary
 // region leaves this unset (=> 'default') so single-region behaviour is exactly
@@ -192,31 +198,56 @@ async function runOne(check: Check): Promise<void> {
   );
   const runId = rows[0].id;
 
-  // Wall-clock start of the executor — the OTel root span's start (durationMs anchors its end).
-  const execStartMs = Date.now();
-  let outcome: Outcome;
-  try {
-    if (check.kind === 'http') outcome = await executeHttp(check);
-    else if (check.kind === 'ssl') outcome = await executeSsl(check);
-    else if (check.kind === 'dns' || check.kind === 'tcp' || check.kind === 'ping')
-      outcome = await executeNet(check);
-    else if (check.kind === 'multistep') outcome = await executeMultistep(check, runId);
-    else outcome = await executeBrowser(check, runId);
-  } catch (err) {
-    // Unexpected runner error (e.g. flow loader threw) -> 'error', not 'fail'.
-    outcome = {
-      status: 'error',
-      httpStatus: null,
-      durationMs: 0,
-      error: err instanceof Error ? err.message : String(err),
-      failedStep: null,
-      screenshot: null,
-      metrics: null,
-      certDaysRemaining: null,
-      tracePath: null,
-      baselineScreenshot: null,
-    };
-  }
+  const errorOutcome = (msg: string): Outcome => ({
+    status: 'error',
+    httpStatus: null,
+    durationMs: 0,
+    error: msg,
+    failedStep: null,
+    screenshot: null,
+    metrics: null,
+    certDaysRemaining: null,
+    tracePath: null,
+    baselineScreenshot: null,
+  });
+
+  // FAST-RETRY (mechanism 1, within ONE run): runWithRetry re-runs on a transient
+  // 'error' (the check couldn't COMPLETE — network/timeout/DNS) up to `retries` times.
+  // NOT retried on 'fail' (an assertion failed = a real, completed result) nor
+  // pass/warn. The LAST attempt is the verdict; onBeforeRetry discards the prior
+  // errored attempt's partial per-run side effects (run_steps, run_metrics, the temp
+  // trace file) + backs off, so EXACTLY ONE verdict persists — the run history /
+  // failure_threshold (mechanism 2, AFTER this) never sees the retried-away attempts.
+  // retries=0 => no retry (pre-0021 behaviour).
+  const maxAttempts = check.retries + 1;
+  // Wall-clock start of the (final) executor attempt — the OTel root span's start.
+  let execStartMs = Date.now();
+  const outcome: Outcome = await runWithRetry<Outcome>(
+    async () => {
+      execStartMs = Date.now();
+      try {
+        if (check.kind === 'http') return await executeHttp(check);
+        if (check.kind === 'ssl') return await executeSsl(check);
+        if (check.kind === 'dns' || check.kind === 'tcp' || check.kind === 'ping')
+          return await executeNet(check);
+        if (check.kind === 'multistep') return await executeMultistep(check, runId);
+        return await executeBrowser(check, runId);
+      } catch (err) {
+        // Unexpected runner error (e.g. flow loader threw) -> 'error', not 'fail'.
+        return errorOutcome(err instanceof Error ? err.message : String(err));
+      }
+    },
+    check.retries,
+    async (prev, attempt) => {
+      if (prev.tracePath) await unlink(prev.tracePath).catch(() => {});
+      await pool.query(`DELETE FROM run_steps WHERE run_id = $1`, [runId]);
+      await pool.query(`DELETE FROM run_metrics WHERE run_id = $1`, [runId]);
+      await new Promise((r) => setTimeout(r, RETRY_BACKOFF_MS));
+      console.log(
+        `[runner] check ${check.id} "${check.name}" errored — fast-retry attempt ${attempt}/${maxAttempts}`,
+      );
+    },
+  );
 
   // Derive 'warn': a run that otherwise PASSED but breached a perf budget is
   // degraded-but-available. Only browser runs have metrics to compare. This is
