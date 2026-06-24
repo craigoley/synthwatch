@@ -9,7 +9,12 @@
 //   az deployment group create \
 //     --resource-group synthwatch-rg \
 //     --template-file infra/main.bicep \
-//     --parameters postgresAdminPassword='<strong-password>'
+//     --parameters postgresAdminPassword='<strong-password>' \
+//                  acsEmailConnectionString='<acs-email-connection-string>'
+//
+// BOTH @secure params are REQUIRED (no defaults). They are template-owned (Postgres auth +
+// the ACS_EMAIL_CONNECTION_STRING secretRef on both runner jobs), so passing them every
+// deploy keeps them intact — and a deploy can no longer WIPE ACS (the recurring defect).
 //
 // Registry auth uses a user-assigned managed identity granted AcrPull on the
 // existing ACR — no registry username/password is stored anywhere.
@@ -54,6 +59,19 @@ param postgresAdminLogin string = 'synthadmin'
 @description('PostgreSQL administrator password.')
 @secure()
 param postgresAdminPassword string
+
+// ACS email transport secret. SECRET (contains an accesskey) -> handled exactly like
+// postgresAdminPassword: a @secure param -> a job secret -> a secretRef env on both runner
+// jobs (NOT a plain value). Declared here so a deploy can no longer WIPE it: it was set
+// out-of-band (az containerapp job update --set-env-vars), so every `az deployment group
+// create` reset the jobs to the declared env and dropped it (the recurring alerting-wipe;
+// same class as #78 Postgres-auth / #80 AOAI-env). REQUIRED at deploy (no default) — pass
+// it alongside postgresAdminPassword or email alerting goes dark. ALERT_EMAIL_FROM is a
+// non-secret config param (alertEmailFrom) and is already owned — only the conn string
+// needed adding.
+@description('Azure Communication Services email connection string (ACS_EMAIL_CONNECTION_STRING). Secret — supply at deploy, like postgresAdminPassword.')
+@secure()
+param acsEmailConnectionString string
 
 @description('Log Analytics workspace name (live stack uses the -e2 name).')
 param logAnalyticsName string = 'synthwatch-logs-e2'
@@ -368,6 +386,12 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
           name: 'storage-conn'
           value: 'DefaultEndpointsProtocol=https;AccountName=${storage.name};AccountKey=${storage.listKeys().keys[0].value};EndpointSuffix=${environment().suffixes.storage}'
         }
+        {
+          // ACS email transport secret (contains an accesskey). Bicep-owned so a deploy
+          // can't wipe it — surfaced as the ACS_EMAIL_CONNECTION_STRING secretRef below.
+          name: 'acs-email-conn'
+          value: acsEmailConnectionString
+        }
       ]
     }
     template: {
@@ -426,10 +450,16 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
               name: 'ALERT_EMAIL_FROM'
               value: alertEmailFrom
             }
+            {
+              // ACS email transport (secret) — from the bicep-owned secret above, so a
+              // redeploy PRESERVES it instead of wiping it (ends the recurring defect).
+              name: 'ACS_EMAIL_CONNECTION_STRING'
+              secretRef: 'acs-email-conn'
+            }
             // STILL out-of-band (NOT owned here) — a redeploy will NOT restore them:
-            // the ACS connection string (ACS_EMAIL_CONNECTION_STRING, secret) + webhook channel
-            // (ALERT_WEBHOOK_URL[/_AUTH_HEADER]) + DASHBOARD_URL + OTel (OTEL_EXPORTER_OTLP_*).
-            // Unset => those channels don't deliver. Declaring the secret ones is a tracked follow-up.
+            // the webhook channel (ALERT_WEBHOOK_URL[/_AUTH_HEADER]) + DASHBOARD_URL + OTel
+            // (OTEL_EXPORTER_OTLP_*). Unset => those channels don't deliver. (ACS_EMAIL_CONNECTION_STRING
+            // is now bicep-owned above — declaring the remaining secret ones is a tracked follow-up.)
           ]
         }
       ]
@@ -497,6 +527,12 @@ resource centralusJob 'Microsoft.App/jobs@2024-03-01' = {
           name: 'storage-conn'
           value: 'DefaultEndpointsProtocol=https;AccountName=${storage.name};AccountKey=${storage.listKeys().keys[0].value};EndpointSuffix=${environment().suffixes.storage}'
         }
+        {
+          // ACS email transport secret (contains an accesskey). Bicep-owned so a deploy
+          // can't wipe it — surfaced as the ACS_EMAIL_CONNECTION_STRING secretRef below.
+          name: 'acs-email-conn'
+          value: acsEmailConnectionString
+        }
       ]
     }
     template: {
@@ -549,6 +585,12 @@ resource centralusJob 'Microsoft.App/jobs@2024-03-01' = {
               // Email sender — non-secret transport property, template-owned (see the eastus2 job).
               name: 'ALERT_EMAIL_FROM'
               value: alertEmailFrom
+            }
+            {
+              // ACS email transport (secret) — from the bicep-owned secret above, so a
+              // redeploy PRESERVES it instead of wiping it (ends the recurring defect).
+              name: 'ACS_EMAIL_CONNECTION_STRING'
+              secretRef: 'acs-email-conn'
             }
           ]
         }
