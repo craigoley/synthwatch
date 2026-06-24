@@ -114,7 +114,11 @@ async function periodFacts(
     `SELECT round(percentile_cont(0.75) WITHIN GROUP (ORDER BY m.lcp_ms))::int AS lcp_p75
        FROM run_metrics m JOIN runs r ON r.id = m.run_id
       WHERE r.started_at >= $2 AND r.started_at < $3 AND r.status IN ('pass','warn')
-        AND ($1::bigint IS NULL OR r.check_id = $1)`,
+        AND ($1::bigint IS NULL OR r.check_id = $1)
+        AND NOT EXISTS (
+          SELECT 1 FROM maintenance_windows mw
+           WHERE (mw.check_id = r.check_id OR mw.check_id IS NULL)
+             AND r.started_at >= mw.starts_at AND r.started_at < mw.ends_at)`,
     [checkId, startIso, endIso],
   );
   const up = Number(avail.rows[0].up);
