@@ -258,6 +258,7 @@ az deployment group create \
   --template-file infra/main.bicep \
   --parameters \
       postgresAdminPassword='<strong-password>' \
+      acsEmailConnectionString='<acs-email-connection-string>' \
       runnerImage='synthwatcholey0620.azurecr.io/synthwatch-runner:0.1.0'
 
 # 2. Grab the Postgres FQDN from the deployment outputs.
@@ -282,16 +283,24 @@ az containerapp job start -g synthwatch-rg -n synthwatch-runner-job
 > **Re-running against the live stack (additive).** The Bicep param defaults are
 > pinned to the live deployment's values (`-e2` names, `eastus2`), so re-running
 > the command above only re-asserts the existing resources — it does **not** build
-> a duplicate stack. One caveat: CD rolls the runner/migrate jobs to `:<git-sha>`
-> images, so re-running with the default `runnerImage` (`:0.1.0`) would revert the
-> runner image. To stay fully additive, pass the **current** image:
+> a duplicate stack. Two caveats:
+> 1. CD rolls the runner/migrate jobs to `:<git-sha>` images, so re-running with the
+>    default `runnerImage` (`:0.1.0`) would revert the runner image — pass the **current** image.
+> 2. **Secrets are REQUIRED params** (`@secure`, no default): `postgresAdminPassword`
+>    **and** `acsEmailConnectionString` (the ACS email connection string). Both are owned
+>    by the template (Postgres auth + the `ACS_EMAIL_CONNECTION_STRING` env on both runner
+>    jobs), so passing them on every deploy keeps them intact — and the deploy can no longer
+>    **wipe** ACS (the recurring email-alerting defect). Omit `acsEmailConnectionString` and
+>    the secret deploys empty → email alerting goes dark.
 >
 > ```bash
 > RUNNER_IMG=$(az containerapp job show -n synthwatch-runner-job -g synthwatch-rg \
 >               --query "properties.template.containers[0].image" -o tsv)
 > az deployment group create -g synthwatch-rg --name synthwatch-infra \
 >   --template-file infra/main.bicep \
->   --parameters postgresAdminPassword='<password>' runnerImage="$RUNNER_IMG"
+>   --parameters postgresAdminPassword='<password>' \
+>                acsEmailConnectionString='<acs-email-connection-string>' \
+>                runnerImage="$RUNNER_IMG"
 > ```
 >
 > A `what-if` on this then shows **0 to create, 0 to delete** (the only deltas are
