@@ -80,6 +80,11 @@ export interface AlertPayload {
   // Goes through the EXACT same dispatch/send path; only the content is flagged. See
   // testSend.ts. (No incident, no check — checkId 0.)
   test?: boolean;
+  // The "RCA ready" ENRICHMENT — a follow-up to an already-paged incident once RCA
+  // completes (~10-30s after the open page). An UPDATE to the existing incident, NOT a
+  // new one: subject/header say "RCA READY" + the incident id. Same path, same channels.
+  // (incident.rca carries the verdict; see evaluate.ts.)
+  rcaReady?: boolean;
 }
 
 /**
@@ -99,6 +104,11 @@ export interface Channel {
 
 function subjectLine(p: AlertPayload): string {
   if (p.test) return `[SynthWatch][TEST] ${p.checkName}`;
+  // Enrichment of an already-paged incident — reference the incident id, never look like
+  // a new/second open.
+  if (p.rcaReady) {
+    return `[SynthWatch][${p.severity}] RCA READY: ${p.checkName} (incident #${p.incident?.incidentId})`;
+  }
   const verb =
     p.status === 'open' ? 'OPENED' : p.status === 'resolved' ? 'RESOLVED' : 'WARN';
   return `[SynthWatch][${p.severity}] ${verb}: ${p.checkName}`;
@@ -159,7 +169,8 @@ async function sendWebhook(c: Channel, p: AlertPayload): Promise<void> {
     // otherwise hang the tick (allSettled isolates rejections, not hangs).
     signal: AbortSignal.timeout(ALERT_TIMEOUT_MS),
     body: JSON.stringify({
-      event: p.status,
+      // 'rca_ready' = the follow-up enrichment on an already-open incident (not a new open).
+      event: p.rcaReady ? 'rca_ready' : p.status,
       severity: p.severity,
       checkId: Number(p.checkId),
       checkName: p.checkName,
@@ -168,6 +179,16 @@ async function sendWebhook(c: Channel, p: AlertPayload): Promise<void> {
       failedStep: p.failedStep ?? null,
       screenshotUrl: p.screenshotUrl ?? null,
       dashboardUrl: dashboardLink(p),
+      // incident id for correlation (so a webhook receiver can thread the enrichment onto
+      // the open event), + the RCA verdict when present (the rca_ready payload).
+      incidentId: p.incident?.incidentId ?? null,
+      rca: p.incident?.rca
+        ? {
+            classification: p.incident.rca.classification,
+            confidence: p.incident.rca.confidence,
+            summary: p.incident.rca.summary ?? null,
+          }
+        : null,
       // true for a channel test-send (lets the receiver distinguish a drill from a real alert).
       test: Boolean(p.test),
     }),

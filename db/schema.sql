@@ -282,7 +282,12 @@ CREATE TABLE incidents (
     -- AI root-cause analysis (mirrors 0015_incident_rca.sql). Structured JSON:
     -- { classification, confidence, observed[], inferred[], summary, signature,
     --   model, cached, generated_at }. NULL when RCA is off / failed / pre-existing.
-    rca                  JSONB
+    rca                  JSONB,
+    -- Fire-once guard for the "RCA ready" enrichment notification (mirrors
+    -- 0027_rca_notified.sql). Set when the enrichment sends; the conditional UPDATE
+    -- (... WHERE rca_notified_at IS NULL) makes the follow-up fire AT MOST ONCE per
+    -- incident, race-safe across runner executions. See runner/evaluate.ts.
+    rca_notified_at      TIMESTAMPTZ
 );
 
 -- At most one OPEN incident per check. Lets evaluate.ts rely on the DB to keep

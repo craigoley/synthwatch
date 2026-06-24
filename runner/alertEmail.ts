@@ -29,6 +29,9 @@ interface Theme {
   label: string; // OPENED | RESOLVED | WARNING
 }
 function theme(p: AlertPayload): Theme {
+  // Enrichment follow-up — still the same (open) incident's severity colour, but labelled
+  // RCA READY so it reads as an update, not a fresh page.
+  if (p.rcaReady) return { color: p.severity === 'warning' ? AMBER : RED, label: 'RCA READY' };
   if (p.status === 'resolved') return { color: GREEN, label: 'RESOLVED' };
   if (p.status === 'warn') return { color: AMBER, label: 'WARNING' };
   return { color: p.severity === 'warning' ? AMBER : RED, label: 'OPENED' };
