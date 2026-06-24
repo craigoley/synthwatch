@@ -15,6 +15,7 @@
 // Fires on incident OPEN / RESOLVE and the warn path.
 import { EmailClient } from '@azure/communication-email';
 import { pool } from './db.js';
+import { buildAlertEmail } from './alertEmail.js';
 
 // Hard ceiling on any single outbound send. dispatchAlerts is awaited in the run
 // tick, and Promise.allSettled isolates REJECTIONS but not HANGS — a webhook (or
@@ -42,6 +43,23 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   ]);
 }
 
+/**
+ * Incident context for the rich email (open/resolved). Optional — present for incident
+ * transitions, absent for warn/burn (which aren't incidents). The email template (see
+ * alertEmail.ts) renders whatever is present and degrades gracefully.
+ */
+export interface IncidentContext {
+  incidentId: number;
+  targetUrl?: string | null;
+  openedAt?: string | null; // ISO; "when it started"
+  resolvedAt?: string | null; // resolved only — for duration
+  locations?: string[] | null; // named failing/reporting locations (eastus2, centralus)
+  consecutiveFailures?: number | null;
+  // RCA verdict, if the incident has one (resolved emails; the open email fires before
+  // RCA runs, so it's usually absent there — see evaluate.ts).
+  rca?: { classification: string; confidence: string; summary?: string } | null;
+}
+
 export interface AlertPayload {
   checkId: number;
   checkName: string;
@@ -56,6 +74,8 @@ export interface AlertPayload {
   runId: number | null;
   failedStep?: string | null;
   screenshotUrl?: string | null;
+  // Incident context for the rich email (open/resolved). Absent for warn/burn.
+  incident?: IncidentContext | null;
 }
 
 /**
@@ -86,24 +106,16 @@ function dashboardLink(p: AlertPayload): string | null {
   return `${base.replace(/\/+$/, '')}/checks/${p.checkId}`;
 }
 
-function bodyText(p: AlertPayload): string {
-  const lines = [subjectLine(p), '', p.summary];
-  if (p.runId != null) lines.push(`Run: #${p.runId}`);
-  if (p.failedStep) lines.push(`Failed step: ${p.failedStep}`);
-  if (p.screenshotUrl) lines.push(`Screenshot: ${p.screenshotUrl}`);
-  const link = dashboardLink(p);
-  if (link) lines.push(`Dashboard: ${link}`);
-  return lines.join('\n');
-}
-
 // --- Delivery: Azure Communication Services email --------------------------
 // Transport SECRET (ACS connection string) AND sender (ALERT_EMAIL_FROM) from env;
-// recipients (to[]) from the channel's DB config. Builder is exported so a test can assert
-// the recipients without touching ACS.
+// recipients (to[]) from the channel's DB config. Body is a rich HTML email + plaintext
+// alternative (multipart) — see alertEmail.ts. Builder is exported so a test can assert
+// the recipients/content without touching ACS.
 export function buildEmailMessage(from: string, to: string[], p: AlertPayload) {
+  const { html, text } = buildAlertEmail(p);
   return {
     senderAddress: from,
-    content: { subject: subjectLine(p), plainText: bodyText(p) },
+    content: { subject: subjectLine(p), plainText: text, html },
     recipients: { to: to.map((address) => ({ address: address.trim() })) },
   };
 }
