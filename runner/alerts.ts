@@ -194,39 +194,39 @@ function mapChannel(r: ChannelRow): Channel {
 }
 
 /**
- * Resolve the channel set for an alert on (checkId, severity) from the DB:
- *   - a PER-CHECK route (alert_routes.check_id = checkId) OVERRIDES, if any exist;
- *   - else the SEVERITY default (alert_routes.severity = severity, check_id IS NULL).
- * Override (per-check REPLACES the severity default), not union. De-duped by channel id;
- * only enabled channels returned (transport/deliverability is checked at dispatch).
+ * Resolve the channel set for an alert on (checkId, severity) — the UNION (all dimensions
+ * ADDITIVE) of:
+ *   - the SEVERITY default (alert_routes.severity = severity, check_id IS NULL) — the
+ *     baseline, ALWAYS applies;
+ *   - the PER-CHECK routes (alert_routes.check_id = checkId) — additive, NOT an override;
+ *   - every TAG-RULE (tag_routes) whose (tag_key, tag_value) the check carries (check_tags
+ *     #84) — "checks tagged X also route to Y".
+ * Deduped by channel id (a channel matched by more than one dimension appears ONCE — the
+ * UNION + unique channels.id). Only enabled channels; deliverability (transport) is
+ * checked at dispatch. "Hit any criterion -> you get the alert."
  */
 export async function resolveChannels(checkId: number, severity: 'critical' | 'warning'): Promise<Channel[]> {
-  const perCheck = await pool.query<ChannelRow>(
+  const { rows } = await pool.query<ChannelRow>(
     `SELECT ch.id, ch.name, ch.type, ch.config, ch.enabled
-       FROM alert_routes r JOIN channels ch ON ch.id = r.channel_id
-      WHERE r.check_id = $1 AND ch.enabled`,
-    [checkId],
-  );
-  const rows = perCheck.rows.length > 0
-    ? perCheck.rows
-    : (
-        await pool.query<ChannelRow>(
-          `SELECT ch.id, ch.name, ch.type, ch.config, ch.enabled
-             FROM alert_routes r JOIN channels ch ON ch.id = r.channel_id
-            WHERE r.severity = $1 AND r.check_id IS NULL AND ch.enabled`,
-          [severity],
+       FROM channels ch
+      WHERE ch.enabled
+        AND ch.id IN (
+          -- severity-default baseline (always)
+          SELECT channel_id FROM alert_routes WHERE severity = $2 AND check_id IS NULL
+          UNION
+          -- per-check routes (additive)
+          SELECT channel_id FROM alert_routes WHERE check_id = $1
+          UNION
+          -- tag-rules matching the check's tags
+          SELECT tr.channel_id
+            FROM tag_routes tr
+            JOIN check_tags ct ON ct.key = tr.tag_key AND ct.value = tr.tag_value
+           WHERE ct.check_id = $1
         )
-      ).rows;
-  const seen = new Set<number>();
-  const out: Channel[] = [];
-  for (const r of rows) {
-    const c = mapChannel(r);
-    if (!seen.has(c.id)) {
-      seen.add(c.id);
-      out.push(c);
-    }
-  }
-  return out;
+      ORDER BY ch.id`,
+    [checkId, severity],
+  );
+  return rows.map(mapChannel);
 }
 
 /**
