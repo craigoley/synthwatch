@@ -537,6 +537,47 @@ CREATE OR REPLACE VIEW sla_availability_90d AS
     SELECT * FROM sla_availability(now() - interval '90 days', now());
 
 -- ---------------------------------------------------------------------------
+-- daily_check_rollup: reporting keystone (mirrors 0028). One row per check per UTC day,
+-- aggregated across locations. Availability reuses the sla_availability definition
+-- (up=pass|warn, down=fail|error, MW-excluded, running-excluded) so it AGREES with the
+-- views. Latency (over UP runs) percentiles are SINGLE-DAY ONLY — never average across
+-- days; multi-day reports recompute from raw. Web-vitals browser-only (NULL elsewhere;
+-- INP omitted). Tags applied at read time (runs/rollup -> checks -> check_tags), not
+-- baked in. Computed by the nightly rollup job (runner/rollup.ts).
+-- ---------------------------------------------------------------------------
+CREATE TABLE daily_check_rollup (
+    check_id           BIGINT      NOT NULL REFERENCES checks(id) ON DELETE CASCADE,
+    day                DATE        NOT NULL,
+    up_count           INTEGER     NOT NULL DEFAULT 0,
+    down_count         INTEGER     NOT NULL DEFAULT 0,
+    total_count        INTEGER     NOT NULL DEFAULT 0,
+    availability_pct   NUMERIC,
+    latency_count      INTEGER     NOT NULL DEFAULT 0,
+    duration_avg_ms    NUMERIC,
+    duration_p50_ms    INTEGER,
+    duration_p95_ms    INTEGER,
+    duration_p99_ms    INTEGER,
+    duration_min_ms    INTEGER,
+    duration_max_ms    INTEGER,
+    vitals_count       INTEGER     NOT NULL DEFAULT 0,
+    lcp_avg_ms         NUMERIC,
+    lcp_p75_ms         INTEGER,
+    fcp_avg_ms         NUMERIC,
+    fcp_p75_ms         INTEGER,
+    ttfb_avg_ms        NUMERIC,
+    ttfb_p75_ms        INTEGER,
+    cls_avg            DOUBLE PRECISION,
+    cls_p75            DOUBLE PRECISION,
+    load_event_avg_ms  NUMERIC,
+    transfer_bytes_avg BIGINT,
+    incidents_opened   INTEGER     NOT NULL DEFAULT 0,
+    downtime_minutes   NUMERIC     NOT NULL DEFAULT 0,
+    computed_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (check_id, day)
+);
+CREATE INDEX daily_check_rollup_day_idx ON daily_check_rollup (day);
+
+-- ---------------------------------------------------------------------------
 -- slo_status: per-check SLO / error-budget / burn-rate over a window (mirrors
 -- 0016_slo.sql). Run-weighted, reusing sla_availability's up/down taxonomy and
 -- maintenance-window exclusion. Zero rows when the check has no slo_target. The
