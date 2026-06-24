@@ -63,12 +63,20 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
       // Resolve the incident row regardless (the check IS up now). But gate the
       // recovery ALERT on the maintenance window, symmetric with the open path: a
       // maintenance endpoint serving 200 shouldn't fire a "recovered" page mid-window.
-      await pool.query(
+      // RETURNING the timestamps + rca for the resolved email (duration + RCA recap —
+      // by resolve time RCA has run, so the recovery email CAN carry it).
+      const { rows: resolvedRows } = await pool.query<{
+        opened_at: Date;
+        resolved_at: Date;
+        rca: { classification: string; confidence: string; summary?: string } | null;
+      }>(
         `UPDATE incidents
             SET status = 'resolved', resolved_at = now(), resolved_run_id = $2
-          WHERE id = $1`,
+          WHERE id = $1
+        RETURNING opened_at, resolved_at, rca`,
         [open.id, run.id],
       );
+      const resolvedInc = resolvedRows[0];
       if (await inMaintenanceWindow(check.id)) {
         console.log(
           `[runner] check ${check.id} "${check.name}" recovered — recovery alert suppressed (maintenance window)`,
@@ -82,6 +90,13 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
             status: 'resolved',
             summary: `Check "${check.name}" recovered.`,
             runId: run.id,
+            incident: {
+              incidentId: open.id,
+              targetUrl: check.target_url,
+              openedAt: resolvedInc?.opened_at?.toISOString() ?? null,
+              resolvedAt: resolvedInc?.resolved_at?.toISOString() ?? null,
+              rca: resolvedInc?.rca ?? null,
+            },
           },
           await resolveChannels(check.id, check.severity),
         );
@@ -166,6 +181,10 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
   }
   const incidentId = incidentRows[0].id;
 
+  // Rich-email context. RCA is null here — it runs AFTER this dispatch (below) so a slow
+  // model can't delay paging, so the OPEN email never carries RCA. (The RESOLVED email
+  // does — by then it's computed. To put RCA in the open email, move runRca above this
+  // dispatch at the cost of ~10-30s paging delay — a product call.)
   await dispatchAlerts(
     {
       checkId: check.id,
@@ -176,6 +195,14 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
       runId: run.id,
       failedStep: run.failed_step,
       screenshotUrl: run.screenshot_url,
+      incident: {
+        incidentId,
+        targetUrl: check.target_url,
+        openedAt: new Date().toISOString(),
+        locations: await failingLocationNames(check),
+        consecutiveFailures: consecutive,
+        rca: null,
+      },
     },
     await resolveChannels(check.id, check.severity),
   );
@@ -287,6 +314,32 @@ async function aggregateVerdict(check: Check): Promise<Verdict> {
   const total = Number(rows[0]?.total ?? 0);
   const failing = Number(rows[0]?.failing ?? 0);
   return { down: crossLocationDown(failing, total, check.min_fail_locations), failing, total };
+}
+
+/**
+ * Names of the locations currently DOWN for the check — same definition as
+ * aggregateVerdict's `failing` count (all of the recent failure_threshold runs down,
+ * and reporting within STALE_LOCATION). For the alert email's "Locations" fact.
+ */
+async function failingLocationNames(check: Check): Promise<string[]> {
+  const { rows } = await pool.query<{ location: string }>(
+    `WITH recent AS (
+       SELECT location, status,
+              row_number() OVER (PARTITION BY location ORDER BY started_at DESC) AS rn,
+              max(started_at) OVER (PARTITION BY location) AS loc_last
+         FROM runs
+        WHERE check_id = $1 AND status <> 'running'
+     )
+     SELECT location
+       FROM recent
+      GROUP BY location
+     HAVING bool_and(status IN ('fail','error')) FILTER (WHERE rn <= $2)
+        AND count(*) FILTER (WHERE rn <= $2) >= $2
+        AND max(loc_last) > now() - $3::interval
+      ORDER BY location`,
+    [check.id, check.failure_threshold, STALE_LOCATION],
+  );
+  return rows.map((r) => r.location);
 }
 
 /**
