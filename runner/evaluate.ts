@@ -220,6 +220,17 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
           `[rca] check ${check.id} incident ${incidentId}: ${rca.classification} ` +
             `(${rca.confidence}${rca.cached ? ', cached' : ''})`,
         );
+        // "RCA ready" ENRICHMENT — a SECOND notification to the SAME channels the open page
+        // hit, ~10-30s after it, now that RCA is in. Strictly additive + AFTER the open
+        // dispatch: a failure here is swallowed (non-fatal) and can never touch the open
+        // alert (already sent) or the incident. Only fires when rca exists (RCA-failed ->
+        // nothing, by design). Fires at most once (rca_notified_at guard).
+        await sendRcaReadyEnrichment(check, incidentId, rca).catch((err) =>
+          console.warn(
+            `[rca-enrich] incident ${incidentId} enrichment failed (non-fatal):`,
+            err instanceof Error ? err.message : err,
+          ),
+        );
       }
     } catch (err) {
       console.warn(
@@ -340,6 +351,57 @@ async function failingLocationNames(check: Check): Promise<string[]> {
     [check.id, check.failure_threshold, STALE_LOCATION],
   );
   return rows.map((r) => r.location);
+}
+
+/**
+ * "RCA ready" enrichment — a follow-up notification to the SAME channels the open page
+ * reached, once RCA completes for a newly-opened incident. It's an UPDATE to incident #N
+ * (subject/header say "RCA READY" + the incident id), NOT a new incident.
+ *
+ * Fires AT MOST ONCE per incident: a conditional UPDATE claims rca_notified_at atomically
+ * (NULL -> now()), so a second runner execution / a reopen never re-sends. Claimed BEFORE
+ * the send (standard at-most-once): if the send then fails it isn't retried — acceptable,
+ * the open page already did its job and the incident page still shows the RCA.
+ *
+ * RCA-failed -> this is never called (the caller only enters on a real rca), so a failed
+ * RCA sends NOTHING (no broken "RCA ready" with no verdict — Craig's lean, confirmed).
+ */
+export async function sendRcaReadyEnrichment(
+  check: Check,
+  incidentId: number,
+  rca: { classification: string; confidence: string; summary?: string },
+): Promise<void> {
+  const claim = await pool.query<{ id: number }>(
+    `UPDATE incidents SET rca_notified_at = now()
+      WHERE id = $1 AND rca_notified_at IS NULL
+      RETURNING id`,
+    [incidentId],
+  );
+  if (!claim.rows[0]) return; // already enriched once — do not re-send
+
+  // SAME channels as the open alert (Craig's decision) — identical resolution.
+  const channels = await resolveChannels(check.id, check.severity);
+  await dispatchAlerts(
+    {
+      checkId: check.id,
+      checkName: check.name,
+      severity: check.severity,
+      status: 'open', // still the open incident; rcaReady governs the wording/subject
+      rcaReady: true,
+      summary: `Root-cause analysis is ready for incident #${incidentId}.`,
+      runId: null,
+      incident: {
+        incidentId,
+        targetUrl: check.target_url,
+        rca: {
+          classification: rca.classification,
+          confidence: rca.confidence,
+          summary: rca.summary,
+        },
+      },
+    },
+    channels,
+  );
 }
 
 /**
