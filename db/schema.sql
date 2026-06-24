@@ -381,6 +381,23 @@ INSERT INTO alert_routes (severity, channel_id)
 SELECT s.sev, c.id FROM (VALUES ('critical'), ('warning')) AS s(sev)
   CROSS JOIN channels c WHERE c.name IN ('email', 'webhook');
 
+-- tag_routes: the TAG dimension of routing (mirrors 0025_tag_routes.sql). A tag-rule
+-- (tag_key, tag_value -> channel) ADDS channels to any incident whose check carries that
+-- tag. Composed as a UNION with severity-default + per-check in resolveChannels (all
+-- additive). tag_key/tag_value normalized like check_tags so the join is exact. No seed
+-- (tag-rules are dashboard-defined).
+CREATE TABLE tag_routes (
+    id         BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    tag_key    TEXT        NOT NULL
+                           CHECK (tag_key = lower(tag_key) AND tag_key !~ '[[:space:]]'),
+    tag_value  TEXT        NOT NULL
+                           CHECK (tag_value <> '' AND tag_value = lower(tag_value) AND tag_value !~ '[[:space:]]'),
+    channel_id BIGINT      NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX tag_routes_uq ON tag_routes (tag_key, tag_value, channel_id);
+CREATE INDEX tag_routes_key_value_idx ON tag_routes (tag_key, tag_value);
+
 -- ---------------------------------------------------------------------------
 -- flow_manifest: available browser flows (mirrors 0009_flow_manifest.sql).
 -- Populated by the runner (it discovers its own flow modules at tick start and
