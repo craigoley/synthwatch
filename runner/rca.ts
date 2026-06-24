@@ -155,9 +155,26 @@ async function gatherContext(
   return { text, failureB64, baselineB64 };
 }
 
+/**
+ * Managed-identity options for DefaultAzureCredential. The runner runs under a
+ * USER-ASSIGNED-only MI (no system-assigned), and a bare DefaultAzureCredential can't
+ * resolve WHICH identity to use in that case -> "ChainedTokenCredential authentication
+ * failed" -> RCA token acquisition fails (the intermittent-RCA root cause, masked by the
+ * 24h cache). Pin the user-assigned MI's client id from AZURE_CLIENT_ID. Unset (local /
+ * system-assigned envs) -> bare DefaultAzureCredential, unchanged. Exported so a test can
+ * assert the pinning decision without a live token.
+ */
+export function credentialOptions(): { managedIdentityClientId: string } | undefined {
+  const clientId = process.env.AZURE_CLIENT_ID;
+  return clientId ? { managedIdentityClientId: clientId } : undefined;
+}
+
 let credential: TokenCredential | null = null;
 async function getAadToken(): Promise<string> {
-  credential ??= new DefaultAzureCredential();
+  if (!credential) {
+    const opts = credentialOptions();
+    credential = opts ? new DefaultAzureCredential(opts) : new DefaultAzureCredential();
+  }
   const token = await credential.getToken(SCOPE);
   if (!token?.token) throw new Error('no AAD token for cognitive-services scope');
   return token.token;

@@ -231,6 +231,15 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
             err instanceof Error ? err.message : err,
           ),
         );
+      } else {
+        // runRca returns null on failure (it NEVER throws, so the page is never blocked) —
+        // a token error, model failure, or truncation. That left rca silently NULL, masked
+        // by the 24h cache (the intermittent-RCA bug that hid for days). Surface it on the
+        // incident-open path so a high RCA-failure rate is greppable HERE, not only in
+        // rca.ts's internal logs. (rca.ts logs the specific reason, e.g. "[rca] failed".)
+        console.warn(
+          `[rca] check ${check.id} incident ${incidentId}: NO RCA produced (runRca returned null — see [rca] failure logs)`,
+        );
       }
     } catch (err) {
       console.warn(

@@ -445,6 +445,17 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
               value: rcaMaxTokens
             }
             {
+              // Pin the user-assigned MI for the runner's in-process DefaultAzureCredential
+              // (rca.ts AAD token for Azure OpenAI). The runner has a USER-ASSIGNED-ONLY MI;
+              // a bare DefaultAzureCredential can't resolve which identity to use ->
+              // "ChainedTokenCredential authentication failed" -> RCA token acquisition fails
+              // (the intermittent-RCA root cause, masked by the 24h cache). DERIVED from the
+              // MI resource (not a hardcoded GUID, can't drift); declared here so a deploy
+              // can't wipe it (same lesson as the ACS/AOAI env).
+              name: 'AZURE_CLIENT_ID'
+              value: identity.properties.clientId
+            }
+            {
               // Email sender — non-secret transport property, now template-owned. Recipients (to[])
               // are DB-managed per channel; the ACS connection string stays out-of-band (secret).
               name: 'ALERT_EMAIL_FROM'
@@ -580,6 +591,17 @@ resource centralusJob 'Microsoft.App/jobs@2024-03-01' = {
             {
               name: 'RCA_MAX_TOKENS'
               value: rcaMaxTokens
+            }
+            {
+              // Pin the user-assigned MI for the runner's in-process DefaultAzureCredential
+              // (rca.ts AAD token for Azure OpenAI). The runner has a USER-ASSIGNED-ONLY MI;
+              // a bare DefaultAzureCredential can't resolve which identity to use ->
+              // "ChainedTokenCredential authentication failed" -> RCA token acquisition fails
+              // (the intermittent-RCA root cause, masked by the 24h cache). DERIVED from the
+              // MI resource (not a hardcoded GUID, can't drift); declared here so a deploy
+              // can't wipe it (same lesson as the ACS/AOAI env).
+              name: 'AZURE_CLIENT_ID'
+              value: identity.properties.clientId
             }
             {
               // Email sender — non-secret transport property, template-owned (see the eastus2 job).
