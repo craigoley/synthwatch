@@ -138,6 +138,23 @@ CREATE TABLE check_locations (
 );
 
 -- ---------------------------------------------------------------------------
+-- check_tags: key:value tags on checks (mirrors 0024_check_tags.sql). The Phase-9a
+-- primitive for tag-scoped routing / dashboard filtering / per-team reporting. Normalized
+-- table (not JSONB) so "checks WHERE key=X [AND value=Y]" is a clean indexed query.
+-- PK(check_id, key) = one value per key. key/value are lowercase + whitespace-free
+-- (guarded by CHECKs); key '' = a bare value. See runner/tags.ts.
+-- ---------------------------------------------------------------------------
+CREATE TABLE check_tags (
+    check_id bigint NOT NULL REFERENCES checks(id) ON DELETE CASCADE,
+    key      text   NOT NULL DEFAULT ''
+                    CHECK (key = lower(key) AND key !~ '[[:space:]]'),
+    value    text   NOT NULL
+                    CHECK (value <> '' AND value = lower(value) AND value !~ '[[:space:]]'),
+    PRIMARY KEY (check_id, key)
+);
+CREATE INDEX check_tags_key_value_idx ON check_tags (key, value);
+
+-- ---------------------------------------------------------------------------
 -- locations: registry of deployed regions (mirrors 0020_location_registry.sql).
 -- The check_locations rows ARE a check's assignment; this registry says which
 -- locations exist / are active and what a new check defaults to (one cursor per
