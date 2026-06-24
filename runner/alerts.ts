@@ -76,6 +76,10 @@ export interface AlertPayload {
   screenshotUrl?: string | null;
   // Incident context for the rich email (open/resolved). Absent for warn/burn.
   incident?: IncidentContext | null;
+  // A channel TEST-SEND (not a real alert) — marks the subject/body/webhook as [TEST].
+  // Goes through the EXACT same dispatch/send path; only the content is flagged. See
+  // testSend.ts. (No incident, no check — checkId 0.)
+  test?: boolean;
 }
 
 /**
@@ -94,6 +98,7 @@ export interface Channel {
 }
 
 function subjectLine(p: AlertPayload): string {
+  if (p.test) return `[SynthWatch][TEST] ${p.checkName}`;
   const verb =
     p.status === 'open' ? 'OPENED' : p.status === 'resolved' ? 'RESOLVED' : 'WARN';
   return `[SynthWatch][${p.severity}] ${verb}: ${p.checkName}`;
@@ -163,28 +168,37 @@ async function sendWebhook(c: Channel, p: AlertPayload): Promise<void> {
       failedStep: p.failedStep ?? null,
       screenshotUrl: p.screenshotUrl ?? null,
       dashboardUrl: dashboardLink(p),
+      // true for a channel test-send (lets the receiver distinguish a drill from a real alert).
+      test: Boolean(p.test),
     }),
   });
   if (!res.ok) throw new Error(`webhook returned ${res.status}`);
 }
 
 /**
- * A channel is DELIVERABLE when enabled AND its transport is available: email needs the
- * ACS connection string (env) + the sender ALERT_EMAIL_FROM (env) + >=1 recipient (DB);
- * webhook needs a URL. (Recipients/URL come from the DB; the secret + sender from env.)
+ * Why a channel can't deliver, or null if it CAN. email needs the ACS connection string
+ * (env) + the sender ALERT_EMAIL_FROM (env) + >=1 recipient (DB); webhook needs a URL.
+ * (Recipients/URL come from the DB; the secret + sender from env.) The human reason backs
+ * a channel test-send's "failed: <reason>" detail.
  */
-export function channelDeliverable(c: Channel): boolean {
-  if (!c.enabled) return false;
+export function channelDeliverabilityReason(c: Channel): string | null {
+  if (!c.enabled) return 'channel is disabled';
   if (c.type === 'email') {
-    return Boolean(
-      process.env.ACS_EMAIL_CONNECTION_STRING &&
-        process.env.ALERT_EMAIL_FROM &&
-        c.config.to &&
-        c.config.to.length > 0,
-    );
+    if (!process.env.ACS_EMAIL_CONNECTION_STRING) {
+      return 'email transport not configured (ACS_EMAIL_CONNECTION_STRING unset on the runner)';
+    }
+    if (!process.env.ALERT_EMAIL_FROM) {
+      return 'sender not configured (ALERT_EMAIL_FROM unset on the runner)';
+    }
+    if (!c.config.to || c.config.to.length === 0) return 'no recipients configured for this channel';
+    return null;
   }
-  if (c.type === 'webhook') return Boolean(c.config.url);
-  return false;
+  if (c.type === 'webhook') return c.config.url ? null : 'no webhook URL configured for this channel';
+  return `unknown channel type "${c.type}"`;
+}
+
+export function channelDeliverable(c: Channel): boolean {
+  return channelDeliverabilityReason(c) === null;
 }
 
 interface ChannelRow { id: string; name: string; type: string; config: unknown; enabled: boolean }
@@ -229,6 +243,15 @@ export async function resolveChannels(checkId: number, severity: 'critical' | 'w
   return rows.map(mapChannel);
 }
 
+/** Load a single channel by id (for a channel test-send). Null if it doesn't exist. */
+export async function getChannelById(id: number): Promise<Channel | null> {
+  const { rows } = await pool.query<ChannelRow>(
+    `SELECT id, name, type, config, enabled FROM channels WHERE id = $1`,
+    [id],
+  );
+  return rows[0] ? mapChannel(rows[0]) : null;
+}
+
 /**
  * Fan out an alert to the resolved channels (from resolveChannels) that are also
  * DELIVERABLE (transport available — see channelDeliverable). A routed channel whose
@@ -241,9 +264,20 @@ export async function resolveChannels(checkId: number, severity: 'critical' | 'w
  * Returns {active, delivered}: how many were tried and how many succeeded — lets the
  * warn path avoid stamping "notified" when every channel failed (retry next tick).
  */
+/** Per-channel outcome — lets a channel test-send report the exact failure reason. */
+export interface ChannelDeliveryResult {
+  channelId: number;
+  name: string;
+  type: string;
+  ok: boolean;
+  error?: string;
+}
+
 export interface DispatchResult {
   active: number;
   delivered: number;
+  // Per ACTIVE (deliverable) channel that was tried. Empty when active === 0.
+  results: ChannelDeliveryResult[];
 }
 
 export async function dispatchAlerts(
@@ -255,23 +289,27 @@ export async function dispatchAlerts(
     console.log(
       `[alerts] ${payload.status} "${payload.checkName}" — no deliverable channels (skipped)`,
     );
-    return { active: 0, delivered: 0 };
+    return { active: 0, delivered: 0, results: [] };
   }
 
-  const results = await Promise.allSettled(
+  const settled = await Promise.allSettled(
     active.map((c) => (c.type === 'email' ? sendEmail(c, payload) : sendWebhook(c, payload))),
   );
+  const results: ChannelDeliveryResult[] = [];
   let delivered = 0;
-  results.forEach((r, i) => {
+  settled.forEach((r, i) => {
     const ch = active[i];
     if (r.status === 'rejected') {
+      const error = r.reason instanceof Error ? r.reason.message : String(r.reason);
+      results.push({ channelId: ch.id, name: ch.name, type: ch.type, ok: false, error });
       console.error(`[alerts] channel "${ch.name}" (${ch.type}) failed:`, r.reason);
     } else {
       delivered++;
+      results.push({ channelId: ch.id, name: ch.name, type: ch.type, ok: true });
       console.log(
         `[alerts] channel "${ch.name}" (${ch.type}) delivered ${payload.status} for "${payload.checkName}"`,
       );
     }
   });
-  return { active: active.length, delivered };
+  return { active: active.length, delivered, results };
 }

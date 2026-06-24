@@ -399,6 +399,23 @@ CREATE UNIQUE INDEX tag_routes_uq ON tag_routes (tag_key, tag_value, channel_id)
 CREATE INDEX tag_routes_key_value_idx ON tag_routes (tag_key, tag_value);
 
 -- ---------------------------------------------------------------------------
+-- test_send_requests: channel test-sends through the runner's real dispatch path
+-- (mirrors 0026_test_send_requests.sql). The API writes a 'pending' row + triggers the
+-- runner job on-demand; the runner drains it at startup, sends a [TEST] alert via the
+-- REAL sendEmail/dispatch, and marks delivered/failed. See runner/testSend.ts.
+-- ---------------------------------------------------------------------------
+CREATE TABLE test_send_requests (
+    id           BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    channel_id   BIGINT      NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    status       TEXT        NOT NULL DEFAULT 'pending'
+                             CHECK (status IN ('pending', 'sending', 'delivered', 'failed')),
+    detail       TEXT,
+    requested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at TIMESTAMPTZ
+);
+CREATE INDEX test_send_requests_pending_idx ON test_send_requests (requested_at) WHERE status = 'pending';
+
+-- ---------------------------------------------------------------------------
 -- flow_manifest: available browser flows (mirrors 0009_flow_manifest.sql).
 -- Populated by the runner (it discovers its own flow modules at tick start and
 -- upserts here); the API/dashboard read this instead of distinct checks.flow_name.

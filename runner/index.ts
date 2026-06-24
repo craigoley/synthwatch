@@ -28,6 +28,7 @@ import {
 import { StepRecorder } from './stepRecorder.js';
 import { loadFlow } from './checks/index.js';
 import { syncFlowManifest } from './flowManifest.js';
+import { drainTestSends } from './testSend.js';
 import { uploadScreenshot, uploadTrace, uploadBaselineScreenshot } from './artifacts.js';
 import os from 'node:os';
 import path from 'node:path';
@@ -92,6 +93,20 @@ async function getBrowser(): Promise<Browser> {
 async function main(): Promise<void> {
   // Opt-in OTLP trace export (no-op unless OTEL_EXPORTER_OTLP_ENDPOINT is set).
   initOtel();
+
+  // Drain on-demand channel test-sends FIRST. An API-triggered start carries no env
+  // override (to preserve secretRefs), so the request is a DB row, not an arg. If any were
+  // processed, this run was (almost certainly) a test-triggered start -> send + exit fast,
+  // skipping the check loop. A normal cron tick finds none pending and proceeds. (A cron
+  // tick that happens to drain one skips its checks this tick; the next tick recovers.)
+  const tests = await drainTestSends().catch((err) => {
+    console.error('[test-send] drain failed (non-fatal):', err);
+    return 0;
+  });
+  if (tests > 0) {
+    console.log(`[test-send] processed ${tests} test-send(s); skipping the check loop this run`);
+    return;
+  }
 
   await reapStaleRunning();
 
