@@ -91,6 +91,9 @@ param centralusJobName string = 'synthwatch-runner-job-centralus'
 @description('One-off Container Apps Job that applies DB migrations (started by CD).')
 param migrateJobName string = 'synthwatch-migrate-job'
 
+@description('Daily Container Apps Job that computes the reporting rollup (daily_check_rollup).')
+param rollupJobName string = 'synthwatch-rollup-job'
+
 @description('User-assigned managed identity name (used for ACR pull).')
 param identityName string = 'synthwatch-runner-id'
 
@@ -623,9 +626,87 @@ resource migrateJob 'Microsoft.App/jobs@2024-03-01' = {
 }
 
 // ---------------------------------------------------------------------------
+// Daily reporting rollup job — a SEPARATE Schedule Job (own daily cron, own execution;
+// not entangled with the */5 check loop). Reuses the RUNNER image but overrides the
+// command to run the rollup entry point (the image's default CMD is the check loop). Runs
+// at 00:07 UTC: rolls up the just-completed previous UTC day (today, partial, is read from
+// raw by reports). One-time historical backfill is run manually:
+//   az containerapp job start -g <rg> -n synthwatch-rollup-job \
+//     --command node --args dist/rollupMain.js --args --backfill
+// (or `node dist/rollupMain.js --backfill` against the DB). Only DATABASE_URL is needed —
+// no ACS/AOAI/storage (the rollup just reads runs/run_metrics/incidents + writes the table).
+// ---------------------------------------------------------------------------
+resource rollupJob 'Microsoft.App/jobs@2024-03-01' = {
+  name: rollupJobName
+  location: location
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${identity.id}': {}
+    }
+  }
+  properties: {
+    environmentId: managedEnvironment.id
+    configuration: {
+      triggerType: 'Schedule'
+      replicaTimeout: 600
+      replicaRetryLimit: 1
+      scheduleTriggerConfig: {
+        cronExpression: '7 0 * * *'
+        parallelism: 1
+        replicaCompletionCount: 1
+      }
+      registries: [
+        {
+          server: acr.properties.loginServer
+          identity: identity.id
+        }
+      ]
+      secrets: [
+        {
+          // Same value/shape as the runner job's database-url secret.
+          name: 'database-url'
+          value: 'postgresql://${postgresAdminLogin}:${postgresAdminPassword}@${postgres.properties.fullyQualifiedDomainName}:5432/synthwatch?sslmode=require'
+        }
+      ]
+    }
+    template: {
+      containers: [
+        {
+          name: 'rollup'
+          image: runnerImage
+          // Override the image's default CMD (dist/index.js, the check loop) -> the rollup
+          // entry. Nightly mode rolls up yesterday (no args).
+          command: [
+            'node'
+          ]
+          args: [
+            'dist/rollupMain.js'
+          ]
+          resources: {
+            cpu: json('0.25')
+            memory: '0.5Gi'
+          }
+          env: [
+            {
+              name: 'DATABASE_URL'
+              secretRef: 'database-url'
+            }
+          ]
+        }
+      ]
+    }
+  }
+  dependsOn: [
+    acrPull
+  ]
+}
+
+// ---------------------------------------------------------------------------
 // Outputs
 // ---------------------------------------------------------------------------
 output postgresFqdn string = postgres.properties.fullyQualifiedDomainName
 output storageAccountName string = storage.name
 output jobName string = job.name
 output migrateJobName string = migrateJob.name
+output rollupJobName string = rollupJob.name
