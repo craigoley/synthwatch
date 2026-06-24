@@ -578,6 +578,25 @@ CREATE TABLE daily_check_rollup (
 CREATE INDEX daily_check_rollup_day_idx ON daily_check_rollup (day);
 
 -- ---------------------------------------------------------------------------
+-- report_narratives: Reporting Layer 3 — precomputed AI narrative over the reporting
+-- data (mirrors 0029). fact-pack-then-narrate: facts computed deterministically, the
+-- model only narrates the stored fact_pack (fallback to a template). Built by the
+-- narrative job (runner/narrative.ts). "window" is quoted (reserved word).
+-- ---------------------------------------------------------------------------
+CREATE TABLE report_narratives (
+    scope_type   TEXT        NOT NULL CHECK (scope_type IN ('fleet', 'monitor')),
+    scope_key    TEXT        NOT NULL,
+    "window"     TEXT        NOT NULL,
+    generated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    headline     TEXT,
+    body         TEXT,
+    highlights   JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    model        TEXT,
+    fact_pack    JSONB       NOT NULL,
+    PRIMARY KEY (scope_type, scope_key, "window")
+);
+
+-- ---------------------------------------------------------------------------
 -- slo_status: per-check SLO / error-budget / burn-rate over a window (mirrors
 -- 0016_slo.sql). Run-weighted, reusing sla_availability's up/down taxonomy and
 -- maintenance-window exclusion. Zero rows when the check has no slo_target. The
