@@ -112,6 +112,9 @@ param migrateJobName string = 'synthwatch-migrate-job'
 @description('Daily Container Apps Job that computes the reporting rollup (daily_check_rollup).')
 param rollupJobName string = 'synthwatch-rollup-job'
 
+@description('Daily Container Apps Job that generates the Layer-3 AI report narratives (report_narratives).')
+param narrativeJobName string = 'synthwatch-narrative-job'
+
 @description('User-assigned managed identity name (used for ACR pull).')
 param identityName string = 'synthwatch-runner-id'
 
@@ -767,6 +770,108 @@ resource rollupJob 'Microsoft.App/jobs@2024-03-01' = {
 }
 
 // ---------------------------------------------------------------------------
+// Daily report-NARRATIVE job (Reporting Layer 3 — "Smart Reports"). A SEPARATE Schedule
+// Job, eastus2 only (a daily batch over the reporting data — not multi-region monitoring).
+// Reuses the RUNNER image, overriding the command to run the narrative entry point. Runs
+// at 00:30 UTC — AFTER the rollup ('7 0 * * *') so the daily rollup is fresh when the
+// narrative reads it (the narrative cites the rollup + recomputes percentiles from raw).
+// Needs DATABASE_URL + the AOAI env (AZURE_OPENAI_* + RCA_MAX_TOKENS) — which is also the
+// OPT-IN: present => Layer 3 generates; absent => narrativeMain no-ops (dark). AZURE_CLIENT_ID
+// (derived from the MI, like #90) pins DefaultAzureCredential for the AOAI token. No ACS
+// (no alerting). One-off run: `az containerapp job start -n synthwatch-narrative-job`.
+// ---------------------------------------------------------------------------
+resource narrativeJob 'Microsoft.App/jobs@2024-03-01' = {
+  name: narrativeJobName
+  location: location
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${identity.id}': {}
+    }
+  }
+  properties: {
+    environmentId: managedEnvironment.id
+    configuration: {
+      triggerType: 'Schedule'
+      replicaTimeout: 600
+      replicaRetryLimit: 1
+      scheduleTriggerConfig: {
+        cronExpression: '30 0 * * *'
+        parallelism: 1
+        replicaCompletionCount: 1
+      }
+      registries: [
+        {
+          server: acr.properties.loginServer
+          identity: identity.id
+        }
+      ]
+      secrets: [
+        {
+          // Same value/shape as the runner job's database-url secret.
+          name: 'database-url'
+          value: 'postgresql://${postgresAdminLogin}:${postgresAdminPassword}@${postgres.properties.fullyQualifiedDomainName}:5432/synthwatch?sslmode=require'
+        }
+      ]
+    }
+    template: {
+      containers: [
+        {
+          name: 'narrative'
+          image: runnerImage
+          // Override the image's default CMD (dist/index.js, the check loop) -> the
+          // narrative entry. Generates the 7d fleet + per-monitor narratives.
+          command: [
+            'node'
+          ]
+          args: [
+            'dist/narrativeMain.js'
+          ]
+          resources: {
+            cpu: json('0.25')
+            memory: '0.5Gi'
+          }
+          env: [
+            {
+              name: 'DATABASE_URL'
+              secretRef: 'database-url'
+            }
+            // AOAI — the SAME config the runner jobs carry. This IS the Layer-3 opt-in:
+            // present => narratives generate; absent => narrativeMain no-ops (dark).
+            {
+              name: 'AZURE_OPENAI_ENDPOINT'
+              value: aoaiEndpoint
+            }
+            {
+              name: 'AZURE_OPENAI_DEPLOYMENT'
+              value: aoaiDeployment
+            }
+            {
+              name: 'AZURE_OPENAI_API_VERSION'
+              value: aoaiApiVersion
+            }
+            {
+              name: 'RCA_MAX_TOKENS'
+              value: rcaMaxTokens
+            }
+            {
+              // Pin the user-assigned MI for DefaultAzureCredential (the AOAI token) — the
+              // #90 fix; derived from the MI resource, not hardcoded. Without it the AAD
+              // token acquisition fails (ChainedTokenCredential) and narration falls back.
+              name: 'AZURE_CLIENT_ID'
+              value: identity.properties.clientId
+            }
+          ]
+        }
+      ]
+    }
+  }
+  dependsOn: [
+    acrPull
+  ]
+}
+
+// ---------------------------------------------------------------------------
 // Outputs
 // ---------------------------------------------------------------------------
 output postgresFqdn string = postgres.properties.fullyQualifiedDomainName
@@ -774,3 +879,4 @@ output storageAccountName string = storage.name
 output jobName string = job.name
 output migrateJobName string = migrateJob.name
 output rollupJobName string = rollupJob.name
+output narrativeJobName string = narrativeJob.name
