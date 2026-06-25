@@ -209,3 +209,32 @@ export function getCompiledSpecFromPool(specPath: string): Promise<SpecResolutio
     hash: sha256,
   });
 }
+
+/**
+ * Pre-WARM the cache for a set of spec paths (Phase 6b Option C, slice 5). Run BEFORE checks
+ * flip to the fetch path so no check's FIRST live run is a cold no-last_good fetch (which, if
+ * GitHub were down at that moment, would dark out every browser monitor at once — infra_error,
+ * not a page, but every monitor silent). Each path is fetched+compiled and cached (200 ->
+ * compiled_js + last_good). Best-effort: a failure on one path warns + counts, never throws, so
+ * one bad spec can't abort the warm pass. The reconcile job calls this (it already has the
+ * manifest); the deploy order is: migrate -> warm (reconcile) -> checks run the fetch path.
+ */
+export async function warmSpecCache(specPaths: string[]): Promise<{ warmed: number; failed: number }> {
+  let warmed = 0;
+  let failed = 0;
+  for (const p of specPaths) {
+    try {
+      const res = await getCompiledSpecFromPool(p);
+      if (res.kind === 'runnable') {
+        warmed++;
+      } else {
+        failed++;
+        console.warn(`[specfetch:warm] ${p}: ${res.reason}`);
+      }
+    } catch (err) {
+      failed++;
+      console.warn(`[specfetch:warm] ${p} failed:`, err instanceof Error ? err.message : err);
+    }
+  }
+  return { warmed, failed };
+}

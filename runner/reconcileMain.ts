@@ -15,6 +15,7 @@ import {
   type ManagedCheck,
   type DriftRow,
 } from './reconcile.js';
+import { warmSpecCache } from './specfetch/specCache.js';
 
 /** Read the Git-managed checks (source_key set). Unmanaged rows are intentionally excluded. */
 async function loadManagedChecks(): Promise<ManagedCheck[]> {
@@ -73,7 +74,16 @@ async function main(): Promise<void> {
   for (const d of drift) {
     console.log(`[reconcile]   ${d.drift_type.padEnd(7)} ${d.source_key} ${JSON.stringify(d.detail)}`);
   }
-  // REPORT-ONLY: nothing is applied to `checks`. Apply lands in a later PR.
+  // REPORT-ONLY for drift: nothing is applied to `checks`. Apply lands in a later PR.
+
+  // ★ Option C (slice 5): WARM the spec cache for every manifest spec, so a check's first
+  // fetch-path run is a 304/cache hit (and a GitHub blip can't dark out monitors en masse on
+  // the all-at-once flip). Best-effort; never fails the reconcile.
+  const specPaths = manifest.monitors.map((m) => m.script);
+  const warm = await warmSpecCache(specPaths);
+  console.log(
+    `[reconcile] spec_cache warm: ${warm.warmed} ok, ${warm.failed} failed (of ${specPaths.length} spec(s))`,
+  );
 }
 
 main()

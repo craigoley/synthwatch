@@ -50,8 +50,16 @@ export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
 });
 
-/** The full run-status taxonomy (mirrors the runs.status CHECK constraint). */
-export type RunStatus = 'pass' | 'warn' | 'fail' | 'error' | 'running';
+/** The full run-status taxonomy (mirrors the runs.status CHECK constraint).
+ *
+ * 'infra_error' (Phase 6b Option C): the runner could NOT obtain the spec to run a browser
+ * check (fetch failed AND no last-known-good cached). ★ It is NEITHER up (pass|warn) NOR down
+ * (fail|error): a check that couldn't fetch its OWN spec is an INFRA problem, not a monitored-
+ * site outage. It is excluded from SLA/availability (every SLA/rollup query uses explicit
+ * pass/warn/fail/error lists, so a 5th status is auto-excluded) AND from incidents/paging
+ * (evaluate() short-circuits it; the cross-location verdict ignores it). Like 'running' but
+ * terminal — recorded + visible, never paged, never counted as downtime. */
+export type RunStatus = 'pass' | 'warn' | 'fail' | 'error' | 'infra_error' | 'running';
 
 /** A run's status once it has finished — 'running' is in-flight, never terminal. */
 export type TerminalStatus = Exclude<RunStatus, 'running'>;
@@ -111,6 +119,11 @@ export interface Check {
   // Most-recent-passing browser screenshot baseline (Blob URL); RCA's visual-diff
   // reference. Overwritten on each passing browser run; null = none yet.
   baseline_screenshot_url: string | null;
+  // Monitors-as-code spec path (Phase 6b Option C, mirrors 0033). A Git-managed browser
+  // check fetches+runs this spec from synthwatch-monitors at run start (see executeBrowser);
+  // null => a legacy/dashboard check that runs the baked-in flow_name. claim() does SELECT *,
+  // so it rides along; typed here so executeBrowser can branch on it.
+  spec_path: string | null;
 }
 
 /** A row from the `runs` table after we've finished executing a check. */
