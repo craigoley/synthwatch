@@ -49,6 +49,20 @@ export function perfBudgetBreach(check: Check, m: RunMetrics): string | null {
 // per-check override. (Replaces the old env-targets + alert_profiles status-routing.)
 
 export async function evaluate(check: Check, run: RunRecord): Promise<void> {
+  // ★ Option C: 'infra_error' = the runner couldn't FETCH this browser check's own spec. That
+  // is an INFRA problem, NOT a monitored-site outage — it must NEVER page. Short-circuit BEFORE
+  // any incident/alert logic: no incident opened, no alert dispatched, no open incident touched
+  // (an unrelated open incident stays as-is; a real recovery run will resolve it). The run is
+  // already recorded + visible; the cross-location verdict also excludes infra_error (below), so
+  // it never counts toward 'down'. This is the live integration point of the #104 guard.
+  if (run.status === 'infra_error') {
+    console.warn(
+      `[runner] check ${check.id} "${check.name}" infra_error (couldn't fetch spec) — ` +
+        `recorded + visible; NO incident, NO alert (not a site outage).`,
+    );
+    return;
+  }
+
   const open = await getOpenIncident(check.id);
 
   // Incidents track the CROSS-LOCATION verdict, not a single run: the check is
@@ -311,7 +325,9 @@ async function aggregateVerdict(check: Check): Promise<Verdict> {
               row_number() OVER (PARTITION BY location ORDER BY started_at DESC) AS rn,
               max(started_at) OVER (PARTITION BY location) AS loc_last
          FROM runs
-        WHERE check_id = $1 AND status <> 'running'
+        -- infra_error excluded with running: it's "didn't run", neither up nor down. A
+        -- location producing only infra_error is NOT reporting (can't block OR cause paging).
+        WHERE check_id = $1 AND status NOT IN ('running', 'infra_error')
      ),
      per_loc AS (
        SELECT location,
@@ -348,7 +364,7 @@ async function failingLocationNames(check: Check): Promise<string[]> {
               row_number() OVER (PARTITION BY location ORDER BY started_at DESC) AS rn,
               max(started_at) OVER (PARTITION BY location) AS loc_last
          FROM runs
-        WHERE check_id = $1 AND status <> 'running'
+        WHERE check_id = $1 AND status NOT IN ('running', 'infra_error')
      )
      SELECT location
        FROM recent
@@ -503,7 +519,9 @@ async function countConsecutiveDown(
 ): Promise<number> {
   // Trailing consecutive down runs (optionally scoped to one location), used for
   // the single-location incident wording/count. Look back only as far as needed.
-  const { rows } = await pool.query<{ status: 'pass' | 'warn' | 'fail' | 'error' | 'running' }>(
+  const { rows } = await pool.query<{
+    status: 'pass' | 'warn' | 'fail' | 'error' | 'infra_error' | 'running';
+  }>(
     `SELECT status FROM runs
       WHERE check_id = $1 ${location ? 'AND location = $3' : ''}
       ORDER BY started_at DESC
@@ -516,6 +534,9 @@ async function countConsecutiveDown(
     // all-'error' streak NEVER opened an incident — a silent alerting hole.
     // pass/warn (up) and running (in-flight, not a result) break the streak.
     if (row.status === 'fail' || row.status === 'error') count++;
+    // infra_error = "didn't run" (couldn't fetch spec): neither counts nor breaks the
+    // down-streak (skip it), so a fetch blip can't reset a genuine outage's count.
+    else if (row.status === 'infra_error') continue;
     else break;
   }
   return count;

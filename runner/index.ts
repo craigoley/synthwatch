@@ -26,7 +26,10 @@ import {
   shutdownOtel,
 } from './otel.js';
 import { StepRecorder } from './stepRecorder.js';
-import { loadFlow } from './checks/index.js';
+import { loadFlow, type Flow } from './checks/index.js';
+import { getCompiledSpecFromPool } from './specfetch/specCache.js';
+import { loadCompiledSpec } from './specfetch/compileSpec.js';
+import { specToFlow } from './specfetch/specShim.js';
 import { syncFlowManifest } from './flowManifest.js';
 import { drainTestSends } from './testSend.js';
 import { uploadScreenshot, uploadTrace, uploadBaselineScreenshot } from './artifacts.js';
@@ -473,15 +476,55 @@ async function executeSsl(check: Check): Promise<Outcome> {
   };
 }
 
+/** A non-paging infra_error Outcome (Phase 6b Option C): the runner could not OBTAIN the spec
+ *  to run (fetch failed AND no last-known-good). No browser opened, no screenshot/trace — the
+ *  check couldn't run, which is an INFRA problem, not a monitored-site outage. evaluate() records
+ *  it + short-circuits (never opens an incident, never pages). */
+function infraErrorOutcome(msg: string): Outcome {
+  return {
+    status: 'infra_error', httpStatus: null, durationMs: 0,
+    error: msg, failedStep: null,
+    screenshot: null, metrics: null, certDaysRemaining: null, tracePath: null,
+    baselineScreenshot: null,
+  };
+}
+
+/** A plain 'error' Outcome usable from executeBrowser (runOne has its own local errorOutcome). */
+function errorOutcomeStandalone(msg: string): Outcome {
+  return {
+    status: 'error', httpStatus: null, durationMs: 0,
+    error: msg, failedStep: null,
+    screenshot: null, metrics: null, certDaysRemaining: null, tracePath: null,
+    baselineScreenshot: null,
+  };
+}
+
 async function executeBrowser(check: Check, runId: number): Promise<Outcome> {
-  if (!check.flow_name) {
-    // Schema enforces this, but TypeScript can't know that.
-    return {
-      status: 'error', httpStatus: null, durationMs: 0,
-      error: 'browser check has no flow_name', failedStep: null,
-      screenshot: null, metrics: null, certDaysRemaining: null, tracePath: null,
-      baselineScreenshot: null,
-    };
+  // Resolve the flow source BEFORE opening a browser. A Git-managed check (spec_path set) FETCHES
+  // its Playwright spec from synthwatch-monitors via the durable cache (#101-#104): 304-reuse /
+  // 200-recompile / fallback-to-last-known-good / infra-error. A legacy/dashboard check (no
+  // spec_path) runs the baked-in flow_name. Resolving first means an infra-error short-circuits
+  // to a non-paging infra_error WITHOUT wasting a browser context.
+  let compiledJs: string | null = null;
+  if (check.spec_path) {
+    const resolution = await getCompiledSpecFromPool(check.spec_path);
+    if (resolution.kind === 'infra-error') {
+      console.warn(
+        `[specfetch] check ${check.id} "${check.name}": ${resolution.reason} — recording infra_error ` +
+          `(could not fetch its spec; NOT a monitor outage, will NOT page).`,
+      );
+      return infraErrorOutcome(`could not fetch spec ${check.spec_path}: ${resolution.reason}`);
+    }
+    if (resolution.origin === 'fallback-last-good') {
+      console.warn(
+        `[specfetch] check ${check.id} "${check.name}": ran LAST-KNOWN-GOOD spec (fetch/compile ` +
+          `degraded). Monitor NOT failed; the spec-fetch path is flaky.`,
+      );
+    }
+    compiledJs = resolution.compiledJs;
+  } else if (!check.flow_name) {
+    // Neither a Git spec nor a baked-in flow — schema's browser_needs_flow should prevent this.
+    return errorOutcomeStandalone('browser check has no spec_path or flow_name');
   }
 
   const start = Date.now();
@@ -523,7 +566,17 @@ async function executeBrowser(check: Check, runId: number): Promise<Outcome> {
   try {
     const rec = new StepRecorder(runId, page, check.target_url);
     try {
-      const flow = await loadFlow(check.flow_name);
+      // Build the Flow: the fetched/compiled spec (run via the #101 shim) or the baked-in
+      // flow_name. Both satisfy Flow = (rec) => Promise<void>; a load failure here is a normal
+      // 'error' (caught below), same as the existing "loader threw" path.
+      let flow: Flow;
+      if (compiledJs !== null) {
+        const tests = await loadCompiledSpec(compiledJs);
+        if (tests.length === 0) throw new Error(`spec ${check.spec_path} defined no test()`);
+        flow = specToFlow(tests[0].fn, page);
+      } else {
+        flow = await loadFlow(check.flow_name as string);
+      }
       await flow(rec);
       status = 'pass';
       // Capture the RCA visual-diff baseline from the just-rendered page (cheap —

@@ -157,7 +157,7 @@ export interface OtelRun {
   method: string;
   targetUrl: string;
   runId: number;
-  status: 'pass' | 'warn' | 'fail' | 'error';
+  status: 'pass' | 'warn' | 'fail' | 'error' | 'infra_error';
   errorMessage: string | null;
   httpStatus: number | null;
   startMs: number;
@@ -266,17 +266,21 @@ export function recordRunMetric(run: OtelRun): void {
     durationHist.record(run.durationMs, attrs);
     runsCounter.add(1, attrs);
 
-    // Availability series: result=up|down (up = pass|warn). 2-state per check, so
-    // a backend ratios up / (up+down) cleanly. No 4-state status here.
-    const result = run.status === 'pass' || run.status === 'warn' ? 'up' : 'down';
-    upCounter.add(1, {
-      'synthwatch.synthetic': true,
-      'synthwatch.check.id': run.checkId,
-      'synthwatch.check.kind': run.checkKind,
-      'synthwatch.check.name': run.checkName,
-      'synthwatch.result': result,
-      'synthwatch.location': run.location ?? 'default',
-    });
+    // Availability series: result=up|down (up = pass|warn, down = fail|error). 2-state per
+    // check, so a backend ratios up / (up+down) cleanly. ★ infra_error is NEITHER (the check
+    // couldn't fetch its own spec — not a site outage); EXCLUDE it from the availability series
+    // entirely, mirroring the SLA/rollup exclusion (else it would inflate 'down').
+    if (run.status !== 'infra_error') {
+      const result = run.status === 'pass' || run.status === 'warn' ? 'up' : 'down';
+      upCounter.add(1, {
+        'synthwatch.synthetic': true,
+        'synthwatch.check.id': run.checkId,
+        'synthwatch.check.kind': run.checkKind,
+        'synthwatch.check.name': run.checkName,
+        'synthwatch.result': result,
+        'synthwatch.location': run.location ?? 'default',
+      });
+    }
   } catch (err) {
     console.warn('[otel] metric record failed (non-fatal):', err instanceof Error ? err.message : err);
   }

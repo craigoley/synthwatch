@@ -43,7 +43,10 @@ export async function computeRollupForDay(checkId: number, day: string): Promise
          FROM runs r
         WHERE r.check_id = $1
           AND r.started_at >= $2 AND r.started_at < $3
-          AND r.status <> 'running'
+          -- infra_error excluded with running: "didn't run", neither up nor down (Option C).
+          -- (up/down counts already use explicit pass|warn / fail|error lists; this keeps it
+          -- out of any total/row selection too.)
+          AND r.status NOT IN ('running', 'infra_error')
           AND NOT EXISTS (
             SELECT 1 FROM maintenance_windows mw
              WHERE (mw.check_id = r.check_id OR mw.check_id IS NULL)
@@ -130,7 +133,8 @@ async function pairsWithRuns(startIso: string, endIso: string): Promise<{ checkI
     `SELECT DISTINCT r.check_id,
             to_char((r.started_at AT TIME ZONE 'UTC')::date, 'YYYY-MM-DD') AS day
        FROM runs r
-      WHERE r.started_at >= $1 AND r.started_at < $2 AND r.status <> 'running'
+      WHERE r.started_at >= $1 AND r.started_at < $2
+        AND r.status NOT IN ('running', 'infra_error')
       ORDER BY day, r.check_id`,
     [startIso, endIso],
   );

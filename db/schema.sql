@@ -195,13 +195,16 @@ INSERT INTO locations (name, enabled) VALUES ('default', true);
 CREATE TABLE runs (
     id             BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     check_id       BIGINT      NOT NULL REFERENCES checks(id) ON DELETE CASCADE,
-    -- Full run-status taxonomy (see db/migrations/0003_widen_status.sql):
-    --   pass | warn | fail | error | running.
+    -- Full run-status taxonomy (see 0003_widen_status.sql + 0035_infra_error_status.sql):
+    --   pass | warn | fail | error | infra_error | running.
     -- Inserted as 'running' (in-flight) and updated to a terminal status on
     -- finish; a stale 'running' (hard crash mid-run) is reaped to 'error' by the
     -- runner. SLA excludes 'running'; warn counts as up; fail/error are down.
+    -- 'infra_error' (Option C): the runner couldn't fetch a browser check's spec — NEITHER
+    -- up nor down, excluded from SLA + paging (recorded + visible, never pages). Like
+    -- 'running' but terminal. See runner/db.ts RunStatus + evaluate.ts.
     status         TEXT        NOT NULL DEFAULT 'running'
-                               CHECK (status IN ('pass', 'warn', 'fail', 'error', 'running')),
+                               CHECK (status IN ('pass', 'warn', 'fail', 'error', 'infra_error', 'running')),
     started_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     finished_at    TIMESTAMPTZ,
     duration_ms    INTEGER,
