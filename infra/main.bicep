@@ -115,6 +115,9 @@ param rollupJobName string = 'synthwatch-rollup-job'
 @description('Daily Container Apps Job that generates the Layer-3 AI report narratives (report_narratives).')
 param narrativeJobName string = 'synthwatch-narrative-job'
 
+@description('Daily Container Apps Job that reconciles the monitors-as-code manifest into checks (detect-only; writes reconcile_drift).')
+param reconcileJobName string = 'synthwatch-reconcile-job'
+
 @description('User-assigned managed identity name (used for ACR pull).')
 param identityName string = 'synthwatch-runner-id'
 
@@ -881,6 +884,94 @@ resource narrativeJob 'Microsoft.App/jobs@2024-03-01' = {
 }
 
 // ---------------------------------------------------------------------------
+// Daily monitors-as-code RECONCILE job (Phase 6b). A SEPARATE Schedule Job, eastus2 only
+// (a daily config reconcile — not multi-region monitoring, so no centralus twin). Reuses
+// the RUNNER image, overriding the command to run the reconcile entry point. Runs at
+// 01:00 UTC — clear of the rollup ('7 0') and narrative ('30 0'), a periodic drift refresh.
+//
+// REPORT-ONLY (this phase): reconcileMain fetches synthwatch-monitors' manifest.json over
+// PUBLIC HTTPS (raw.githubusercontent.com — egress is already fine; the other jobs make
+// external calls), diffs it against `checks`, and writes reconcile_drift. It applies NOTHING
+// to live config. So only DATABASE_URL is needed — NO ACS/AOAI/storage (no email/AI/blobs).
+// AZURE_CLIENT_ID pins the user-assigned MI for DefaultAzureCredential (the #90 pattern);
+// reconcile makes no AAD calls today (DB is password-auth, manifest is public), so it is
+// belt-and-suspenders / future-proofing, carried to match the other jobs.
+// One-off run: `az containerapp job start -n synthwatch-reconcile-job`.
+// ---------------------------------------------------------------------------
+resource reconcileJob 'Microsoft.App/jobs@2024-03-01' = {
+  name: reconcileJobName
+  location: location
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${identity.id}': {}
+    }
+  }
+  properties: {
+    environmentId: managedEnvironment.id
+    configuration: {
+      triggerType: 'Schedule'
+      replicaTimeout: 600
+      replicaRetryLimit: 1
+      scheduleTriggerConfig: {
+        cronExpression: '0 1 * * *'
+        parallelism: 1
+        replicaCompletionCount: 1
+      }
+      registries: [
+        {
+          server: acr.properties.loginServer
+          identity: identity.id
+        }
+      ]
+      secrets: [
+        {
+          // Same value/shape as the runner job's database-url secret.
+          name: 'database-url'
+          value: 'postgresql://${postgresAdminLogin}:${postgresAdminPassword}@${postgres.properties.fullyQualifiedDomainName}:5432/synthwatch?sslmode=require'
+        }
+      ]
+    }
+    template: {
+      containers: [
+        {
+          name: 'reconcile'
+          image: runnerImage
+          // Override the image's default CMD (dist/index.js, the check loop) -> the reconcile
+          // entry. Detect-only: computes drift + writes reconcile_drift, applies nothing.
+          command: [
+            'node'
+          ]
+          args: [
+            'dist/reconcileMain.js'
+          ]
+          resources: {
+            cpu: json('0.25')
+            memory: '0.5Gi'
+          }
+          env: [
+            {
+              name: 'DATABASE_URL'
+              secretRef: 'database-url'
+            }
+            {
+              // Pin the user-assigned MI for DefaultAzureCredential (the #90 pattern),
+              // derived from the MI resource. Reconcile makes no AAD calls today; carried
+              // to match the other jobs and future-proof any AAD need.
+              name: 'AZURE_CLIENT_ID'
+              value: identity.properties.clientId
+            }
+          ]
+        }
+      ]
+    }
+  }
+  dependsOn: [
+    acrPull
+  ]
+}
+
+// ---------------------------------------------------------------------------
 // Outputs
 // ---------------------------------------------------------------------------
 output postgresFqdn string = postgres.properties.fullyQualifiedDomainName
@@ -889,3 +980,4 @@ output jobName string = job.name
 output migrateJobName string = migrateJob.name
 output rollupJobName string = rollupJob.name
 output narrativeJobName string = narrativeJob.name
+output reconcileJobName string = reconcileJob.name
