@@ -27,7 +27,7 @@
     "@opentelemetry/sdk-metrics": "^2.8.0",
     "@opentelemetry/sdk-trace-node": "^2.8.0",
     "@opentelemetry/semantic-conventions": "^1.41.1",
-    "esbuild": "^0.24.2",
+    "esbuild": "^0.28.1",
     "pg": "8.22.0",
     "playwright": "1.61.0"
   },
