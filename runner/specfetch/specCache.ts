@@ -1,21 +1,31 @@
-// Phase 6b Option C — SLICE 3: the durable spec_cache (happy path + change detection).
+// Phase 6b Option C — SLICE 4: the FALLBACK + FALSE-OUTAGE GUARD (the load-bearing slice).
 //
-// The runner cold-starts every 5 min and exits, so the compiled-spec cache lives in Postgres
-// (spec_cache). Per due Option-C check, getCompiledSpec():
-//   1. read the cached row (etag, compiled_js).
-//   2. conditional-GET the raw spec with If-None-Match: etag.
-//   3. 304 Not Modified -> reuse compiled_js (NO recompile).
-//   4. 200 -> esbuild-compile (reuse #101's compileSpec), upsert {etag, source_sha, compiled_js,
-//      fetched_at} AND write last_good_compiled_js/last_good_at (so slice 4 has a fallback).
+// ★★ THE INVARIANT: a fetch or compile FAILURE must DEGRADE TO LAST-KNOWN-GOOD and can NEVER
+// manufacture a monitor failure. A monitor that false-fails because GitHub hiccuped pages an SRE
+// for a non-existent outage — that is THE failure mode this feature must not have.
 //
-// ★ SLICE 4 SEAM: on a fetch FAILURE this slice PROPAGATES the error (no fallback yet). Slice 4
-// fills the marked seam below — fall back to last_good_compiled_js so a transient GitHub blip
-// never false-fails a monitor (the false-outage guard). ★ NOT wired into live executeBrowser
-// until slice 4 exists (a fetch hiccup with no fallback would false-fail a live check).
+// getCompiledSpec returns a typed SpecResolution (it no longer throws on fetch/compile failure):
+//   - { kind: 'runnable' }  — there is a compiled spec to run (a fresh compile, a 304 cache hit,
+//                             or, on failure, the LAST-KNOWN-GOOD). The check runs NORMALLY; its
+//                             outcome (pass/fail/error) comes from the REAL run, not the fetch.
+//   - { kind: 'infra-error' } — the runner could not obtain ANY spec to run (fetch failed AND no
+//                             last-known-good). ★ This is categorically NOT a monitor outage: the
+//                             check couldn't RUN. The caller (the live-wiring slice) maps this to
+//                             a DISTINCT non-paging status (see the STATUS DECISION below) — never
+//                             a 'fail' or 'error', both of which route to the down/paging path.
 //
-// Deps are injected (store / fetcher / compile / hash) so the flow is a tested unit without
-// live GitHub or a DB — the production wiring (pgSpecCacheStore, conditionalFetchSpec,
-// compileSpec, sha256) is assembled in getCompiledSpecFromPool().
+// STATUS DECISION (recon of the taxonomy in db.ts): RunStatus = pass|warn|fail|error|running, and
+// the availability partition is "up" = pass|warn, "down" = fail|error — so BOTH fail AND error
+// open incidents and PAGE. The nightmare case (infra-error) must be NEITHER up nor down, like
+// 'running' but terminal — excluded from SLA and from incidents. There is no such status today,
+// so the live-wiring slice will ADD a terminal status (recommended: 'infra_error') and exclude it
+// from the up/down partition (runs.status CHECK + the SLA views + evaluate.ts). Slice 4 defines
+// the SIGNAL (the typed 'infra-error' variant) and proves the guard; it writes no runs row (not
+// wired), so the status-value + SLA/evaluate exclusion ship coherently with the slice that writes
+// it. ★ The non-negotiable contract: 'infra-error' must NOT become a 'fail'/'error'.
+//
+// Deps are injected (store / fetcher / compile / hash) so the flow is a tested unit. ★ STILL NOT
+// wired into live executeBrowser (next slice) — the guard had to exist + be proven first.
 import { createHash } from 'node:crypto';
 import { pool } from '../db.js';
 import { conditionalFetchSpec, assertValidSpecPath, type ConditionalFetch } from './fetchSpec.js';
@@ -42,7 +52,7 @@ export interface SpecCacheUpsert {
 export interface SpecCacheStore {
   read(specPath: string): Promise<SpecCacheRow | null>;
   /** Upsert the fresh compile; MUST set fetched_at=now and last_good_compiled_js/at to the
-   *  just-compiled output (every successful compile is a new known-good — slice-4 fallback). */
+   *  just-compiled output (every successful compile is a new known-good — the fallback). */
   upsert(row: SpecCacheUpsert): Promise<void>;
 }
 
@@ -53,68 +63,115 @@ export interface SpecCacheDeps {
   hash: (s: string) => string;
 }
 
-export interface CompiledSpec {
-  compiledJs: string;
-  /** 'cache-304' = reused unchanged; 'compiled-200' = freshly fetched+compiled. */
-  origin: 'cache-304' | 'compiled-200';
-}
+/** Where a runnable compiled spec came from — observability for the degradation path. */
+export type SpecOrigin =
+  | 'compiled-200' // fresh fetch + compile
+  | 'cache-304' // upstream unchanged, reused cache
+  | 'fallback-last-good'; // ★ fetch/compile FAILED — ran the last-known-good (degraded, NOT failed)
+
+/**
+ * The outcome of resolving a spec. NEVER throws for a fetch/compile failure (that is the whole
+ * point) — failures become either a degraded 'runnable' (last-good) or a distinct 'infra-error'.
+ */
+export type SpecResolution =
+  | { kind: 'runnable'; compiledJs: string; origin: SpecOrigin }
+  | { kind: 'infra-error'; reason: string };
 
 export function sha256(s: string): string {
   return createHash('sha256').update(s).digest('hex');
 }
 
+const errMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+
 /**
- * Resolve a runnable compiled spec for spec_path: conditional GET, 304 -> cache, 200 -> compile
- * + upsert. Slice 3 = happy path + change detection only.
+ * Degrade a fetch/compile failure: run the LAST-KNOWN-GOOD if we have one (the check runs
+ * normally — a GitHub blip is invisible), else surface a DISTINCT infra-error (the check could
+ * not run; the caller must keep this OFF the paging path). Always logs a WARN (observability:
+ * the operator must know the fetch path is degrading even though monitors aren't false-failing).
  */
-export async function getCompiledSpec(specPath: string, deps: SpecCacheDeps): Promise<CompiledSpec> {
+function degradeOrInfraError(
+  specPath: string,
+  existing: SpecCacheRow | null,
+  why: string,
+): SpecResolution {
+  if (existing?.last_good_compiled_js) {
+    console.warn(
+      `[specfetch] DEGRADED ${specPath}: ${why} — ran LAST-KNOWN-GOOD ` +
+        `(last_good_at=${existing.last_good_at?.toISOString() ?? '?'}). ` +
+        `Monitor NOT failed; the spec-fetch path is flaky.`,
+    );
+    return { kind: 'runnable', compiledJs: existing.last_good_compiled_js, origin: 'fallback-last-good' };
+  }
+  console.warn(
+    `[specfetch] INFRA-ERROR ${specPath}: ${why} — and NO last-known-good cached. ` +
+      `Cannot run the check; this is an INFRA error (fetching the spec), NOT a monitor outage. ` +
+      `It MUST NOT page.`,
+  );
+  return { kind: 'infra-error', reason: why };
+}
+
+/**
+ * Resolve a runnable compiled spec for spec_path with graceful degradation:
+ *   - conditional GET (If-None-Match: etag).
+ *   - 304 + cache  -> reuse compiled_js (no recompile).
+ *   - 304 + NO cache (etag desync) -> forced unconditional re-fetch (cache-miss).
+ *   - 200          -> esbuild-compile + upsert (refreshes last_good_*).
+ *   - fetch fails / 5xx / timeout / compile fails -> last-known-good, else infra-error.
+ * NEVER throws for a fetch/compile failure — that would false-fail the monitor.
+ */
+export async function getCompiledSpec(specPath: string, deps: SpecCacheDeps): Promise<SpecResolution> {
   assertValidSpecPath(specPath); // defense in depth; the fetcher also guards
   const existing = await deps.store.read(specPath);
 
+  // 1) Conditional GET. A network error / 5xx / timeout throws here -> degrade.
   let fetched: ConditionalFetch;
   try {
     fetched = await deps.fetcher(specPath, existing?.etag ?? null);
   } catch (err) {
-    // ─────────────────────────────────────────────────────────────────────────────────────
-    // ★★ SLICE 4 SEAM — fetch FAILURE handling lives HERE.
-    // Slice 4 will, instead of rethrowing, fall back to existing?.last_good_compiled_js (run
-    // normally so a GitHub blip is invisible) and, when there is NO cached/last-good entry,
-    // surface a DISTINCT infra error (never a paging 'fail'). For slice 3 there is no fallback
-    // yet, so we log + propagate — and this is exactly why the cache is NOT wired into live
-    // checks until slice 4 lands. `hasLastGood` shows what slice 4 will have to fall back to.
-    // ─────────────────────────────────────────────────────────────────────────────────────
-    const hasLastGood = Boolean(existing?.last_good_compiled_js);
-    console.warn(
-      `[specfetch] fetch failed for ${specPath} (no fallback yet — slice 4; ` +
-        `last_good available: ${hasLastGood}):`,
-      err instanceof Error ? err.message : err,
-    );
-    throw err;
+    return degradeOrInfraError(specPath, existing, `fetch failed: ${errMsg(err)}`);
   }
 
+  // 2) 304 Not Modified.
   if (fetched.kind === 'unchanged') {
-    // 304: the upstream matched our etag. We must have a cached compile to reuse.
-    if (!existing) {
-      throw new Error(`spec_cache: 304 for ${specPath} but no cached row (etag desync)`);
+    if (existing) {
+      return { kind: 'runnable', compiledJs: existing.compiled_js, origin: 'cache-304' };
     }
-    return { compiledJs: existing.compiled_js, origin: 'cache-304' };
+    // 304 with no cached row (we couldn't have sent a matching etag) -> treat as cache-miss:
+    // force a full unconditional fetch.
+    console.warn(`[specfetch] ${specPath}: 304 with no cached row (etag desync) — forcing a full fetch.`);
+    try {
+      fetched = await deps.fetcher(specPath, null);
+    } catch (err) {
+      return degradeOrInfraError(specPath, existing, `forced re-fetch failed: ${errMsg(err)}`);
+    }
+    if (fetched.kind === 'unchanged') {
+      // Still 304 on an unconditional fetch is pathological — there is no source to compile.
+      return degradeOrInfraError(specPath, existing, 'unconditional fetch still returned 304 (pathological)');
+    }
   }
 
-  // 200: source changed (or first fetch) -> compile once and persist.
-  const sourcefile = specPath.split('/').pop();
-  const compiledJs = await deps.compile(fetched.source, sourcefile);
+  // 3) 200 -> compile + persist. A broken merged spec (shouldn't pass monitors-repo CI) throws
+  //    in compile -> degrade to last-good rather than running a broken spec or failing the monitor.
+  const { source, etag } = fetched;
+  let compiledJs: string;
+  try {
+    compiledJs = await deps.compile(source, specPath.split('/').pop());
+  } catch (err) {
+    return degradeOrInfraError(specPath, existing, `compile failed (broken spec merged?): ${errMsg(err)}`);
+  }
   await deps.store.upsert({
     spec_path: specPath,
-    etag: fetched.etag,
-    source_sha: deps.hash(fetched.source),
+    etag,
+    source_sha: deps.hash(source),
     compiled_js: compiledJs,
   });
-  return { compiledJs, origin: 'compiled-200' };
+  return { kind: 'runnable', compiledJs, origin: 'compiled-200' };
 }
 
 // ---------------------------------------------------------------------------
 // Production store — Postgres-backed (spec_cache). Every successful upsert also refreshes
-// last_good_* to the just-compiled output, so slice 4 always has a known-good to fall back to.
+// last_good_* to the just-compiled output, so a fetch failure always has a known-good to fall
+// back to (until the very first successful fetch — the nightmare case, handled as infra-error).
 // ---------------------------------------------------------------------------
 export const pgSpecCacheStore: SpecCacheStore = {
   async read(specPath) {
@@ -144,7 +201,7 @@ export const pgSpecCacheStore: SpecCacheStore = {
 };
 
 /** Production wiring: real Postgres store + conditional GET + esbuild compile + sha256. */
-export function getCompiledSpecFromPool(specPath: string): Promise<CompiledSpec> {
+export function getCompiledSpecFromPool(specPath: string): Promise<SpecResolution> {
   return getCompiledSpec(specPath, {
     store: pgSpecCacheStore,
     fetcher: conditionalFetchSpec,

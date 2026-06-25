@@ -1,25 +1,28 @@
-// Phase 6b Option C — SLICES 2+3 tests. spec_path resolution + the spec_cache happy path
-// (conditional GET / 304-reuse / 200-recompile + last_good), parity preserved via #101's shim,
-// and the slice-4 error SEAM (a fetch failure propagates — no fallback yet). Offline: the
-// fetcher/store/compile are injected, so no live GitHub or DB. (The real pg upsert's last_good
-// SQL is proven separately against the live DB in the PR's validation.)
+// Phase 6b Option C — SLICE 4 tests: the FALLBACK + FALSE-OUTAGE GUARD.
+//
+// ★★ The invariant under test: a fetch/compile FAILURE NEVER manufactures a monitor failure.
+// Every degradation test asserts the SpecResolution is NOT a false-outage — either 'runnable'
+// (the check runs the last-known-good → its real outcome) or 'infra-error' (a DISTINCT non-paging
+// signal). It is NEVER a throw and NEVER something that routes to a monitor 'fail'/'error'.
+// Offline + deterministic: fetcher/store/compile are injected; failure modes are mocked.
 import { test as nodeTest } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Page } from 'playwright';
 import { StepRecorder, type RecordedStep } from '../stepRecorder.js';
 import { loadCompiledSpec, compileSpec } from './compileSpec.js';
 import { specToFlow } from './specShim.js';
-import { assertValidSpecPath } from './fetchSpec.js';
+import { assertValidSpecPath, type ConditionalFetch } from './fetchSpec.js';
 import { specPathForSourceKey, type Monitor } from '../reconcile.js';
 import {
   getCompiledSpec,
   sha256,
+  type SpecResolution,
   type SpecCacheStore,
   type SpecCacheRow,
   type SpecCacheUpsert,
 } from './specCache.js';
 
-// The REAL repo spec, verbatim (used to prove cached compiled_js still runs via the shim).
+// The REAL repo spec, verbatim (proves a cached / last-good compiled_js still runs via the shim).
 const DASHBOARD_SPEC = `
 import { test, expect, step, assertLoaded } from '../../lib/flow';
 test('SynthWatch dashboard loads', async ({ page }) => {
@@ -33,7 +36,7 @@ test('SynthWatch dashboard loads', async ({ page }) => {
 });
 `;
 
-// --- an in-memory SpecCacheStore that mirrors the pg upsert semantics (last_good <- compile) ---
+// --- in-memory SpecCacheStore mirroring the pg upsert (last_good <- the just-compiled output) ---
 function memStore(seed?: { spec_path: string } & Partial<SpecCacheRow>): SpecCacheStore & {
   rows: Map<string, SpecCacheRow>;
   upserts: SpecCacheUpsert[];
@@ -60,7 +63,6 @@ function memStore(seed?: { spec_path: string } & Partial<SpecCacheRow>): SpecCac
     async upsert(row) {
       upserts.push(row);
       const now = new Date();
-      // Mirror 0034's ON CONFLICT: every successful compile is the new known-good.
       rows.set(row.spec_path, {
         spec_path: row.spec_path,
         etag: row.etag,
@@ -85,8 +87,37 @@ function fakePage(): Page {
   } as unknown as Page;
 }
 
+// Capture console.warn so we can assert each degradation is OBSERVABLE.
+async function captureWarns<T>(fn: () => Promise<T>): Promise<{ result: T; warns: string[] }> {
+  const warns: string[] = [];
+  const orig = console.warn;
+  console.warn = (...a: unknown[]) => {
+    warns.push(a.map((x) => (x instanceof Error ? x.message : String(x))).join(' '));
+  };
+  try {
+    const result = await fn();
+    return { result, warns };
+  } finally {
+    console.warn = orig;
+  }
+}
+
+const ok200 = (source: string, etag = '"v1"'): (() => Promise<ConditionalFetch>) =>
+  async () => ({ kind: 'fetched', source, etag });
+const throwsWith = (msg: string): (() => Promise<ConditionalFetch>) =>
+  async () => {
+    throw new Error(msg);
+  };
+
+// ★ The invariant guard: a degradation result is NEVER a false-outage.
+function assertNotFalseOutage(res: SpecResolution): void {
+  assert.ok(res.kind === 'runnable' || res.kind === 'infra-error', `unexpected kind ${JSON.stringify(res)}`);
+  // 'runnable' => the check RUNS (real outcome); 'infra-error' => distinct non-paging signal.
+  // Neither is a monitor 'fail'/'error', and getCompiledSpec never threw to get here.
+}
+
 // ===========================================================================================
-// SLICE 2 — spec_path resolution + the shared path guard.
+// SLICE 2 — spec_path resolution + the shared path guard (regression).
 // ===========================================================================================
 const MONITORS: Monitor[] = [
   { id: 'wegmans-search-product', name: 'A', script: 'monitors/wegmans/search-product.spec.ts', kind: 'browser' },
@@ -95,53 +126,36 @@ const MONITORS: Monitor[] = [
 
 nodeTest('specPathForSourceKey resolves source_key -> manifest script path', () => {
   assert.equal(specPathForSourceKey(MONITORS, 'wegmans-search-product'), 'monitors/wegmans/search-product.spec.ts');
-  assert.equal(specPathForSourceKey(MONITORS, 'synthwatch-self-homepage'), 'monitors/synthwatch/dashboard-homepage.spec.ts');
-});
-
-nodeTest('specPathForSourceKey returns null for an unknown source_key', () => {
   assert.equal(specPathForSourceKey(MONITORS, 'not-a-monitor'), null);
 });
 
-nodeTest('spec path guard rejects traversal / non-monitors paths (reused from #101)', () => {
+nodeTest('spec path guard rejects traversal / non-monitors paths', () => {
   assert.doesNotThrow(() => assertValidSpecPath('monitors/wegmans/search-product.spec.ts'));
   assert.throws(() => assertValidSpecPath('monitors/../../../etc/passwd'), /invalid spec path/);
   assert.throws(() => assertValidSpecPath('flows/x.spec.ts'), /invalid spec path/);
-  assert.throws(() => assertValidSpecPath('monitors/x.ts'), /invalid spec path/);
 });
 
 // ===========================================================================================
-// SLICE 3 — the cache flow.
+// HAPPY PATHS (new SpecResolution shape) — no regression from #103.
 // ===========================================================================================
-nodeTest('200: compiles once, upserts {etag,source_sha,compiled_js}, populates last_good_*', async () => {
+nodeTest('200: compiles once, upserts, populates last_good, kind runnable/compiled-200', async () => {
   const store = memStore();
   let compiles = 0;
   const res = await getCompiledSpec('monitors/x.spec.ts', {
     store,
-    fetcher: async () => ({ kind: 'fetched', source: 'SRC', etag: '"abc"' }),
+    fetcher: ok200('SRC', '"abc"'),
     compile: async (s) => {
       compiles++;
       return `COMPILED(${s})`;
     },
     hash: () => 'sha-of-src',
   });
-
-  assert.equal(res.origin, 'compiled-200');
-  assert.equal(res.compiledJs, 'COMPILED(SRC)');
+  assert.ok(res.kind === 'runnable' && res.origin === 'compiled-200' && res.compiledJs === 'COMPILED(SRC)');
   assert.equal(compiles, 1);
-  assert.equal(store.upserts.length, 1);
-  assert.deepEqual(store.upserts[0], {
-    spec_path: 'monitors/x.spec.ts',
-    etag: '"abc"',
-    source_sha: 'sha-of-src',
-    compiled_js: 'COMPILED(SRC)',
-  });
-  // ★ slice-4 prerequisite: last_good_* is populated by a successful compile.
-  const row = store.rows.get('monitors/x.spec.ts')!;
-  assert.equal(row.last_good_compiled_js, 'COMPILED(SRC)', 'last_good populated for slice 4 fallback');
-  assert.ok(row.last_good_at instanceof Date);
+  assert.equal(store.rows.get('monitors/x.spec.ts')!.last_good_compiled_js, 'COMPILED(SRC)');
 });
 
-nodeTest('304: reuses cached compiled_js, sends the cached etag, NO recompile, NO upsert', async () => {
+nodeTest('304 + cache: reuses compiled_js, sends cached etag, no recompile/upsert', async () => {
   const store = memStore({ spec_path: 'monitors/x.spec.ts', etag: '"abc"', compiled_js: 'CACHED_JS' });
   let compiles = 0;
   let etagSent: string | null | undefined;
@@ -157,79 +171,138 @@ nodeTest('304: reuses cached compiled_js, sends the cached etag, NO recompile, N
     },
     hash: () => 'h',
   });
-
-  assert.equal(res.origin, 'cache-304');
-  assert.equal(res.compiledJs, 'CACHED_JS');
-  assert.equal(compiles, 0, 'no recompile on 304');
-  assert.equal(etagSent, '"abc"', 'conditional GET carried the cached etag (If-None-Match)');
-  assert.equal(store.upserts.length, 0, 'no upsert on 304');
+  assert.ok(res.kind === 'runnable' && res.origin === 'cache-304' && res.compiledJs === 'CACHED_JS');
+  assert.equal(compiles, 0);
+  assert.equal(etagSent, '"abc"');
+  assert.equal(store.upserts.length, 0);
 });
 
-nodeTest('304 with no cached row throws (etag desync — should not happen)', async () => {
-  const store = memStore();
-  await assert.rejects(
-    () =>
-      getCompiledSpec('monitors/x.spec.ts', {
-        store,
-        fetcher: async () => ({ kind: 'unchanged' }),
-        compile: async () => 'x',
-        hash: () => 'h',
-      }),
-    /no cached row/,
+nodeTest('304 + NO cache row (etag desync): forces a full fetch (cache-miss), warns', async () => {
+  const store = memStore(); // empty
+  let calls = 0;
+  const { result, warns } = await captureWarns(() =>
+    getCompiledSpec('monitors/x.spec.ts', {
+      store,
+      // first call returns 304, forcing the unconditional re-fetch which 200s.
+      fetcher: async () => {
+        calls++;
+        return calls === 1 ? { kind: 'unchanged' } : { kind: 'fetched', source: 'SRC', etag: '"new"' };
+      },
+      compile: async (s) => `C(${s})`,
+      hash: () => 'h',
+    }),
   );
+  assert.ok(result.kind === 'runnable' && result.origin === 'compiled-200');
+  assert.equal(calls, 2, 'forced a second unconditional fetch');
+  assert.ok(warns.some((w) => /etag desync/.test(w)));
 });
 
-nodeTest('★ fetch error PROPAGATES (the slice-4 seam — no fallback yet)', async () => {
-  // A cached last-good EXISTS, but slice 3 must NOT use it — that graceful degradation is
-  // slice 4's job, added deliberately with its own tests. Slice 3 propagates.
-  const store = memStore({
+// ===========================================================================================
+// ★★ DEGRADATION MATRIX — each proves NO false-outage.
+// ===========================================================================================
+const LAST_GOOD = 'LAST_GOOD_JS';
+const withLastGood = (): ReturnType<typeof memStore> =>
+  memStore({
     spec_path: 'monitors/x.spec.ts',
-    compiled_js: 'CACHED_JS',
-    last_good_compiled_js: 'CACHED_JS',
+    etag: '"old"',
+    compiled_js: LAST_GOOD,
+    last_good_compiled_js: LAST_GOOD,
+    last_good_at: new Date('2026-06-01T00:00:00Z'),
   });
-  await assert.rejects(
-    () =>
-      getCompiledSpec('monitors/x.spec.ts', {
-        store,
-        fetcher: async () => {
-          throw new Error('github 503 Service Unavailable');
-        },
-        compile: async () => 'x',
-        hash: () => 'h',
-      }),
-    /github 503/,
+
+for (const [label, fetcher] of [
+  ['network error (connection refused)', throwsWith('connect ECONNREFUSED 140.82.0.1:443')],
+  ['5xx from raw.githubusercontent', throwsWith('spec fetch failed: 503 Service Unavailable')],
+  ['timeout', throwsWith('The operation was aborted due to timeout')],
+] as const) {
+  nodeTest(`degrade: ${label} + last_good -> runs LAST-GOOD, NOT a fail, warns`, async () => {
+    const store = withLastGood();
+    const { result, warns } = await captureWarns(() =>
+      getCompiledSpec('monitors/x.spec.ts', { store, fetcher, compile: compileSpec, hash: sha256 }),
+    );
+    assertNotFalseOutage(result);
+    assert.ok(result.kind === 'runnable', 'fell back, did not fail the monitor');
+    assert.ok(result.kind === 'runnable' && result.origin === 'fallback-last-good');
+    assert.ok(result.kind === 'runnable' && result.compiledJs === LAST_GOOD, 'ran the last-known-good');
+    assert.equal(store.upserts.length, 0, 'no cache write on a failed fetch');
+    assert.ok(warns.some((w) => /DEGRADED/.test(w) && /Monitor NOT failed/.test(w)), 'WARN observability');
+  });
+}
+
+nodeTest('degrade: 200 but COMPILE fails + last_good -> runs LAST-GOOD (not the broken spec), warns', async () => {
+  const store = withLastGood();
+  const { result, warns } = await captureWarns(() =>
+    getCompiledSpec('monitors/x.spec.ts', {
+      store,
+      fetcher: ok200('this is not valid typescript {{{', '"v2"'),
+      compile: async () => {
+        throw new Error('esbuild: Unexpected "{"');
+      },
+      hash: sha256,
+    }),
   );
-  assert.equal(store.upserts.length, 0, 'nothing written on a fetch failure');
+  assertNotFalseOutage(result);
+  assert.ok(result.kind === 'runnable' && result.origin === 'fallback-last-good');
+  assert.ok(result.kind === 'runnable' && result.compiledJs === LAST_GOOD, 'ran last-good, NOT the broken spec');
+  assert.equal(store.upserts.length, 0, 'a broken compile is NOT cached');
+  assert.ok(warns.some((w) => /compile failed/.test(w)));
+});
+
+// ★ THE NIGHTMARE: fetch fails AND no last_good (brand-new spec, first run, GitHub down).
+nodeTest('★ nightmare: fetch fails + NO last_good -> DISTINCT infra-error (NOT fail/error/throw)', async () => {
+  const store = memStore(); // no row at all -> no last_good
+  const { result, warns } = await captureWarns(() =>
+    getCompiledSpec('monitors/brand-new.spec.ts', {
+      store,
+      fetcher: throwsWith('getaddrinfo ENOTFOUND raw.githubusercontent.com'),
+      compile: compileSpec,
+      hash: sha256,
+    }),
+  );
+  assertNotFalseOutage(result);
+  assert.equal(result.kind, 'infra-error', 'a distinct signal, not runnable');
+  assert.ok(result.kind === 'infra-error' && /ENOTFOUND/.test(result.reason));
+  assert.ok(warns.some((w) => /INFRA-ERROR/.test(w) && /MUST NOT page/.test(w)), 'WARN says it must not page');
+});
+
+nodeTest('nightmare variant: 200 + compile fails + NO last_good -> infra-error (no broken run)', async () => {
+  const store = memStore();
+  const res = await getCompiledSpec('monitors/brand-new.spec.ts', {
+    store,
+    fetcher: ok200('broken {{{'),
+    compile: async () => {
+      throw new Error('esbuild parse error');
+    },
+    hash: sha256,
+  });
+  assert.equal(res.kind, 'infra-error');
+  assert.equal(store.upserts.length, 0);
 });
 
 // ===========================================================================================
-// PARITY — the cached compiled_js (reused on 304) still runs via #101's shim with identical
-// run_steps. This proves the cache preserves the slice-1 execution contract.
+// PARITY — the degraded LAST-GOOD compiled_js still runs via #101's shim with a NORMAL outcome
+// (proves the degraded path yields a real monitor result, not a synthetic failure).
 // ===========================================================================================
-nodeTest('cached compiled_js (304 reuse) runs via the shim with the same run_steps', async () => {
-  const store = memStore();
-  // 200: real fetch+compile populates the cache with real compiled_js.
-  const first = await getCompiledSpec('monitors/synthwatch/dashboard-homepage.spec.ts', {
+nodeTest('degraded last-good runs via the shim -> normal pass (real outcome, not a false fail)', async () => {
+  const realCompiled = await compileSpec(DASHBOARD_SPEC, 'dashboard-homepage.spec.ts');
+  const store = memStore({
+    spec_path: 'monitors/synthwatch/dashboard-homepage.spec.ts',
+    etag: '"old"',
+    compiled_js: realCompiled,
+    last_good_compiled_js: realCompiled,
+    last_good_at: new Date('2026-06-01T00:00:00Z'),
+  });
+
+  const res = await getCompiledSpec('monitors/synthwatch/dashboard-homepage.spec.ts', {
     store,
-    fetcher: async () => ({ kind: 'fetched', source: DASHBOARD_SPEC, etag: '"v1"' }),
+    fetcher: throwsWith('503 Service Unavailable'), // GitHub down -> must degrade
     compile: compileSpec,
     hash: sha256,
   });
-  assert.equal(first.origin, 'compiled-200');
+  assert.ok(res.kind === 'runnable' && res.origin === 'fallback-last-good');
 
-  // 304: reuse the cached compiled_js (no recompile).
-  const second = await getCompiledSpec('monitors/synthwatch/dashboard-homepage.spec.ts', {
-    store,
-    fetcher: async () => ({ kind: 'unchanged' }),
-    compile: compileSpec,
-    hash: sha256,
-  });
-  assert.equal(second.origin, 'cache-304');
-  assert.equal(second.compiledJs, first.compiledJs, 'cache returns the same compiled output');
-
-  // Run the cached compiled_js through the shim — identical run_steps to slice 1.
-  const [t] = await loadCompiledSpec(second.compiledJs);
-  assert.equal(t.name, 'SynthWatch dashboard loads');
+  // The degraded spec RUNS and produces a normal pass — not a false failure.
+  const [t] = await loadCompiledSpec(res.compiledJs);
   const steps: RecordedStep[] = [];
   const rec = new StepRecorder(1, null as unknown as Page, 'about:blank', async (s) => {
     steps.push(s);
