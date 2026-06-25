@@ -15,6 +15,7 @@ import { assertValidSpecPath, type ConditionalFetch } from './fetchSpec.js';
 import { specPathForSourceKey, type Monitor } from '../reconcile.js';
 import {
   getCompiledSpec,
+  probeSpec,
   sha256,
   type SpecResolution,
   type SpecCacheStore,
@@ -312,4 +313,77 @@ nodeTest('degraded last-good runs via the shim -> normal pass (real outcome, not
     steps.map((s) => `${s.name}:${s.status}`),
     ['open the dashboard:pass', 'assert the monitor grid rendered:pass'],
   );
+});
+
+// ===========================================================================================
+// SLICE 6 — probeSpec: orphan-detection (fetchable+compilable?) that ALSO warms the cache.
+// Unlike getCompiledSpec (runtime), the probe REPORTS failures (404/won't-compile) instead of
+// falling back to last-good — it answers "is the Git spec runnable from main right now?".
+// ===========================================================================================
+nodeTest('probeSpec: 200 + compiles -> runnable + WARMS the cache (upsert)', async () => {
+  const store = memStore();
+  const res = await probeSpec('monitors/x.spec.ts', {
+    store,
+    fetcher: ok200('SRC', '"v1"'),
+    compile: async (s) => `C(${s})`,
+    hash: () => 'sha',
+  });
+  assert.deepEqual(res, { runnable: true });
+  assert.equal(store.upserts.length, 1, 'a runnable probe warms the cache');
+  assert.equal(store.rows.get('monitors/x.spec.ts')!.last_good_compiled_js, 'C(SRC)');
+});
+
+nodeTest('probeSpec: a 404 / fetch failure -> NOT runnable (reason: not fetchable), no warm', async () => {
+  const store = memStore();
+  const res = await probeSpec('monitors/missing.spec.ts', {
+    store,
+    fetcher: throwsWith('spec fetch failed: 404 Not Found (…/missing.spec.ts)'),
+    compile: compileSpec,
+    hash: sha256,
+  });
+  assert.equal(res.runnable, false);
+  assert.match(res.reason!, /not fetchable/);
+  assert.match(res.reason!, /404/);
+  assert.equal(store.upserts.length, 0, 'a 404 does not warm');
+});
+
+nodeTest("probeSpec: 200 but won't compile -> NOT runnable (reason: won't compile), no warm", async () => {
+  const store = memStore();
+  const res = await probeSpec('monitors/broken.spec.ts', {
+    store,
+    fetcher: ok200('not valid typescript {{{'),
+    compile: async () => {
+      throw new Error('esbuild: Unexpected "{"');
+    },
+    hash: sha256,
+  });
+  assert.equal(res.runnable, false);
+  assert.match(res.reason!, /won't compile/);
+  assert.equal(store.upserts.length, 0, 'a broken spec is not cached');
+});
+
+nodeTest('probeSpec: 304 with an existing cache row -> runnable (already compiled), no upsert', async () => {
+  const store = memStore({ spec_path: 'monitors/x.spec.ts', etag: '"v1"', compiled_js: 'CACHED' });
+  const res = await probeSpec('monitors/x.spec.ts', {
+    store,
+    fetcher: async () => ({ kind: 'unchanged' }),
+    compile: compileSpec,
+    hash: sha256,
+  });
+  assert.deepEqual(res, { runnable: true });
+  assert.equal(store.upserts.length, 0);
+});
+
+// The REAL repo specs (verbatim) compile through esbuild -> runnable. Proves the 3 manifest
+// specs flip to NOT-orphan (the live reconcile run confirms it against actual main).
+nodeTest('★ slice 6: the real dashboard spec probes as RUNNABLE (compiles via esbuild)', async () => {
+  const store = memStore();
+  const res = await probeSpec('monitors/synthwatch/dashboard-homepage.spec.ts', {
+    store,
+    fetcher: ok200(DASHBOARD_SPEC, '"v1"'),
+    compile: compileSpec,
+    hash: sha256,
+  });
+  assert.deepEqual(res, { runnable: true }, 'a real, valid spec is runnable -> not orphan');
+  assert.equal(store.upserts.length, 1, 'and it warmed the cache');
 });

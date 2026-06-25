@@ -73,9 +73,6 @@ const DEFAULT_INTERVAL_SECONDS = 300;
 // the same way other runner modules hand-validate their inputs.
 const ID_RE = /^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$/;
 const SCRIPT_RE = /^monitors\/.+\.spec\.ts$/;
-// The runner's flow-name allowlist (checks/index.ts loadFlow): a derived flow_name that
-// can't match this can never be a real flow module -> it will read as 'orphan'.
-const FLOW_NAME_RE = /^[a-z0-9-]+$/;
 
 /**
  * The runner flow_name a manifest monitor binds to = the script's basename without the
@@ -190,10 +187,15 @@ export async function fetchManifest(url = manifestUrl()): Promise<Manifest> {
  * (source_key, drift_type) — a monitor can yield several (e.g. NEW and ORPHAN). Unmanaged
  * checks (source_key NULL) are never passed in, so they're invisible to reconcile by design.
  */
+/** Per-spec runnability under Option C — is the manifest's spec fetchable + compilable from
+ *  main? Computed by reconcileMain (fetch+compile probe, which also warms spec_cache), keyed by
+ *  spec path. Passed in so computeDrift stays pure/synchronous (mirrors the old knownFlows arg). */
+export type SpecRunnability = Map<string, { runnable: boolean; reason?: string }>;
+
 export function computeDrift(
   monitors: Monitor[],
   managedChecks: ManagedCheck[],
-  knownFlows: Set<string>,
+  specRunnable: SpecRunnability,
 ): DriftRow[] {
   const byId = new Map(monitors.map((m) => [m.id, m]));
   const byKey = new Map(managedChecks.map((c) => [c.source_key, c]));
@@ -202,13 +204,18 @@ export function computeDrift(
   for (const m of monitors) {
     const flow = flowNameFor(m);
 
-    // ORPHAN — the bound flow has no compiled runner module (or isn't a valid flow name).
-    // "Git defines a monitor the runner can't run yet" (spec execution deferred).
-    if (!FLOW_NAME_RE.test(flow) || !knownFlows.has(flow)) {
+    // ORPHAN — Option C (slice 6) flips the meaning: "runnable" no longer means "a module is
+    // BAKED into the runner image" — it means the spec is FETCHABLE + COMPILABLE from main (the
+    // runner fetches+runs it at run start; #101-#105). So orphan now = a manifest spec that
+    // 404s (Git declares a spec whose file is missing) or won't compile — "Git declares a spec
+    // the runner can't run". A fetchable+compilable spec is NOT orphan. The probe (reconcileMain)
+    // also warms spec_cache, so this pass front-loads the runtime cache.
+    const probe = specRunnable.get(m.script);
+    if (!probe || !probe.runnable) {
       rows.push({
         source_key: m.id,
         drift_type: 'orphan',
-        detail: { flow_name: flow, reason: 'no compiled runner flow module for this monitor' },
+        detail: { spec_path: m.script, reason: probe?.reason ?? 'spec not probed' },
       });
     }
 

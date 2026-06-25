@@ -210,31 +210,87 @@ export function getCompiledSpecFromPool(specPath: string): Promise<SpecResolutio
   });
 }
 
+/** Is a manifest spec RUNNABLE under Option C — fetchable (raw 200) + esbuild-compilable? */
+export interface SpecProbe {
+  runnable: boolean;
+  reason?: string; // when not runnable: why (not fetchable: 404/... | won't compile: ...)
+}
+
 /**
- * Pre-WARM the cache for a set of spec paths (Phase 6b Option C, slice 5). Run BEFORE checks
- * flip to the fetch path so no check's FIRST live run is a cold no-last_good fetch (which, if
- * GitHub were down at that moment, would dark out every browser monitor at once — infra_error,
- * not a page, but every monitor silent). Each path is fetched+compiled and cached (200 ->
- * compiled_js + last_good). Best-effort: a failure on one path warns + counts, never throws, so
- * one bad spec can't abort the warm pass. The reconcile job calls this (it already has the
- * manifest); the deploy order is: migrate -> warm (reconcile) -> checks run the fetch path.
+ * Probe a manifest spec for runnability (Phase 6b Option C, slice 6) AND warm the cache.
+ *
+ * ★ This is the ORPHAN-detection question, which is DIFFERENT from the runtime path
+ * (getCompiledSpec): it reports the TRUE current state of the Git spec and does NOT fall back to
+ * last-known-good. A spec that 404s but has a stale cached last_good is NOT "runnable from main"
+ * here — it's orphan (the file is gone) even though the runtime would still degrade-run it.
+ *   - fetch fails / 404 / 5xx           -> { runnable: false, reason: 'not fetchable: …' }
+ *   - 200 but won't esbuild-compile     -> { runnable: false, reason: "won't compile: …" }
+ *   - 304 (unchanged) with a cache row  -> runnable (already fetched + compiled before)
+ *   - 200 + compiles                    -> runnable; UPSERTS the cache (warms compiled_js +
+ *                                          last_good) so this same pass front-loads the runtime.
  */
-export async function warmSpecCache(specPaths: string[]): Promise<{ warmed: number; failed: number }> {
-  let warmed = 0;
-  let failed = 0;
-  for (const p of specPaths) {
+export async function probeSpec(specPath: string, deps: SpecCacheDeps): Promise<SpecProbe> {
+  assertValidSpecPath(specPath);
+  const existing = await deps.store.read(specPath);
+
+  let fetched: ConditionalFetch;
+  try {
+    fetched = await deps.fetcher(specPath, existing?.etag ?? null);
+  } catch (err) {
+    return { runnable: false, reason: `not fetchable: ${errMsg(err)}` };
+  }
+
+  if (fetched.kind === 'unchanged') {
+    if (existing) return { runnable: true }; // unchanged + already compiled in cache
+    // 304 with no cache row (etag desync) -> force a full fetch to actually probe it.
     try {
-      const res = await getCompiledSpecFromPool(p);
-      if (res.kind === 'runnable') {
-        warmed++;
-      } else {
-        failed++;
-        console.warn(`[specfetch:warm] ${p}: ${res.reason}`);
-      }
+      fetched = await deps.fetcher(specPath, null);
     } catch (err) {
-      failed++;
-      console.warn(`[specfetch:warm] ${p} failed:`, err instanceof Error ? err.message : err);
+      return { runnable: false, reason: `not fetchable: ${errMsg(err)}` };
+    }
+    if (fetched.kind === 'unchanged') {
+      return { runnable: false, reason: 'not fetchable: unconditional fetch still 304' };
     }
   }
-  return { warmed, failed };
+
+  // 200 -> compile (reports failure, unlike getCompiledSpec which would fall back) + warm.
+  let compiledJs: string;
+  try {
+    compiledJs = await deps.compile(fetched.source, specPath.split('/').pop());
+  } catch (err) {
+    return { runnable: false, reason: `won't compile: ${errMsg(err)}` };
+  }
+  await deps.store.upsert({
+    spec_path: specPath,
+    etag: fetched.etag,
+    source_sha: deps.hash(fetched.source),
+    compiled_js: compiledJs,
+  });
+  return { runnable: true };
+}
+
+/**
+ * Probe + WARM a set of manifest specs (production wiring). Returns a map keyed by spec path for
+ * computeDrift's orphan check; a successful probe also warms spec_cache (compiled_js + last_good)
+ * — so this single pass both resolves orphans AND front-loads the runtime cache before checks run
+ * the fetch path. Best-effort: a probe error is captured as not-runnable, never thrown.
+ */
+export async function probeSpecsFromPool(specPaths: string[]): Promise<Map<string, SpecProbe>> {
+  const out = new Map<string, SpecProbe>();
+  for (const p of specPaths) {
+    try {
+      out.set(
+        p,
+        await probeSpec(p, {
+          store: pgSpecCacheStore,
+          fetcher: conditionalFetchSpec,
+          compile: compileSpec,
+          hash: sha256,
+        }),
+      );
+    } catch (err) {
+      out.set(p, { runnable: false, reason: `probe error: ${errMsg(err)}` });
+    }
+  }
+  return out;
 }

@@ -7,7 +7,6 @@
 // REPORT-ONLY: this computes + persists drift and APPLIES NOTHING to live config. The
 // field-split apply upsert (reconcile.buildApplyUpsert) is gated off — a later PR enables it.
 import { pool } from './db.js';
-import { discoverFlows } from './flowManifest.js';
 import {
   fetchManifest,
   computeDrift,
@@ -15,7 +14,7 @@ import {
   type ManagedCheck,
   type DriftRow,
 } from './reconcile.js';
-import { warmSpecCache } from './specfetch/specCache.js';
+import { probeSpecsFromPool } from './specfetch/specCache.js';
 
 /** Read the Git-managed checks (source_key set). Unmanaged rows are intentionally excluded. */
 async function loadManagedChecks(): Promise<ManagedCheck[]> {
@@ -59,11 +58,26 @@ async function main(): Promise<void> {
   console.log(`[reconcile] fetching manifest: ${url}`);
   const manifest = await fetchManifest(url);
 
-  const [managed, flows] = await Promise.all([loadManagedChecks(), discoverFlows()]);
-  const knownFlows = new Set(flows.map((f) => f.name));
+  // ★ Option C (slice 6): orphan = a manifest spec that ISN'T fetchable+compilable from main
+  // (no longer "no baked-in module"). Probe every manifest spec (fetch+compile) for runnability;
+  // the SAME pass WARMS spec_cache (a successful probe upserts compiled_js + last_good), so this
+  // front-loads the runtime cache before checks run the fetch path.
+  const specPaths = manifest.monitors.map((m) => m.script);
+  const [managed, specRunnable] = await Promise.all([
+    loadManagedChecks(),
+    probeSpecsFromPool(specPaths),
+  ]);
 
-  const drift = computeDrift(manifest.monitors, managed, knownFlows);
+  const drift = computeDrift(manifest.monitors, managed, specRunnable);
   await persistDrift(drift);
+
+  const runnableCount = [...specRunnable.values()].filter((p) => p.runnable).length;
+  console.log(
+    `[reconcile] spec probe+warm: ${runnableCount}/${specPaths.length} runnable (fetchable+compilable)`,
+  );
+  for (const [path, probe] of specRunnable) {
+    if (!probe.runnable) console.log(`[reconcile]   NOT runnable: ${path} — ${probe.reason}`);
+  }
 
   const byType = (t: string): number => drift.filter((d) => d.drift_type === t).length;
   console.log(
@@ -75,15 +89,8 @@ async function main(): Promise<void> {
     console.log(`[reconcile]   ${d.drift_type.padEnd(7)} ${d.source_key} ${JSON.stringify(d.detail)}`);
   }
   // REPORT-ONLY for drift: nothing is applied to `checks`. Apply lands in a later PR.
-
-  // ★ Option C (slice 5): WARM the spec cache for every manifest spec, so a check's first
-  // fetch-path run is a 304/cache hit (and a GitHub blip can't dark out monitors en masse on
-  // the all-at-once flip). Best-effort; never fails the reconcile.
-  const specPaths = manifest.monitors.map((m) => m.script);
-  const warm = await warmSpecCache(specPaths);
-  console.log(
-    `[reconcile] spec_cache warm: ${warm.warmed} ok, ${warm.failed} failed (of ${specPaths.length} spec(s))`,
-  );
+  // (The spec probe above ALSO warmed spec_cache — slice 5's separate warm pass is now folded
+  // into the probe, since both need the same fetch+compile of each manifest spec.)
 }
 
 main()

@@ -13,7 +13,14 @@ import {
   SEED_ONLY_COLUMNS,
   type Monitor,
   type ManagedCheck,
+  type SpecRunnability,
 } from './reconcile.js';
+
+// Option C (slice 6): orphan now keys on per-spec runnability (fetchable+compilable), not baked
+// modules. The monitor()'s script is the default-runnable spec; helpers build the probe map.
+const SPEC = 'monitors/wegmans/search-product.spec.ts';
+const runnable = (...specPaths: string[]): SpecRunnability =>
+  new Map(specPaths.map((p) => [p, { runnable: true }]));
 
 // A representative valid manifest (mirrors the real synthwatch-monitors manifest.json).
 const VALID = {
@@ -100,26 +107,22 @@ const managed = (over: Partial<ManagedCheck> = {}): ManagedCheck => ({
   ...over,
 });
 
-test('drift NEW: a manifest id with no managed check (plus ORPHAN if no flow module)', () => {
-  const rows = computeDrift([monitor()], [], new Set()); // empty knownFlows
+test('drift NEW + ORPHAN when the spec is not runnable (not fetchable/compilable)', () => {
+  const rows = computeDrift([monitor()], [], new Map()); // no probe -> orphan
   const types = rows.map((r) => r.drift_type).sort();
   assert.deepEqual(types, ['new', 'orphan']);
 });
 
-test('drift NEW but NOT orphan when the flow module exists', () => {
-  const rows = computeDrift([monitor()], [], new Set(['search-product']));
+test('★ slice 6: a fetchable+compilable spec is NOT orphan (Option C runnable)', () => {
+  const rows = computeDrift([monitor()], [], runnable(SPEC));
   assert.deepEqual(
     rows.map((r) => r.drift_type),
-    ['new'],
+    ['new'], // new only — the spec runs via Option C, so NOT orphan
   );
 });
 
 test('drift CHANGED only on Git-authoritative fields (name)', () => {
-  const rows = computeDrift(
-    [monitor({ name: 'New name' })],
-    [managed({ name: 'Old name' })],
-    new Set(['search-product']),
-  );
+  const rows = computeDrift([monitor({ name: 'New name' })], [managed({ name: 'Old name' })], runnable(SPEC));
   assert.deepEqual(
     rows.map((r) => r.drift_type),
     ['changed'],
@@ -134,13 +137,13 @@ test('drift does NOT flag CHANGED for seed/dashboard-owned fields (interval/enab
   const rows = computeDrift(
     [monitor({ suggestedIntervalSeconds: 60, enabledByDefault: true })],
     [managed()], // identical Git-authoritative fields
-    new Set(['search-product']),
+    runnable(SPEC),
   );
   assert.deepEqual(rows, []); // no drift at all
 });
 
 test('drift MISSING: a managed check whose id left the manifest (would soft-disable)', () => {
-  const rows = computeDrift([], [managed({ source_key: 'gone-monitor' })], new Set());
+  const rows = computeDrift([], [managed({ source_key: 'gone-monitor' })], new Map());
   assert.deepEqual(
     rows.map((r) => r.drift_type),
     ['missing'],
@@ -149,9 +152,27 @@ test('drift MISSING: a managed check whose id left the manifest (would soft-disa
   assert.match(String(rows[0].detail.action), /never hard-delete/);
 });
 
-test('drift ORPHAN: flow_name has no compiled runner module', () => {
-  const rows = computeDrift([monitor()], [managed()], new Set(['homepage-load']));
-  assert.ok(rows.some((r) => r.drift_type === 'orphan'));
+test('★ slice 6: ORPHAN when the spec 404s (Git declares a spec whose file is missing)', () => {
+  const rows = computeDrift(
+    [monitor()],
+    [managed()],
+    new Map([[SPEC, { runnable: false, reason: 'not fetchable: spec fetch failed: 404 Not Found' }]]),
+  );
+  const orphan = rows.find((r) => r.drift_type === 'orphan');
+  assert.ok(orphan, 'a 404 spec is orphan');
+  assert.equal(orphan!.detail.spec_path, SPEC);
+  assert.match(String(orphan!.detail.reason), /not fetchable/);
+});
+
+test('★ slice 6: ORPHAN when the spec will not compile', () => {
+  const rows = computeDrift(
+    [monitor()],
+    [managed()],
+    new Map([[SPEC, { runnable: false, reason: "won't compile: esbuild parse error" }]]),
+  );
+  const orphan = rows.find((r) => r.drift_type === 'orphan');
+  assert.ok(orphan);
+  assert.match(String(orphan!.detail.reason), /won't compile/);
 });
 
 // --- buildApplyUpsert (the GATED field-split apply — the crux) ---------------
