@@ -118,10 +118,21 @@ CREATE TABLE checks (
     -- browser run; RCA reads this as the visual-diff baseline. NULL = none yet.
     baseline_screenshot_url TEXT,
 
+    -- Monitors-as-code identity (mirrors 0030_source_key.sql). Binds this row to a
+    -- synthwatch-monitors manifest `id`. NULL => dashboard/seed-created (reconcile
+    -- ignores it); NOT NULL => Git-managed. NOT the same as flow_name (manifest id
+    -- 'wegmans-search-product' vs runner flow 'wegmans-search'). The partial unique
+    -- index is created below (a NULL-tolerant uniqueness).
+    source_key         TEXT,
+
     -- A browser check is meaningless without a flow to run.
     CONSTRAINT browser_needs_flow
         CHECK (kind <> 'browser' OR flow_name IS NOT NULL)
 );
+
+-- One live check per manifest id; the many unmanaged (NULL) rows don't collide.
+CREATE UNIQUE INDEX IF NOT EXISTS checks_source_key_uniq
+    ON checks (source_key) WHERE source_key IS NOT NULL;
 
 -- ---------------------------------------------------------------------------
 -- check_locations: per-(check, location) cadence cursor (mirrors 0019).
@@ -430,6 +441,21 @@ CREATE TABLE flow_manifest (
     description    TEXT,
     entry_url_hint TEXT,
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ---------------------------------------------------------------------------
+-- reconcile_drift: monitors-as-code drift surface (mirrors 0031_reconcile_drift.sql).
+-- The reconcile job compares synthwatch-monitors' manifest.json to live `checks`
+-- READ-ONLY and writes what differs here (new/changed/missing/orphan). One row per
+-- (source_key, drift_type); each run upserts the current set and deletes stale rows.
+-- ---------------------------------------------------------------------------
+CREATE TABLE reconcile_drift (
+    source_key  text        NOT NULL,
+    drift_type  text        NOT NULL
+                            CHECK (drift_type IN ('new', 'changed', 'missing', 'orphan')),
+    detail      jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    detected_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (source_key, drift_type)
 );
 
 -- ---------------------------------------------------------------------------
