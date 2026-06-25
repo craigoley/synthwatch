@@ -307,6 +307,13 @@ CREATE UNIQUE INDEX one_open_incident_per_check
     ON incidents (check_id)
     WHERE status = 'open';
 
+-- Backs the GET /api/incidents keyset cursor (opened_at DESC, id DESC) — index range
+-- scan instead of full-scan-and-sort (mirrors 0032_incidents_opened_idx.sql). Column
+-- order MUST match the cursor's ORDER BY exactly. On a live DB the migration builds this
+-- CONCURRENTLY; here (fresh, empty table) a plain CREATE INDEX is instant.
+CREATE INDEX IF NOT EXISTS incidents_opened_idx
+    ON incidents (opened_at DESC, id DESC);
+
 -- ---------------------------------------------------------------------------
 -- maintenance_windows: planned downtime (mirrors db/migrations/0004). A window
 -- both SUPPRESSES incident alerting (evaluate.ts) and EXCLUDES the period from
