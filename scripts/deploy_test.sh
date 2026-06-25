@@ -157,6 +157,74 @@ assert_abort   "drop ignores --yes ('' aborts)"    confirm_drop <<< ""
 assert_proceed "drop still needs 'yes' under --yes" confirm_drop <<< "yes"
 ASSUME_YES=0
 
+# ===========================================================================
+# D. BUG 1 — runner/migrate pinned to ONE SHA present in BOTH repos (newest_common_sha).
+# ===========================================================================
+expect_eq() {
+  local name="$1" want="$2" got="$3"
+  if [[ "${got}" == "${want}" ]]; then green "PASS  ${name} (${got:-<empty>})"; else
+    red "FAIL  ${name} — want '${want}', got '${got}'"; FAILS=$((FAILS + 1)); fi
+}
+RUNNER_TAGS=$'aaa1111111111111111111111111111111111111\nbbb2222222222222222222222222222222222222\nccc3333333333333333333333333333333333333'
+# Migrate is one build behind (missing the newest runner tag aaa…): pick the newest COMMON (bbb…).
+MIGRATE_TAGS=$'bbb2222222222222222222222222222222222222\nccc3333333333333333333333333333333333333'
+expect_eq "common-sha skips runner-only newest" "bbb2222222222222222222222222222222222222" \
+  "$(newest_common_sha "${RUNNER_TAGS}" "${MIGRATE_TAGS}")"
+# Both repos current -> the newest tag is common.
+expect_eq "common-sha both-current picks newest" "aaa1111111111111111111111111111111111111" \
+  "$(newest_common_sha "${RUNNER_TAGS}" "${RUNNER_TAGS}")"
+# No overlap -> empty (deploy.sh fails hard on this).
+expect_eq "common-sha no-overlap is empty" "" \
+  "$(newest_common_sha 'aaa1111111111111111111111111111111111111' 'zzz9999999999999999999999999999999999999')"
+# Both bicep params derive from the ONE resolved SHA -> identical :SHA suffix (never split).
+RUNNER_IMG="reg.io/synthwatch-runner:bbb2222222222222222222222222222222222222"
+MIGRATE_IMG="reg.io/synthwatch-migrate:bbb2222222222222222222222222222222222222"
+expect_eq "runner+migrate share one SHA" "${RUNNER_IMG##*:}" "${MIGRATE_IMG##*:}"
+
+# ===========================================================================
+# E. BUG 2 — verify catches a stale MIGRATE job image (the bug that bit today), not just runner.
+# ===========================================================================
+expect_mismatch() {
+  local name="$1" want="$2" map="$3" got
+  got="$(printf '%s' "${map}" | image_mismatches "reg.io/synthwatch-runner:NEW" "reg.io/synthwatch-migrate:NEW" | tr '\n' ',' | sed 's/,$//')"
+  if [[ "${got}" == "${want}" ]]; then green "PASS  ${name} (${got:-none})"; else
+    red "FAIL  ${name} — want '${want}', got '${got}'"; FAILS=$((FAILS + 1)); fi
+}
+# All jobs on the new image -> no mismatch.
+expect_mismatch "all-on-new -> clean" "" \
+  $'synthwatch-runner-job\treg.io/synthwatch-runner:NEW\nsynthwatch-migrate-job\treg.io/synthwatch-migrate:NEW'
+# ★ The exact bug: migrate job stuck on the OLD image while the runner job rolled -> FLAGGED.
+expect_mismatch "stale migrate job -> flagged" "synthwatch-migrate-job" \
+  $'synthwatch-runner-job\treg.io/synthwatch-runner:NEW\nsynthwatch-migrate-job\treg.io/synthwatch-migrate:OLD'
+# A stale runner-family job is flagged too.
+expect_mismatch "stale narrative job -> flagged" "synthwatch-narrative-job" \
+  $'synthwatch-runner-job\treg.io/synthwatch-runner:NEW\nsynthwatch-narrative-job\treg.io/synthwatch-runner:OLD'
+# An absent/unreadable job (empty image) is a failure, not a pass.
+expect_mismatch "absent job -> flagged" "synthwatch-reconcile-job" \
+  $'synthwatch-reconcile-job\t'
+
+# ===========================================================================
+# F. BUG 3 — migration detection over the deploy's git-diff range (migrations_in_diff).
+# ===========================================================================
+expect_migs() {
+  local name="$1" want="$2" diff="$3" got
+  got="$(printf '%s' "${diff}" | migrations_in_diff | tr '\n' ',' | sed 's/,$//')"
+  if [[ "${got}" == "${want}" ]]; then green "PASS  ${name} (${got:-none})"; else
+    red "FAIL  ${name} — want '${want}', got '${got}'"; FAILS=$((FAILS + 1)); fi
+}
+# A shipped migration is detected -> the deploy auto-runs the migrate job (today's 0032 case).
+expect_migs "detects shipped migration" "0032_incidents_opened_idx" \
+  $'db/migrations/0032_incidents_opened_idx.sql\nrunner/index.ts\ninfra/main.bicep'
+# Multiple migrations both detected.
+expect_migs "detects multiple migrations" "0033_a,0034_b" \
+  $'db/migrations/0033_a.sql\ndb/migrations/0034_b.sql'
+# No migration in range -> empty -> migrate job not run (no needless state change).
+expect_migs "no migration -> empty" "" \
+  $'runner/index.ts\ninfra/main.bicep\nscripts/deploy.sh'
+# db/ changes that are NOT migrations (e.g. schema.sql, seed.sql) don't trigger the migrate job.
+expect_migs "db non-migration -> empty" "" \
+  $'db/schema.sql\ndb/seed.sql'
+
 echo
 if [[ "${FAILS}" -eq 0 ]]; then
   green "ALL TESTS PASSED"
