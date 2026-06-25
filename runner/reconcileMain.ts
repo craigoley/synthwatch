@@ -11,10 +11,11 @@ import {
   fetchManifest,
   computeDrift,
   manifestUrl,
+  type Monitor,
   type ManagedCheck,
   type DriftRow,
 } from './reconcile.js';
-import { probeSpecsFromPool } from './specfetch/specCache.js';
+import { probeSpecsFromPool, type SpecProbe } from './specfetch/specCache.js';
 
 /** Read the Git-managed checks (source_key set). Unmanaged rows are intentionally excluded. */
 async function loadManagedChecks(): Promise<ManagedCheck[]> {
@@ -53,6 +54,52 @@ async function persistDrift(rows: DriftRow[]): Promise<void> {
   }
 }
 
+/**
+ * Replace the spec-catalog snapshot with the current manifest, atomically (full reload, same
+ * pattern as persistDrift). One row per manifest monitor — the manifest's suggested defaults plus
+ * the runnability probe already computed this pass (no re-probe). This is the read-only inventory
+ * the API serves at GET /api/specs; it is NEVER applied to `checks`.
+ */
+async function persistSpecCatalog(
+  monitors: Monitor[],
+  probes: Map<string, SpecProbe>,
+): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('DELETE FROM spec_catalog');
+    for (const m of monitors) {
+      const probe = probes.get(m.script);
+      await client.query(
+        `INSERT INTO spec_catalog
+           (source_key, name, spec_path, kind, target, suggested_interval_seconds,
+            tags, description, enabled_by_default, runnable, not_runnable_reason, probed_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, now())`,
+        [
+          m.id,
+          m.name,
+          m.script,
+          m.kind,
+          m.target ?? null,
+          m.suggestedIntervalSeconds ?? null,
+          JSON.stringify(m.tags ?? []),
+          m.description ?? null,
+          m.enabledByDefault ?? false,
+          probe?.runnable ?? false,
+          // not runnable (or never probed) -> a reason; runnable -> null
+          probe?.runnable ? null : (probe?.reason ?? 'spec not probed'),
+        ],
+      );
+    }
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 async function main(): Promise<void> {
   const url = manifestUrl();
   console.log(`[reconcile] fetching manifest: ${url}`);
@@ -71,10 +118,15 @@ async function main(): Promise<void> {
   const drift = computeDrift(manifest.monitors, managed, specRunnable);
   await persistDrift(drift);
 
+  // Snapshot the full manifest (every spec + its probe result) for the read-only catalog
+  // (GET /api/specs). Reuses the probe just computed — no second fetch/compile.
+  await persistSpecCatalog(manifest.monitors, specRunnable);
+
   const runnableCount = [...specRunnable.values()].filter((p) => p.runnable).length;
   console.log(
     `[reconcile] spec probe+warm: ${runnableCount}/${specPaths.length} runnable (fetchable+compilable)`,
   );
+  console.log(`[reconcile] spec_catalog: wrote ${manifest.monitors.length} spec row(s) (full reload)`);
   for (const [path, probe] of specRunnable) {
     if (!probe.runnable) console.log(`[reconcile]   NOT runnable: ${path} — ${probe.reason}`);
   }
