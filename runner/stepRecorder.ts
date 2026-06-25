@@ -33,6 +33,29 @@ export interface FlowContext {
   expect: (condition: unknown, message: string) => void;
 }
 
+/** One recorded funnel step. The persisted shape of a run_steps row. */
+export interface RecordedStep {
+  runId: number;
+  index: number;
+  name: string;
+  status: 'pass' | 'fail' | 'error';
+  durationMs: number;
+  errorMessage: string | null;
+}
+
+/** Where a recorded step goes. Default writes run_steps; tests inject an in-memory sink. */
+export type StepSink = (step: RecordedStep) => Promise<void>;
+
+/** Production sink: the run_steps INSERT (unchanged behaviour). */
+const poolSink: StepSink = (s) =>
+  pool
+    .query(
+      `INSERT INTO run_steps (run_id, step_index, name, status, duration_ms, error_message)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [s.runId, s.index, s.name, s.status, s.durationMs, s.errorMessage],
+    )
+    .then(() => undefined);
+
 export class StepRecorder {
   private stepIndex = 0;
 
@@ -44,6 +67,8 @@ export class StepRecorder {
     private readonly page: Page,
     /** The check's target_url, exposed to flows for navigation. */
     public readonly baseUrl: string,
+    /** Sink for recorded steps. Defaults to the run_steps INSERT; tests override it. */
+    private readonly sink: StepSink = poolSink,
   ) {}
 
   /**
@@ -86,10 +111,6 @@ export class StepRecorder {
     durationMs: number,
     errorMessage: string | null,
   ): Promise<void> {
-    await pool.query(
-      `INSERT INTO run_steps (run_id, step_index, name, status, duration_ms, error_message)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [this.runId, index, name, status, durationMs, errorMessage],
-    );
+    await this.sink({ runId: this.runId, index, name, status, durationMs, errorMessage });
   }
 }
