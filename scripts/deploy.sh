@@ -22,6 +22,8 @@
 #   scripts/deploy.sh --yes | -y      # non-interactive: skip the benign HEAD-mismatch prompt.
 #                                     #   ★ Does NOT skip a what-if DROP halt — a drop always stops.
 #   scripts/deploy.sh --sha <sha>     # override the image SHA (skip the HEAD/registry check)
+#   scripts/deploy.sh --post-reconcile # after deploy+verify: trigger the reconcile job, WAIT,
+#                                     #   then print spec_catalog + reconcile_drift (no manual sleep).
 #   scripts/deploy.sh --help
 #
 # Requires: az (logged in), jq, git, curl; psql for the DB check (provided via ~/.synthwatch.env PATH).
@@ -62,6 +64,7 @@ readonly TEMPLATE="${ROOT}/infra/main.bicep"
 
 WHATIF_ONLY=0
 ASSUME_YES=0
+POST_RECONCILE=0
 SHA_OVERRIDE=''
 
 # Pure, testable helpers (path classifier + the confirmation gates). Shared with deploy_test.sh.
@@ -87,7 +90,7 @@ c_bold()  { printf '\033[1m%s\033[0m\n' "$*"; }
 fail() { c_red "ERROR: $*" >&2; exit 1; }
 
 usage() {
-  sed -n '3,28p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '3,30p' "$0" | sed 's/^# \{0,1\}//'
   exit 0
 }
 
@@ -98,6 +101,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --what-if-only) WHATIF_ONLY=1; shift ;;
     --yes|-y) ASSUME_YES=1; shift ;;
+    --post-reconcile) POST_RECONCILE=1; shift ;;
     --sha) [[ $# -ge 2 ]] || fail "--sha needs a value"; SHA_OVERRIDE="$2"; shift 2 ;;
     --help|-h) usage ;;
     *) fail "unknown arg: $1 (try --help)" ;;
@@ -448,28 +452,63 @@ start_and_wait_migrate() {
   return 1
 }
 
-# handle_migrations <prev_sha> <new_sha>: detect migrations shipped in the deploy range and,
-# if any, auto-run the migrate job. Sets EXPECTED_MIGRATIONS so verify confirms they landed.
+# The migration "versions" present on disk (db/migrations/*.sql basenames, no .sql).
+migration_versions_on_disk() {
+  local f
+  for f in "${ROOT}"/db/migrations/*.sql; do
+    [[ -e "${f}" ]] || continue
+    f="${f##*/}"
+    echo "${f%.sql}"
+  done
+}
+
+# run_unapplied_via_schema_migrations: FIX 1 fallback. Git-independent — query schema_migrations
+# for the applied set, diff against the migration files on disk (unapplied_versions), and run the
+# (idempotent) migrate job if any file is unapplied. Used when the git range can't decide.
+run_unapplied_via_schema_migrations() {
+  local applied present unapplied
+  applied="$(psql "${DATABASE_URL:-}" -tA -c 'SELECT version FROM schema_migrations' 2>/dev/null || true)"
+  present="$(migration_versions_on_disk)"
+  unapplied="$(printf '%s' "${present}" | unapplied_versions "${applied}")"
+  if [[ -z "${unapplied}" ]]; then
+    c_green "  schema_migrations: every on-disk migration is already applied — migrate job not needed."
+    return
+  fi
+  EXPECTED_MIGRATIONS="${unapplied}"
+  c_bold "  unapplied migration(s) per schema_migrations: $(printf '%s' "${unapplied}" | tr '\n' ' ')"
+  start_and_wait_migrate || c_red "  migrate job did not succeed — migrations may NOT be applied (verify will flag)."
+}
+
+# handle_migrations <prev_sha> <new_sha>: auto-detect + run shipped migrations.
+#  FAST PATH — a RESOLVABLE, NON-DEGENERATE git range: detect via git diff (cheap, precise).
+#  ★ FIX 1 — when the range is DEGENERATE (prev==new) or UNRESOLVABLE (failed pull / shallow /
+#  diverged), git can't tell us what shipped, so fall back to a GIT-INDEPENDENT check against
+#  schema_migrations (run_unapplied_via_schema_migrations). A live deploy hit the degenerate
+#  SHA..SHA case and got a "apply manually" warning — defeating the auto-apply exactly when git
+#  state was confused. Now it auto-applies regardless (migrate.sh is idempotent, so safe).
+# Sets EXPECTED_MIGRATIONS so verify confirms they landed.
 handle_migrations() {
   local prev="$1" new="$2" migs
   c_bold "Migration handling…"
-  if [[ -z "${prev}" ]] \
-     || ! git rev-parse -q --verify "${prev}^{commit}" >/dev/null 2>&1 \
-     || ! git rev-parse -q --verify "${new}^{commit}" >/dev/null 2>&1; then
-    # UNRESOLVABLE range -> fall back to option (b): warn, don't silently skip.
-    c_yellow "  WARN: can't resolve the deploy range (${prev:0:12}..${new:0:12}) in local git."
-    c_yellow "        If this deploy shipped a migration, apply it manually:"
-    c_yellow "          az containerapp job start -n ${MIGRATE_JOB} -g ${RG}"
-    return
-  fi
-  migs="$(git diff --name-only "${prev}" "${new}" 2>/dev/null | migrations_in_diff)"
-  if [[ -z "${migs}" ]]; then
+
+  if [[ -n "${prev}" && "${prev}" != "${new}" ]] \
+     && git rev-parse -q --verify "${prev}^{commit}" >/dev/null 2>&1 \
+     && git rev-parse -q --verify "${new}^{commit}" >/dev/null 2>&1; then
+    # Fast path: a real, resolvable range.
+    migs="$(git diff --name-only "${prev}" "${new}" 2>/dev/null | migrations_in_diff)"
+    if [[ -n "${migs}" ]]; then
+      EXPECTED_MIGRATIONS="${migs}"
+      c_bold "  deploy shipped migration(s) [git range]: $(printf '%s' "${migs}" | tr '\n' ' ')"
+      start_and_wait_migrate || c_red "  migrate job did not succeed — migrations may NOT be applied (verify will flag)."
+      return
+    fi
     c_green "  no new migrations in ${prev:0:12}..${new:0:12} — migrate job not needed."
     return
   fi
-  EXPECTED_MIGRATIONS="${migs}"
-  c_bold "  deploy shipped migration(s): $(printf '%s' "${migs}" | tr '\n' ' ')"
-  start_and_wait_migrate || c_red "  migrate job did not succeed — migrations may NOT be applied (verify will flag)."
+
+  # ★ FIX 1: degenerate (prev==new) or unresolvable range -> git-independent schema_migrations check.
+  c_yellow "  deploy range degenerate/unresolvable (${prev:0:12}..${new:0:12}) — checking schema_migrations directly…"
+  run_unapplied_via_schema_migrations
 }
 
 # ---------------------------------------------------------------------------
@@ -514,9 +553,18 @@ main() {
 
   do_deploy
   echo
-  handle_migrations "${prev_sha}" "${SHA}"   # BUG 3: auto-run the migrate job if one shipped
+  handle_migrations "${prev_sha}" "${SHA}"   # BUG 3 + FIX 1: auto-run the migrate job if one shipped
   echo
   verify                                       # BUG 2: every job's image; + migration-applied
+
+  # ★ FIX 2: --post-reconcile — trigger the reconcile job, wait, print the post-deploy state
+  # (spec_catalog + reconcile_drift) so the operator sees it without manually sleeping/re-querying.
+  if [[ "${POST_RECONCILE}" -eq 1 ]]; then
+    echo
+    c_bold "Post-reconcile (--post-reconcile)…"
+    post_reconcile || c_red "post-reconcile reported a problem (see above)."
+  fi
+
   exit "$(( VERIFY_FAILS > 0 ? 1 : 0 ))"
 }
 
