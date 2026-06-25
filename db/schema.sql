@@ -560,6 +560,30 @@ CREATE TABLE access_requests (
 CREATE INDEX access_requests_email_requested_idx ON access_requests (email, requested_at);
 
 -- ---------------------------------------------------------------------------
+-- audit_log: the API's append-only audit trail (mirrors 0038_audit_log.sql, Phase 12 slice 2).
+-- Logically API-owned (the AuthorizationMiddleware writes it on every authorized mutation, with
+-- secrets redacted). ★ APPEND-ONLY: the API role is granted INSERT/SELECT and REVOKEd UPDATE/DELETE
+-- (applied via the migration / ops, not this snapshot) so history can't be rewritten by the app.
+-- ---------------------------------------------------------------------------
+CREATE TABLE audit_log (
+    id           BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    ts           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    actor_email  TEXT,
+    actor_ip     TEXT,
+    action       TEXT,                  -- create | update | delete (from the HTTP verb)
+    target_type  TEXT,
+    target_id    TEXT,
+    http_method  TEXT,
+    http_path    TEXT,
+    status_code  INTEGER,
+    success      BOOLEAN,
+    before_json  JSONB,                 -- REDACTED snapshot before the change
+    after_json   JSONB,                 -- REDACTED snapshot after the change
+    note         TEXT
+);
+CREATE INDEX audit_log_ts_idx ON audit_log (ts DESC);
+
+-- ---------------------------------------------------------------------------
 -- schema_migrations: tracks which db/migrations/*.sql files have been applied
 -- (version = filename without ".sql"). Owned by the migration runner
 -- (db/migrate.sh), which also creates it IF NOT EXISTS.
