@@ -12,9 +12,15 @@
 #
 # This is a LOCAL helper Craig runs — not CD/automation. Scope: this script only.
 #
+# The newest-image≠HEAD check is SMART: if HEAD's commits since the newest image touch only
+# infra/docs/scripts (no runner build expected), it PROCEEDS silently; it only prompts when
+# HEAD touches runner code (CI may still be building) or an unclassifiable path (conservative).
+#
 # Usage:
 #   scripts/deploy.sh                 # pick SHA, what-if (auto-proceed if clean / prompt on drop), deploy, verify
 #   scripts/deploy.sh --what-if-only  # steps 1-4 only: show the classified diff, then stop
+#   scripts/deploy.sh --yes | -y      # non-interactive: skip the benign HEAD-mismatch prompt.
+#                                     #   ★ Does NOT skip a what-if DROP halt — a drop always stops.
 #   scripts/deploy.sh --sha <sha>     # override the image SHA (skip the HEAD/registry check)
 #   scripts/deploy.sh --help
 #
@@ -47,7 +53,13 @@ readonly ROOT
 readonly TEMPLATE="${ROOT}/infra/main.bicep"
 
 WHATIF_ONLY=0
+ASSUME_YES=0
 SHA_OVERRIDE=''
+
+# Pure, testable helpers (path classifier + the confirmation gates). Shared with deploy_test.sh.
+[[ -f "${ROOT}/scripts/lib/deploy-lib.sh" ]] || { echo "missing scripts/lib/deploy-lib.sh" >&2; exit 1; }
+# shellcheck source=scripts/lib/deploy-lib.sh disable=SC1091
+source "${ROOT}/scripts/lib/deploy-lib.sh"
 
 # A temp file for the what-if JSON; cleaned up on exit. (@secure params are redacted by
 # what-if, so this file never contains PG_PW/ACS_CONN — verified — but we still scope it tight.)
@@ -67,7 +79,7 @@ c_bold()  { printf '\033[1m%s\033[0m\n' "$*"; }
 fail() { c_red "ERROR: $*" >&2; exit 1; }
 
 usage() {
-  sed -n '3,33p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '3,28p' "$0" | sed 's/^# \{0,1\}//'
   exit 0
 }
 
@@ -77,6 +89,7 @@ usage() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --what-if-only) WHATIF_ONLY=1; shift ;;
+    --yes|-y) ASSUME_YES=1; shift ;;
     --sha) [[ $# -ge 2 ]] || fail "--sha needs a value"; SHA_OVERRIDE="$2"; shift 2 ;;
     --help|-h) usage ;;
     *) fail "unknown arg: $1 (try --help)" ;;
@@ -101,9 +114,24 @@ az account show >/dev/null 2>&1 || fail "az not logged in (run: az login)"
 # 2. Pick the image SHA.
 #    The newest SHA-tagged runner image from the registry, time-desc. NOTE: --top 1 returns
 #    the floating `latest` tag, so we filter to 40-hex commit tags and take the newest.
-#    Then compare to main HEAD: if they differ (CI hasn't built HEAD yet — e.g. an infra-only
-#    commit CI path-filters out), WARN and let the user decide. runner+migrate share the SHA.
+#    Then reconcile with main HEAD — but SMARTLY (see mismatch_verdict): an infra/docs-only
+#    HEAD legitimately has no new image and PROCEEDS silently; only a runner-code mismatch
+#    (or one we can't classify) prompts. runner+migrate share the SHA.
 # ---------------------------------------------------------------------------
+
+# mismatch_verdict <image_sha> <head_sha> -> "benign" | "prompt" | "unresolved".
+#   benign     — HEAD's diff vs the image touches only non-image-producing paths.
+#   prompt     — diff touches runner code, or an unclassifiable path (conservative).
+#   unresolved — the image SHA isn't a resolvable ancestor of HEAD (diverged / force-push /
+#                shallow clone) or git diff failed; we can't reason, so fall back to prompting.
+mismatch_verdict() {
+  local img="$1" head="$2" changed
+  git rev-parse -q --verify "${img}^{commit}" >/dev/null 2>&1 || { echo "unresolved"; return; }
+  git merge-base --is-ancestor "${img}" "${head}" 2>/dev/null || { echo "unresolved"; return; }
+  changed="$(git diff --name-only "${img}" "${head}" 2>/dev/null)" || { echo "unresolved"; return; }
+  printf '%s\n' "${changed}" | classify_paths
+}
+
 pick_sha() {
   if [[ -n "${SHA_OVERRIDE}" ]]; then
     c_yellow "Using --sha override: ${SHA_OVERRIDE}" >&2
@@ -121,14 +149,27 @@ pick_sha() {
   if [[ "${newest}" == "${head}" ]]; then
     c_green "Newest image == main HEAD (${newest:0:12}) — building from the current commit." >&2
   else
-    c_yellow "WARN: newest image ${newest:0:12} is NOT main HEAD ${head:0:12}." >&2
-    c_yellow "      CI may still be building HEAD, or HEAD is an infra/docs-only commit CI skips." >&2
-    if [[ "${WHATIF_ONLY}" -eq 1 ]]; then
-      c_yellow "      (--what-if-only: proceeding against the existing image ${newest:0:12}.)" >&2
+    local verdict; verdict="$(mismatch_verdict "${newest}" "${head}")"
+    if [[ "${verdict}" == "benign" ]]; then
+      # EXPECTED: HEAD didn't change runner code, so CI built no new image. Proceed silently.
+      c_green "INFO: HEAD (${head:0:12}) is infra/docs-only since the newest image (${newest:0:12});" >&2
+      c_green "      deploying ${newest:0:12} — this is normal for an infra/config deploy." >&2
     else
-      printf '      Deploy the existing image %s? [y/N] ' "${newest:0:12}" >&2
-      local ans; read -r ans
-      [[ "${ans}" == "y" || "${ans}" == "Y" ]] || fail "aborted — no image for HEAD yet."
+      # AMBIGUOUS (runner code changed / unclassifiable) or UNRESOLVED — a human should decide.
+      if [[ "${verdict}" == "unresolved" ]]; then
+        c_yellow "WARN: newest image ${newest:0:12} is NOT main HEAD ${head:0:12}, and I can't classify" >&2
+        c_yellow "      why (image SHA not an ancestor of HEAD? diverged / shallow clone)." >&2
+      else
+        c_yellow "WARN: newest image ${newest:0:12} is NOT main HEAD ${head:0:12}, and HEAD touches runner" >&2
+        c_yellow "      code since that image — CI may still be building, or a build failed." >&2
+      fi
+      if [[ "${WHATIF_ONLY}" -eq 1 ]]; then
+        c_yellow "      (--what-if-only: proceeding against the existing image ${newest:0:12}.)" >&2
+      elif [[ "${ASSUME_YES}" -eq 1 ]]; then
+        c_yellow "      (--yes: proceeding against the existing image ${newest:0:12}.)" >&2
+      else
+        confirm_head_mismatch || fail "aborted — no image for HEAD yet."
+      fi
     fi
   fi
 
@@ -339,10 +380,9 @@ main() {
 
   if [[ -n "${HALTS}" ]]; then
     echo
-    c_yellow "A drop was flagged above. Review it. To deploy anyway, type 'yes':"
-    printf '  > '
-    local ans; read -r ans
-    [[ "${ans}" == "yes" ]] || fail "aborted — drop not confirmed."
+    c_yellow "A drop was flagged above. Review it carefully."
+    # ★ confirm_drop ignores --yes by design: a drop is NEVER auto-proceeded.
+    confirm_drop || fail "aborted — drop not confirmed."
   else
     c_green "Clean what-if — proceeding to deploy."
   fi

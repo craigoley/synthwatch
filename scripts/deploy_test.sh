@@ -15,10 +15,15 @@ set -euo pipefail
 ROOT="$(git rev-parse --show-toplevel)"
 readonly CLASSIFIER="${ROOT}/scripts/lib/whatif-halts.jq"
 readonly SAMPLE="${ROOT}/scripts/testdata/whatif-sample.json"
+readonly LIB="${ROOT}/scripts/lib/deploy-lib.sh"
 readonly RUNNER_SEL='.resourceId|test("synthwatch-runner-job$")'
 
 [[ -f "${CLASSIFIER}" ]] || { echo "missing ${CLASSIFIER}" >&2; exit 1; }
 [[ -f "${SAMPLE}" ]] || { echo "missing ${SAMPLE}" >&2; exit 1; }
+[[ -f "${LIB}" ]] || { echo "missing ${LIB}" >&2; exit 1; }
+# Source the SAME helpers deploy.sh uses (classify_paths + the confirmation gates).
+# shellcheck source=scripts/lib/deploy-lib.sh disable=SC1091
+source "${LIB}"
 
 FAILS=0
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -93,6 +98,64 @@ mut="$(printf '%s' "${SAMPLE_JSON}" | jq "
   (.changes[] | select(${RUNNER_SEL}) | .delta) +=
   [{\"path\":\"properties.template.scale\",\"propertyChangeType\":\"Delete\",\"children\":null}]")"
 expect_clean "benign-nonenv-delete-not-a-drop" "${mut}"
+
+# ===========================================================================
+# B. SMART HEAD-vs-image path classification (classify_paths). Fixtures are
+#    captured `git diff --name-only <image-sha> HEAD` outputs (lists of paths).
+#    "benign" => proceed silently; "prompt" => ask a human.
+# ===========================================================================
+# expect_verdict <name> <expected> <newline-separated-paths>
+expect_verdict() {
+  local name="$1" want="$2" got
+  got="$(printf '%s' "$3" | classify_paths)"
+  if [[ "${got}" == "${want}" ]]; then
+    green "PASS  ${name} (${got})"
+  else
+    red "FAIL  ${name} — want '${want}', got '${got}'"
+    FAILS=$((FAILS + 1))
+  fi
+}
+
+# (1) infra/docs/scripts-only diff -> benign -> PROCEEDS without prompting (the bug fix).
+expect_verdict "infra-docs-only-benign" "benign" \
+  $'infra/main.bicep\nscripts/deploy.sh\nREADME.md\ndocs/AUTHORING.md'
+# (2) runner code changed, no image for HEAD yet -> prompt (CI may still be building).
+expect_verdict "runner-code-prompts" "prompt" $'runner/index.ts'
+expect_verdict "db-change-prompts" "prompt" $'db/migrations/0030_source_key.sql'
+expect_verdict "root-dockerfile-prompts" "prompt" $'Dockerfile'
+expect_verdict "deploy-workflow-prompts" "prompt" $'.github/workflows/deploy.yml'
+# (3) unclassifiable path -> prompt (CONSERVATIVE — lean to caution).
+expect_verdict "unknown-path-prompts" "prompt" $'some-new-top-level/thing.bin'
+# Mixed (one code path among benign) -> prompt; non-deploy workflow + md -> benign; empty -> benign.
+expect_verdict "mixed-has-code-prompts" "prompt" $'infra/main.bicep\nrunner/db.ts'
+expect_verdict "other-workflow-benign" "benign" $'.github/workflows/eslint.yml'
+expect_verdict "empty-diff-benign" "benign" ''
+
+# ===========================================================================
+# C. --yes semantics + the drop never being auto-proceeded (confirm gates).
+#    confirm_head_mismatch / confirm_drop read stdin; we inject answers and toggle ASSUME_YES.
+# ===========================================================================
+assert_proceed() { local name="$1"; shift; if "$@"; then green "PASS  ${name} (proceed)"; else red "FAIL  ${name} — expected proceed"; FAILS=$((FAILS + 1)); fi; }
+assert_abort()   { local name="$1"; shift; if "$@"; then red "FAIL  ${name} — expected abort"; FAILS=$((FAILS + 1)); else green "PASS  ${name} (abort)"; fi; }
+
+WHATIF_ONLY=0
+
+# (4a) --yes skips the benign HEAD-mismatch prompt (proceeds without reading stdin).
+ASSUME_YES=1; assert_proceed "head-mismatch --yes proceeds" confirm_head_mismatch </dev/null; ASSUME_YES=0
+# (4b) interactive HEAD-mismatch: 'y' proceeds, anything else aborts (default No).
+assert_proceed "head-mismatch 'y' proceeds" confirm_head_mismatch <<< "y"
+assert_abort   "head-mismatch 'n' aborts"   confirm_head_mismatch <<< "n"
+assert_abort   "head-mismatch '' aborts"    confirm_head_mismatch <<< ""
+
+# (4c) ★ the drop gate is NEVER auto-proceeded — typing 'yes' is the ONLY way through,
+#      even with --yes set. This is the core safety guarantee.
+assert_proceed "drop 'yes' proceeds"               confirm_drop <<< "yes"
+assert_abort   "drop 'no' aborts"                  confirm_drop <<< "no"
+ASSUME_YES=1
+assert_abort   "drop ignores --yes ('no' aborts)"  confirm_drop <<< "no"
+assert_abort   "drop ignores --yes ('' aborts)"    confirm_drop <<< ""
+assert_proceed "drop still needs 'yes' under --yes" confirm_drop <<< "yes"
+ASSUME_YES=0
 
 echo
 if [[ "${FAILS}" -eq 0 ]]; then
