@@ -516,6 +516,50 @@ CREATE TABLE spec_catalog (
 );
 
 -- ---------------------------------------------------------------------------
+-- auth identity tables (mirrors 0037_auth.sql, Phase 12 slice 1). Logically API-owned
+-- (only the API reads/writes them); here because the runner owns the schema + migrate
+-- pipeline. Slice 1 is additive — these mint/verify OTP sessions; NOTHING is enforced
+-- until slice 2 adds the API authz gate. GRANTs to "synthwatch-api" are applied via the
+-- migration / ops, not this snapshot (the snapshot has no MI role).
+-- ---------------------------------------------------------------------------
+CREATE TABLE otp_codes (
+    id            BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email         TEXT        NOT NULL,
+    code_hash     TEXT        NOT NULL,          -- sha256(code); the raw code is never stored
+    expires_at    TIMESTAMPTZ NOT NULL,
+    consumed_at   TIMESTAMPTZ,                   -- one-time use
+    attempt_count INTEGER     NOT NULL DEFAULT 0, -- brute-force cap on verify
+    request_ip    TEXT,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX otp_codes_email_created_idx ON otp_codes (email, created_at);
+
+CREATE TABLE sessions (
+    id           BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    token_hash   TEXT        NOT NULL UNIQUE,    -- sha256(opaque bearer); raw token shown once
+    email        TEXT        NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_used_at TIMESTAMPTZ,
+    expires_at   TIMESTAMPTZ NOT NULL,
+    revoked_at   TIMESTAMPTZ,                    -- logout / admin revoke
+    issued_ip    TEXT
+);
+
+CREATE TABLE editors (
+    email    TEXT        PRIMARY KEY,            -- admin-managed allowlist; admins come from ADMIN_EMAILS
+    added_by TEXT        NOT NULL,
+    added_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE access_requests (
+    id           BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email        TEXT        NOT NULL,
+    requested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    request_ip   TEXT
+);
+CREATE INDEX access_requests_email_requested_idx ON access_requests (email, requested_at);
+
+-- ---------------------------------------------------------------------------
 -- schema_migrations: tracks which db/migrations/*.sql files have been applied
 -- (version = filename without ".sql"). Owned by the migration runner
 -- (db/migrate.sh), which also creates it IF NOT EXISTS.
