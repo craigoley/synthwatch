@@ -17,6 +17,7 @@
 // dashboard own DISJOINT fields; the reconcile keeps a strict column allow-list to honor it.
 //
 // IDENTITY: manifest `id` -> checks.source_key (NOT flow_name — they deliberately differ).
+import { assertValidSpecPath } from './specfetch/fetchSpec.js';
 
 /** A monitor entry from synthwatch-monitors' manifest.json (kind is browser-only today). */
 export interface Monitor {
@@ -86,6 +87,21 @@ const FLOW_NAME_RE = /^[a-z0-9-]+$/;
 export function flowNameFor(monitor: Monitor): string {
   const base = monitor.script.split('/').pop() ?? monitor.script;
   return base.replace(/\.spec\.ts$/, '');
+}
+
+/**
+ * Resolve a check's spec_path from its source_key via the manifest (Phase 6b Option C, slice 2):
+ * source_key === manifest id, and the monitor's `script` IS the spec path. Returns the validated
+ * path, or null if no monitor has that id. Reuses the runtime fetch guard (assertValidSpecPath)
+ * — one guard, not two; the manifest's SCRIPT_RE already validated `script` at parse time, so a
+ * throw here means an internal inconsistency. The reconcile-apply step (gated) writes this to
+ * checks.spec_path; the hot path then reads the column directly (no per-tick manifest fetch).
+ */
+export function specPathForSourceKey(monitors: Monitor[], sourceKey: string): string | null {
+  const monitor = monitors.find((m) => m.id === sourceKey);
+  if (!monitor) return null;
+  assertValidSpecPath(monitor.script);
+  return monitor.script;
 }
 
 /** Validate a parsed manifest against the schema invariants; throw on the first violation. */
