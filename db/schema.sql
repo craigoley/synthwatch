@@ -495,6 +495,27 @@ CREATE TABLE spec_cache (
 );
 
 -- ---------------------------------------------------------------------------
+-- spec_catalog: manifest-snapshot inventory (mirrors 0036_spec_catalog.sql, Phase 13).
+-- One row per manifest monitor (FULL RELOAD each reconcile), so the API/dashboard can
+-- enumerate EVERY spec + its runnable probe result — reconcile_drift only holds drifting
+-- rows, so an Active spec has no drift row and can't back the catalog. READ-ONLY inventory.
+-- ---------------------------------------------------------------------------
+CREATE TABLE spec_catalog (
+    source_key                 text        PRIMARY KEY,
+    name                       text        NOT NULL,
+    spec_path                  text        NOT NULL,
+    kind                       text        NOT NULL,
+    target                     text,
+    suggested_interval_seconds integer,
+    tags                       jsonb       NOT NULL DEFAULT '[]'::jsonb,
+    description                text,
+    enabled_by_default         boolean     NOT NULL DEFAULT false,
+    runnable                   boolean     NOT NULL,
+    not_runnable_reason        text,
+    probed_at                  timestamptz NOT NULL DEFAULT now()
+);
+
+-- ---------------------------------------------------------------------------
 -- schema_migrations: tracks which db/migrations/*.sql files have been applied
 -- (version = filename without ".sql"). Owned by the migration runner
 -- (db/migrate.sh), which also creates it IF NOT EXISTS.
