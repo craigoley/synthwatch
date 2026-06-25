@@ -225,6 +225,61 @@ expect_migs "no migration -> empty" "" \
 expect_migs "db non-migration -> empty" "" \
   $'db/schema.sql\ndb/seed.sql'
 
+# ===========================================================================
+# G. FIX 1 — git-independent migration detection (unapplied_versions). The robust fallback when
+#    the deploy's git range is degenerate (SHA..SHA) or unresolvable: schema_migrations vs files.
+# ===========================================================================
+expect_unapplied() {
+  local name="$1" applied="$2" present="$3" want="$4" got
+  got="$(printf '%s' "${present}" | unapplied_versions "${applied}" | tr '\n' ',' | sed 's/,$//')"
+  if [[ "${got}" == "${want}" ]]; then green "PASS  ${name} (${got:-none})"; else
+    red "FAIL  ${name} — want '${want}', got '${got}'"; FAILS=$((FAILS + 1)); fi
+}
+# (1) degenerate/unresolvable range + an UNAPPLIED migration -> fallback finds it -> migrate runs.
+expect_unapplied "fallback finds the unapplied migration" \
+  $'0034_a\n0035_b' $'0034_a\n0035_b\n0036_spec_catalog' '0036_spec_catalog'
+# (2) degenerate range + ALL applied -> nothing unapplied -> NO migrate.
+expect_unapplied "fallback: all applied -> no migrate" \
+  $'0034_a\n0035_b\n0036_spec_catalog' $'0034_a\n0035_b\n0036_spec_catalog' ''
+# multiple unapplied, and a fresh (empty schema_migrations) DB -> everything present is unapplied.
+expect_unapplied "fallback finds multiple unapplied" \
+  $'0034_a' $'0034_a\n0035_b\n0036_c' '0035_b,0036_c'
+expect_unapplied "fallback: empty schema_migrations -> all unapplied" \
+  '' $'0001_x\n0002_y' '0001_x,0002_y'
+
+# ===========================================================================
+# H. FIX 2 — post_reconcile triggers + waits + reports (az/psql/sleep stubbed).
+# ===========================================================================
+RG='rg-test'; RECONCILE_JOB='synthwatch-reconcile-job'; DATABASE_URL='db'; RECONCILE_POLL_TRIES=1
+sleep() { :; }   # no real waiting in tests
+check_contains() {
+  local name="$1" hay="$2" needle="$3"
+  case "${hay}" in *"${needle}"*) green "PASS  ${name}" ;; *) red "FAIL  ${name} — missing: ${needle}"; FAILS=$((FAILS + 1)) ;; esac
+}
+
+# Reconcile job Succeeds -> reports spec_catalog + reconcile_drift, rc 0.
+az() { case "$*" in *"job start"*) echo "recon-exec-1" ;; *"execution show"*) echo "Succeeded" ;; esac; }
+psql() {
+  case "$*" in
+    *"WHERE runnable"*)    echo "3" ;;
+    *"FROM spec_catalog"*) echo "3" ;;
+    *reconcile_drift*)     echo "new=3" ;;
+  esac
+}
+if out="$(post_reconcile)"; then rc=0; else rc=$?; fi
+if [[ "${rc}" -eq 0 ]]; then green "PASS  post_reconcile success rc=0"; else red "FAIL  post_reconcile rc=${rc}"; FAILS=$((FAILS + 1)); fi
+check_contains "post_reconcile starts the job"  "${out}" "starting synthwatch-reconcile-job"
+check_contains "post_reconcile waits"           "${out}" "waiting up to"
+check_contains "post_reconcile reports catalog" "${out}" "spec_catalog: 3 row(s), 3 runnable"
+check_contains "post_reconcile reports drift"   "${out}" "reconcile_drift: new=3"
+
+# Reconcile job FAILS -> surfaced + rc non-zero.
+az() { case "$*" in *"job start"*) echo "recon-exec-2" ;; *"execution show"*) echo "Failed" ;; esac; }
+if out="$(post_reconcile)"; then rc=0; else rc=$?; fi
+if [[ "${rc}" -ne 0 ]]; then green "PASS  post_reconcile surfaces failure (rc!=0)"; else red "FAIL  post_reconcile should fail"; FAILS=$((FAILS + 1)); fi
+check_contains "post_reconcile prints the error" "${out}" "ERROR: synthwatch-reconcile-job ended: Failed"
+unset -f az psql sleep check_contains
+
 echo
 if [[ "${FAILS}" -eq 0 ]]; then
   green "ALL TESTS PASSED"

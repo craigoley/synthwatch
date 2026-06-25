@@ -128,3 +128,56 @@ image_mismatches() {
     [[ "${actual}" == "${exp}" ]] || echo "${job}"
   done
 }
+
+# ---------------------------------------------------------------------------
+# unapplied_versions — FIX 1 (git-independent migration detection). Reads the on-disk migration
+# "versions" (filenames without .sql, one per line) on stdin; given the APPLIED versions (from
+# schema_migrations, newline-separated) as $1, echoes each on-disk version NOT yet applied.
+# Empty output => everything on disk is already in schema_migrations (nothing to run). This is
+# the robust fallback when the git deploy-range is degenerate (SHA..SHA) or unresolvable: it
+# needs no git at all — just the DB's applied set vs the files present. (migrate.sh is
+# idempotent, so running the migrate job on the result is always safe.)
+unapplied_versions() {
+  local applied="$1" v
+  while IFS= read -r v || [[ -n "${v}" ]]; do
+    [[ -z "${v}" ]] && continue
+    grep -qxF "${v}" <<< "${applied}" || echo "${v}"
+  done
+}
+
+# ---------------------------------------------------------------------------
+# post_reconcile — FIX 2. After a successful deploy, trigger the reconcile job, WAIT for it,
+# then print the resulting post-deploy state (spec_catalog + reconcile_drift) so the operator
+# sees it in one command instead of manually sleeping + re-querying. Returns non-zero if the
+# reconcile job failed. Uses az/psql/sleep (stubbable in tests) + env: RG, RECONCILE_JOB,
+# DATABASE_URL, RECONCILE_POLL_TRIES (default 9 × ~10s ≈ 90s). Plain output (no colors) so it's
+# sourceable + unit-testable; deploy.sh prints a colored header before calling it.
+post_reconcile() {
+  local exec_name status tries=0 max="${RECONCILE_POLL_TRIES:-9}"
+  printf 'Post-deploy reconcile: starting %s…\n' "${RECONCILE_JOB}"
+  exec_name="$(az containerapp job start -n "${RECONCILE_JOB}" -g "${RG}" --query name -o tsv 2>/dev/null)" \
+    || { printf '  ERROR: could not start %s\n' "${RECONCILE_JOB}"; return 1; }
+  printf '  started %s; waiting up to %ss for it to finish…\n' "${exec_name}" "$(( max * 10 ))"
+  while (( tries < max )); do
+    status="$(az containerapp job execution show -n "${RECONCILE_JOB}" -g "${RG}" \
+                --job-execution-name "${exec_name}" --query properties.status -o tsv 2>/dev/null || true)"
+    case "${status}" in
+      Succeeded) printf '  %s Succeeded.\n' "${RECONCILE_JOB}"; break ;;
+      Failed|Degraded|Cancelled)
+        printf '  ERROR: %s ended: %s\n' "${RECONCILE_JOB}" "${status}"; return 1 ;;
+    esac
+    sleep 10
+    tries=$(( tries + 1 ))
+  done
+  [[ "${status}" == "Succeeded" ]] \
+    || printf '  WARN: %s not confirmed Succeeded within the wait; showing current state.\n' "${RECONCILE_JOB}"
+
+  # Post-deploy state (best-effort; a psql failure shows '?').
+  local catalog_total catalog_runnable drift_summary
+  catalog_total="$(psql "${DATABASE_URL}" -tA -c 'SELECT count(*) FROM spec_catalog' 2>/dev/null || echo '?')"
+  catalog_runnable="$(psql "${DATABASE_URL}" -tA -c 'SELECT count(*) FROM spec_catalog WHERE runnable' 2>/dev/null || echo '?')"
+  drift_summary="$(psql "${DATABASE_URL}" -tA -c "SELECT coalesce(string_agg(drift_type||'='||c, ', ' ORDER BY drift_type), 'none') FROM (SELECT drift_type, count(*) c FROM reconcile_drift GROUP BY drift_type) t" 2>/dev/null || echo '?')"
+  printf '  spec_catalog: %s row(s), %s runnable\n' "${catalog_total}" "${catalog_runnable}"
+  printf '  reconcile_drift: %s\n' "${drift_summary}"
+  return 0
+}
