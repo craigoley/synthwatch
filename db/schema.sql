@@ -125,6 +125,16 @@ CREATE TABLE checks (
     -- index is created below (a NULL-tolerant uniqueness).
     source_key         TEXT,
 
+    -- The monitors-repo spec path for runtime fetch (mirrors 0033_spec_path.sql, Phase 6b
+    -- Option C). The manifest `script` for this monitor; the hot path reads it directly to
+    -- fetch+run the Playwright spec (no per-tick manifest fetch). NULL for native/dashboard
+    -- checks. The CHECK mirrors the runtime guard (specfetch/fetchSpec.assertValidSpecPath).
+    spec_path          TEXT
+                       CONSTRAINT checks_spec_path_shape
+                       CHECK (spec_path IS NULL
+                              OR (spec_path ~ '^monitors/.+\.spec\.ts$'
+                                  AND position('..' in spec_path) = 0)),
+
     -- A browser check is meaningless without a flow to run.
     CONSTRAINT browser_needs_flow
         CHECK (kind <> 'browser' OR flow_name IS NOT NULL)
@@ -463,6 +473,22 @@ CREATE TABLE reconcile_drift (
     detail      jsonb       NOT NULL DEFAULT '{}'::jsonb,
     detected_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (source_key, drift_type)
+);
+
+-- ---------------------------------------------------------------------------
+-- spec_cache: durable runtime-spec cache (mirrors 0034_spec_cache.sql, Phase 6b Option C).
+-- The runner cold-starts every 5 min, so the spec cache lives in Postgres. Per due check:
+-- conditional-GET (If-None-Match: etag); 304 reuses compiled_js, 200 recompiles + upserts.
+-- last_good_* are populated here but only READ by slice 4's fetch-failure fallback.
+-- ---------------------------------------------------------------------------
+CREATE TABLE spec_cache (
+    spec_path             text        PRIMARY KEY,
+    etag                  text,
+    source_sha            text,
+    compiled_js           text        NOT NULL,
+    fetched_at            timestamptz NOT NULL DEFAULT now(),
+    last_good_compiled_js text,
+    last_good_at          timestamptz
 );
 
 -- ---------------------------------------------------------------------------
