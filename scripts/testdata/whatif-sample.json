@@ -1,0 +1,609 @@
+{
+  "status": "Succeeded",
+  "changes": [
+    {
+      "after": {
+        "apiVersion": "2024-03-01",
+        "id": "/subscriptions/505a01eb-9a5f-4212-a293-ff82a68d0d03/resourceGroups/synthwatch-rg/providers/Microsoft.App/jobs/synthwatch-reconcile-job",
+        "identity": {
+          "type": "UserAssigned",
+          "userAssignedIdentities": {
+            "/subscriptions/505a01eb-9a5f-4212-a293-ff82a68d0d03/resourceGroups/synthwatch-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/synthwatch-runner-id": {}
+          }
+        },
+        "location": "eastus2",
+        "name": "synthwatch-reconcile-job",
+        "properties": {
+          "configuration": {
+            "registries": [
+              {
+                "identity": "/subscriptions/505a01eb-9a5f-4212-a293-ff82a68d0d03/resourceGroups/synthwatch-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/synthwatch-runner-id",
+                "server": "[reference('/subscriptions/505a01eb-9a5f-4212-a293-ff82a68d0d03/resourceGroups/synthwatch-rg/providers/Microsoft.ContainerRegistry/registries/synthwatcholey0620', '2023-11-01-preview').loginServer]"
+              }
+            ],
+            "replicaRetryLimit": 1,
+            "replicaTimeout": 600,
+            "scheduleTriggerConfig": {
+              "cronExpression": "0 1 * * *",
+              "parallelism": 1,
+              "replicaCompletionCount": 1
+            },
+            "secrets": [
+              {
+                "name": "*******",
+                "value": "*******"
+              }
+            ],
+            "triggerType": "Schedule"
+          },
+          "environmentId": "/subscriptions/505a01eb-9a5f-4212-a293-ff82a68d0d03/resourceGroups/synthwatch-rg/providers/Microsoft.App/managedEnvironments/synthwatch-env-e2",
+          "template": {
+            "containers": [
+              {
+                "args": [
+                  "dist/reconcileMain.js"
+                ],
+                "command": [
+                  "node"
+                ],
+                "env": [
+                  {
+                    "name": "DATABASE_URL",
+                    "secretRef": "*******"
+                  },
+                  {
+                    "name": "AZURE_CLIENT_ID",
+                    "value": "[reference('/subscriptions/505a01eb-9a5f-4212-a293-ff82a68d0d03/resourceGroups/synthwatch-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/synthwatch-runner-id', '2023-01-31').clientId]"
+                  }
+                ],
+                "image": "synthwatcholey0620.azurecr.io/synthwatch-runner:1ff07902dee8da5e2054055fcb6bc3dd676910ba",
+                "name": "reconcile",
+                "resources": {
+                  "cpu": 0.25,
+                  "memory": "0.5Gi"
+                }
+              }
+            ]
+          }
+        },
+        "resourceGroup": "synthwatch-rg",
+        "type": "Microsoft.App/jobs"
+      },
+      "before": null,
+      "changeType": "Create",
+      "delta": null,
+      "deploymentId": null,
+      "extension": null,
+      "identifiers": null,
+      "resourceId": "/subscriptions/505a01eb-9a5f-4212-a293-ff82a68d0d03/resourceGroups/synthwatch-rg/providers/Microsoft.App/jobs/synthwatch-reconcile-job",
+      "symbolicName": null,
+      "unsupportedReason": null
+    },
+    {
+      "after": {
+        "apiVersion": "2024-03-01",
+        "id": "/subscriptions/505a01eb-9a5f-4212-a293-ff82a68d0d03/resourceGroups/synthwatch-rg/providers/Microsoft.App/jobs/synthwatch-runner-job",
+        "identity": {
+          "type": "UserAssigned",
+          "userAssignedIdentities": {
+            "/subscriptions/505a01eb-9a5f-4212-a293-ff82a68d0d03/resourcegroups/synthwatch-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/synthwatch-runner-id": {}
+          }
+        },
+        "location": "eastus2",
+        "name": "synthwatch-runner-job",
+        "properties": {
+          "configuration": {
+            "registries": [
+              {
+                "identity": "/subscriptions/505a01eb-9a5f-4212-a293-ff82a68d0d03/resourceGroups/synthwatch-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/synthwatch-runner-id",
+                "server": "[reference('/subscriptions/505a01eb-9a5f-4212-a293-ff82a68d0d03/resourceGroups/synthwatch-rg/providers/Microsoft.ContainerRegistry/registries/synthwatcholey0620', '2023-11-01-preview').loginServer]"
+              }
+            ],
+            "replicaRetryLimit": 0,
+            "replicaTimeout": 240,
+            "scheduleTriggerConfig": {
+              "cronExpression": "*/5 * * * *",
+              "parallelism": 1,
+              "replicaCompletionCount": 1
+            },
+            "secrets": [
+              {
+                "name": "database-url",
+                "value": "*******"
+              },
+              {
+                "name": "storage-conn",
+                "value": "*******"
+              },
+              {
+                "name": "acs-email-conn",
+                "value": "*******"
+              }
+            ],
+            "triggerType": "Schedule"
+          },
+          "environmentId": "/subscriptions/505a01eb-9a5f-4212-a293-ff82a68d0d03/resourceGroups/synthwatch-rg/providers/Microsoft.App/managedEnvironments/synthwatch-env-e2",
+          "template": {
+            "containers": [
+              {
+                "env": [
+                  {
+                    "name": "DATABASE_URL",
+                    "secretRef": "database-url"
+                  },
+                  {
+                    "name": "AZURE_STORAGE_CONNECTION_STRING",
+                    "secretRef": "storage-conn"
+                  },
+                  {
+                    "name": "AZURE_STORAGE_CONTAINER",
+                    "value": "synthwatch-artifacts"
+                  },
+                  {
+                    "name": "SYNTHWATCH_LOCATION",
+                    "value": "eastus2"
+                  },
+                  {
+                    "name": "AZURE_OPENAI_ENDPOINT",
+                    "value": "https://synthwatch-aoai.openai.azure.com/"
+                  },
+                  {
+                    "name": "AZURE_OPENAI_DEPLOYMENT",
+                    "value": "gpt-5-mini"
+                  },
+                  {
+                    "name": "AZURE_OPENAI_API_VERSION",
+                    "value": "2025-04-01-preview"
+                  },
+                  {
+                    "name": "RCA_MAX_TOKENS",
+                    "value": "4000"
+                  },
+                  {
+                    "name": "AZURE_CLIENT_ID",
+                    "value": "[reference('/subscriptions/505a01eb-9a5f-4212-a293-ff82a68d0d03/resourceGroups/synthwatch-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/synthwatch-runner-id', '2023-01-31').clientId]"
+                  },
+                  {
+                    "name": "ALERT_EMAIL_FROM",
+                    "value": "donotreply@0ad660ff-ac71-4b63-a5f6-ce885666c796.azurecomm.net"
+                  },
+                  {
+                    "name": "ACS_EMAIL_CONNECTION_STRING",
+                    "secretRef": "acs-email-conn"
+                  }
+                ],
+                "image": "synthwatcholey0620.azurecr.io/synthwatch-runner:1ff07902dee8da5e2054055fcb6bc3dd676910ba",
+                "name": "runner",
+                "resources": {
+                  "cpu": 1.0,
+                  "memory": "2Gi"
+                }
+              }
+            ]
+          }
+        },
+        "resourceGroup": "synthwatch-rg",
+        "type": "Microsoft.App/jobs"
+      },
+      "before": {
+        "apiVersion": "2024-03-01",
+        "id": "/subscriptions/505a01eb-9a5f-4212-a293-ff82a68d0d03/resourceGroups/synthwatch-rg/providers/Microsoft.App/jobs/synthwatch-runner-job",
+        "identity": {
+          "type": "UserAssigned",
+          "userAssignedIdentities": {
+            "/subscriptions/505a01eb-9a5f-4212-a293-ff82a68d0d03/resourcegroups/synthwatch-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/synthwatch-runner-id": {}
+          }
+        },
+        "location": "eastus2",
+        "name": "synthwatch-runner-job",
+        "properties": {
+          "configuration": {
+            "registries": [
+              {
+                "identity": "/subscriptions/505a01eb-9a5f-4212-a293-ff82a68d0d03/resourceGroups/synthwatch-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/synthwatch-runner-id",
+                "server": "synthwatcholey0620.azurecr.io"
+              }
+            ],
+            "replicaRetryLimit": 0,
+            "replicaTimeout": 240,
+            "scheduleTriggerConfig": {
+              "cronExpression": "*/5 * * * *",
+              "parallelism": 1,
+              "replicaCompletionCount": 1
+            },
+            "secrets": [
+              {
+                "name": "database-url",
+                "value": "*******"
+              },
+              {
+                "name": "storage-conn",
+                "value": "*******"
+              },
+              {
+                "name": "acs-email-conn",
+                "value": "*******"
+              }
+            ],
+            "triggerType": "Schedule"
+          },
+          "environmentId": "/subscriptions/505a01eb-9a5f-4212-a293-ff82a68d0d03/resourceGroups/synthwatch-rg/providers/Microsoft.App/managedEnvironments/synthwatch-env-e2",
+          "template": {
+            "containers": [
+              {
+                "env": [
+                  {
+                    "name": "DATABASE_URL",
+                    "secretRef": "database-url"
+                  },
+                  {
+                    "name": "AZURE_STORAGE_CONNECTION_STRING",
+                    "secretRef": "storage-conn"
+                  },
+                  {
+                    "name": "AZURE_STORAGE_CONTAINER",
+                    "value": "synthwatch-artifacts"
+                  },
+                  {
+                    "name": "SYNTHWATCH_LOCATION",
+                    "value": "eastus2"
+                  },
+                  {
+                    "name": "AZURE_OPENAI_ENDPOINT",
+                    "value": "https://synthwatch-aoai.openai.azure.com/"
+                  },
+                  {
+                    "name": "AZURE_OPENAI_DEPLOYMENT",
+                    "value": "gpt-5-mini"
+                  },
+                  {
+                    "name": "AZURE_OPENAI_API_VERSION",
+                    "value": "2025-04-01-preview"
+                  },
+                  {
+                    "name": "RCA_MAX_TOKENS",
+                    "value": "4000"
+                  },
+                  {
+                    "name": "AZURE_CLIENT_ID",
+                    "value": "9015212f-3e39-4d70-9fa9-1d97f9662deb"
+                  },
+                  {
+                    "name": "ALERT_EMAIL_FROM",
+                    "value": "donotreply@0ad660ff-ac71-4b63-a5f6-ce885666c796.azurecomm.net"
+                  },
+                  {
+                    "name": "ACS_EMAIL_CONNECTION_STRING",
+                    "secretRef": "acs-email-conn"
+                  }
+                ],
+                "image": "synthwatcholey0620.azurecr.io/synthwatch-runner:1ff07902dee8da5e2054055fcb6bc3dd676910ba",
+                "name": "runner",
+                "resources": {
+                  "cpu": 1.0,
+                  "memory": "2Gi"
+                }
+              }
+            ]
+          }
+        },
+        "resourceGroup": "synthwatch-rg",
+        "type": "Microsoft.App/jobs"
+      },
+      "changeType": "Modify",
+      "delta": [
+        {
+          "after": null,
+          "before": null,
+          "children": [
+            {
+              "after": null,
+              "before": null,
+              "children": [
+                {
+                  "after": "[reference('/subscriptions/505a01eb-9a5f-4212-a293-ff82a68d0d03/resourceGroups/synthwatch-rg/providers/Microsoft.ContainerRegistry/registries/synthwatcholey0620', '2023-11-01-preview').loginServer]",
+                  "before": "synthwatcholey0620.azurecr.io",
+                  "children": null,
+                  "path": "server",
+                  "propertyChangeType": "Modify"
+                }
+              ],
+              "path": "0",
+              "propertyChangeType": "Modify"
+            }
+          ],
+          "path": "properties.configuration.registries",
+          "propertyChangeType": "Array"
+        },
+        {
+          "after": null,
+          "before": null,
+          "children": [
+            {
+              "after": null,
+              "before": null,
+              "children": [
+                {
+                  "after": null,
+                  "before": null,
+                  "children": [
+                    {
+                      "after": null,
+                      "before": null,
+                      "children": [
+                        {
+                          "after": "[reference('/subscriptions/505a01eb-9a5f-4212-a293-ff82a68d0d03/resourceGroups/synthwatch-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/synthwatch-runner-id', '2023-01-31').clientId]",
+                          "before": "9015212f-3e39-4d70-9fa9-1d97f9662deb",
+                          "children": null,
+                          "path": "value",
+                          "propertyChangeType": "Modify"
+                        }
+                      ],
+                      "path": "8",
+                      "propertyChangeType": "Modify"
+                    }
+                  ],
+                  "path": "env",
+                  "propertyChangeType": "Array"
+                }
+              ],
+              "path": "0",
+              "propertyChangeType": "Modify"
+            }
+          ],
+          "path": "properties.template.containers",
+          "propertyChangeType": "Array"
+        }
+      ],
+      "deploymentId": null,
+      "extension": null,
+      "identifiers": null,
+      "resourceId": "/subscriptions/505a01eb-9a5f-4212-a293-ff82a68d0d03/resourceGroups/synthwatch-rg/providers/Microsoft.App/jobs/synthwatch-runner-job",
+      "symbolicName": null,
+      "unsupportedReason": null
+    },
+    {
+      "after": {
+        "apiVersion": "2024-03-01",
+        "id": "/subscriptions/505a01eb-9a5f-4212-a293-ff82a68d0d03/resourceGroups/synthwatch-rg/providers/Microsoft.App/managedEnvironments/synthwatch-env-e2",
+        "location": "eastus2",
+        "name": "synthwatch-env-e2",
+        "properties": {
+          "appLogsConfiguration": {
+            "destination": "log-analytics",
+            "logAnalyticsConfiguration": {
+              "customerId": "[reference('/subscriptions/505a01eb-9a5f-4212-a293-ff82a68d0d03/resourceGroups/synthwatch-rg/providers/Microsoft.OperationalInsights/workspaces/synthwatch-logs-e2', '2023-09-01').customerId]",
+              "sharedKey": "*******"
+            }
+          },
+          "zoneRedundant": false
+        },
+        "resourceGroup": "synthwatch-rg",
+        "type": "Microsoft.App/managedEnvironments"
+      },
+      "before": {
+        "apiVersion": "2024-03-01",
+        "id": "/subscriptions/505a01eb-9a5f-4212-a293-ff82a68d0d03/resourceGroups/synthwatch-rg/providers/Microsoft.App/managedEnvironments/synthwatch-env-e2",
+        "location": "eastus2",
+        "name": "synthwatch-env-e2",
+        "properties": {
+          "appLogsConfiguration": {
+            "destination": "log-analytics",
+            "logAnalyticsConfiguration": {
+              "customerId": "8a11a8a8-7061-4540-8f5d-07fccf556742",
+              "sharedKey": "*******"
+            }
+          },
+          "peerAuthentication": {
+            "mtls": {
+              "enabled": false
+            }
+          },
+          "peerTrafficConfiguration": {
+            "encryption": {
+              "enabled": false
+            }
+          },
+          "zoneRedundant": false
+        },
+        "resourceGroup": "synthwatch-rg",
+        "type": "Microsoft.App/managedEnvironments"
+      },
+      "changeType": "Modify",
+      "delta": [
+        {
+          "after": "[reference('/subscriptions/505a01eb-9a5f-4212-a293-ff82a68d0d03/resourceGroups/synthwatch-rg/providers/Microsoft.OperationalInsights/workspaces/synthwatch-logs-e2', '2023-09-01').customerId]",
+          "before": "8a11a8a8-7061-4540-8f5d-07fccf556742",
+          "children": null,
+          "path": "properties.appLogsConfiguration.logAnalyticsConfiguration.customerId",
+          "propertyChangeType": "Modify"
+        },
+        {
+          "after": null,
+          "before": {
+            "mtls": {
+              "enabled": false
+            }
+          },
+          "children": null,
+          "path": "properties.peerAuthentication",
+          "propertyChangeType": "Delete"
+        },
+        {
+          "after": null,
+          "before": {
+            "encryption": {
+              "enabled": false
+            }
+          },
+          "children": null,
+          "path": "properties.peerTrafficConfiguration",
+          "propertyChangeType": "Delete"
+        }
+      ],
+      "deploymentId": null,
+      "extension": null,
+      "identifiers": null,
+      "resourceId": "/subscriptions/505a01eb-9a5f-4212-a293-ff82a68d0d03/resourceGroups/synthwatch-rg/providers/Microsoft.App/managedEnvironments/synthwatch-env-e2",
+      "symbolicName": null,
+      "unsupportedReason": null
+    },
+    {
+      "after": {
+        "apiVersion": "2024-08-01",
+        "id": "/subscriptions/505a01eb-9a5f-4212-a293-ff82a68d0d03/resourceGroups/synthwatch-rg/providers/Microsoft.DBforPostgreSQL/flexibleServers/synthwatch-pg-e2",
+        "location": "eastus2",
+        "name": "synthwatch-pg-e2",
+        "properties": {
+          "administratorLogin": "synthadmin",
+          "administratorLoginPassword": "*******",
+          "authConfig": {
+            "activeDirectoryAuth": "Enabled",
+            "passwordAuth": "Enabled",
+            "tenantId": "087ee734-7aed-45e9-93ba-e1bb35e3e572"
+          },
+          "availabilityZone": "3",
+          "backup": {
+            "backupRetentionDays": 7,
+            "geoRedundantBackup": "Disabled"
+          },
+          "highAvailability": {
+            "mode": "Disabled"
+          },
+          "maintenanceWindow": {
+            "customWindow": "Disabled",
+            "dayOfWeek": 0,
+            "startHour": 0,
+            "startMinute": 0
+          },
+          "storage": {
+            "storageSizeGB": 32
+          },
+          "version": "16"
+        },
+        "resourceGroup": "synthwatch-rg",
+        "sku": {
+          "name": "Standard_B1ms",
+          "tier": "Burstable"
+        },
+        "type": "Microsoft.DBforPostgreSQL/flexibleServers"
+      },
+      "before": {
+        "apiVersion": "2024-08-01",
+        "id": "/subscriptions/505a01eb-9a5f-4212-a293-ff82a68d0d03/resourceGroups/synthwatch-rg/providers/Microsoft.DBforPostgreSQL/flexibleServers/synthwatch-pg-e2",
+        "location": "eastus2",
+        "name": "synthwatch-pg-e2",
+        "properties": {
+          "administratorLogin": "synthadmin",
+          "administratorLoginPassword": "*******",
+          "authConfig": {
+            "activeDirectoryAuth": "Enabled",
+            "passwordAuth": "Enabled",
+            "tenantId": "087ee734-7aed-45e9-93ba-e1bb35e3e572"
+          },
+          "availabilityZone": "3",
+          "backup": {
+            "backupRetentionDays": 7,
+            "geoRedundantBackup": "Disabled"
+          },
+          "dataEncryption": {
+            "type": "SystemManaged"
+          },
+          "highAvailability": {
+            "mode": "Disabled"
+          },
+          "maintenanceWindow": {
+            "customWindow": "Disabled",
+            "dayOfWeek": 0,
+            "startHour": 0,
+            "startMinute": 0
+          },
+          "network": {
+            "publicNetworkAccess": "Enabled"
+          },
+          "replica": {
+            "role": "Primary"
+          },
+          "replicationRole": "Primary",
+          "storage": {
+            "autoGrow": "Disabled",
+            "iops": 120,
+            "storageSizeGB": 32,
+            "tier": "P4"
+          },
+          "version": "16"
+        },
+        "resourceGroup": "synthwatch-rg",
+        "sku": {
+          "name": "Standard_B1ms",
+          "tier": "Burstable"
+        },
+        "type": "Microsoft.DBforPostgreSQL/flexibleServers"
+      },
+      "changeType": "Modify",
+      "delta": [
+        {
+          "after": null,
+          "before": {
+            "type": "SystemManaged"
+          },
+          "children": null,
+          "path": "properties.dataEncryption",
+          "propertyChangeType": "Delete"
+        },
+        {
+          "after": null,
+          "before": {
+            "publicNetworkAccess": "Enabled"
+          },
+          "children": null,
+          "path": "properties.network",
+          "propertyChangeType": "Delete"
+        },
+        {
+          "after": null,
+          "before": {
+            "role": "Primary"
+          },
+          "children": null,
+          "path": "properties.replica",
+          "propertyChangeType": "Delete"
+        },
+        {
+          "after": null,
+          "before": "Primary",
+          "children": null,
+          "path": "properties.replicationRole",
+          "propertyChangeType": "Delete"
+        },
+        {
+          "after": null,
+          "before": "Disabled",
+          "children": null,
+          "path": "properties.storage.autoGrow",
+          "propertyChangeType": "Delete"
+        },
+        {
+          "after": null,
+          "before": 120,
+          "children": null,
+          "path": "properties.storage.iops",
+          "propertyChangeType": "Delete"
+        },
+        {
+          "after": null,
+          "before": "P4",
+          "children": null,
+          "path": "properties.storage.tier",
+          "propertyChangeType": "Delete"
+        }
+      ],
+      "deploymentId": null,
+      "extension": null,
+      "identifiers": null,
+      "resourceId": "/subscriptions/505a01eb-9a5f-4212-a293-ff82a68d0d03/resourceGroups/synthwatch-rg/providers/Microsoft.DBforPostgreSQL/flexibleServers/synthwatch-pg-e2",
+      "symbolicName": null,
+      "unsupportedReason": null
+    }
+  ]
+}
