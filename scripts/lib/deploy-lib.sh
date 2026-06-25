@@ -72,3 +72,59 @@ confirm_drop() {
   read -r ans
   [[ "${ans}" == "yes" ]]
 }
+
+# ---------------------------------------------------------------------------
+# newest_common_sha — BUG 1 fix. The runner and migrate images are built together for the
+# same commit; the auto-pick must deploy a SHA that exists in BOTH repos, or a deploy can
+# half-apply (runner job rolls to SHA, migrate job's update to a not-yet-pushed migrate:SHA
+# fails -> migrate stays stale -> migrations silently don't apply). Given the runner tags
+# (newline, newest-first) as $1 and the migrate tags (newline) as $2, echo the newest runner
+# tag that ALSO exists in the migrate repo (empty if there is no common tag).
+newest_common_sha() {
+  local runner_tags="$1" migrate_tags="$2" t
+  while IFS= read -r t || [[ -n "${t}" ]]; do
+    [[ -z "${t}" ]] && continue
+    # Exact-line membership test against the migrate tag list.
+    if printf '%s\n' "${migrate_tags}" | grep -qxF "${t}"; then
+      printf '%s' "${t}"
+      return 0
+    fi
+  done <<< "${runner_tags}"
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# migrations_in_diff — BUG 3 detection. Reads `git diff --name-only <prev>..<new>` output on
+# stdin; echoes (one per line) the migration "version" (filename without .sql) for each
+# ADDED/CHANGED path under db/migrations/*.sql. Empty output => the deploy shipped no
+# migration => no need to run the migrate job. Used to gate the auto-run of the migrate job.
+migrations_in_diff() {
+  local p base
+  while IFS= read -r p || [[ -n "${p}" ]]; do
+    case "${p}" in
+      db/migrations/*.sql)
+        base="${p##*/}"
+        echo "${base%.sql}" ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------------------
+# image_mismatches — BUG 2 verify. A correct deploy puts EVERY job on the intended image:
+# the migrate job on the migrate image, every other job on the runner image. Reads a
+# "<job>\t<actual-image>" line per job on stdin; given the expected runner image as $1 and
+# migrate image as $2, echoes the name of each job whose actual image != expected (and of any
+# job whose actual image is empty — an absent/unreadable job is a failure). Empty output =>
+# all jobs are on the intended image. This is what would have caught today's split (the
+# migrate job stuck on the old SHA while the runner job rolled).
+image_mismatches() {
+  local runner_img="$1" migrate_img="$2" job actual exp
+  while IFS=$'\t' read -r job actual || [[ -n "${job}" ]]; do
+    [[ -z "${job}" ]] && continue
+    case "${job}" in
+      *migrate*) exp="${migrate_img}" ;;
+      *)         exp="${runner_img}" ;;
+    esac
+    [[ "${actual}" == "${exp}" ]] || echo "${job}"
+  done
+}

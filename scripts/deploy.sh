@@ -42,10 +42,18 @@ readonly EXPECTED_API_VERSION='2025-04-01-preview'   # the #93/#94 fix — must 
 readonly ACS_SECRET_REF='acs-email-conn'             # the runner ACS env's secretRef — the wipe canary
 readonly API_HEALTH_URL='https://synthwatch-api.azurewebsites.net/api/checks'
 
-# Jobs that reuse the runner image (so their deployed image == the intended SHA after a deploy).
+# Jobs that reuse the RUNNER image (their deployed image == the intended SHA after a deploy).
 readonly RUNNER_JOB='synthwatch-runner-job'
+readonly CENTRALUS_RUNNER_JOB='synthwatch-runner-job-centralus'
 readonly NARRATIVE_JOB='synthwatch-narrative-job'
+readonly ROLLUP_JOB='synthwatch-rollup-job'
 readonly RECONCILE_JOB='synthwatch-reconcile-job'
+# The migrate job runs on the MIGRATE image (its own repo, same SHA) and applies migrations.
+readonly MIGRATE_JOB='synthwatch-migrate-job'
+# Every job that should be on the runner image after a deploy (verify checks each — BUG 2).
+readonly RUNNER_IMAGE_JOBS=(
+  "${RUNNER_JOB}" "${CENTRALUS_RUNNER_JOB}" "${NARRATIVE_JOB}" "${ROLLUP_JOB}" "${RECONCILE_JOB}"
+)
 
 # Repo root, so the script works from any cwd.
 ROOT="$(git rev-parse --show-toplevel)"
@@ -132,18 +140,44 @@ mismatch_verdict() {
   printf '%s\n' "${changed}" | classify_paths
 }
 
+# repo_sha_tags <repo> -> newline list of 40-hex commit tags, newest first.
+repo_sha_tags() {
+  az acr repository show-tags -n "${ACR}" --repository "$1" --orderby time_desc -o tsv 2>/dev/null \
+    | grep -E '^[0-9a-f]{40}$' || true
+}
+
 pick_sha() {
+  local runner_tags migrate_tags
+  runner_tags="$(repo_sha_tags "${RUNNER_REPO}")"
+  migrate_tags="$(repo_sha_tags "${MIGRATE_REPO}")"
+
   if [[ -n "${SHA_OVERRIDE}" ]]; then
+    # ★ BUG 1: even an explicit SHA must exist in BOTH repos, or the deploy half-applies.
     c_yellow "Using --sha override: ${SHA_OVERRIDE}" >&2
+    printf '%s\n' "${runner_tags}"  | grep -qxF "${SHA_OVERRIDE}" \
+      || fail "${RUNNER_REPO}:${SHA_OVERRIDE:0:12} not in registry — nothing to deploy."
+    printf '%s\n' "${migrate_tags}" | grep -qxF "${SHA_OVERRIDE}" \
+      || fail "${MIGRATE_REPO}:${SHA_OVERRIDE:0:12} not in registry — would split runner/migrate. Refusing."
     printf '%s' "${SHA_OVERRIDE}"
     return
   fi
 
-  local newest head
-  newest="$(az acr repository show-tags -n "${ACR}" --repository "${RUNNER_REPO}" \
-              --orderby time_desc -o tsv 2>/dev/null \
-            | grep -E '^[0-9a-f]{40}$' | head -1 || true)"
-  [[ -n "${newest}" ]] || fail "no SHA-tagged ${RUNNER_REPO} image found in ${ACR}."
+  # ★ BUG 1 root cause: the runner & migrate images are built together, but a deploy can be
+  # run while only the runner image of the newest commit has been pushed (CI mid-build). The
+  # old code picked the newest RUNNER tag and only soft-warned if migrate:SHA was missing —
+  # so the deploy set migrate to a not-yet-pushed tag, that resource update failed, and the
+  # migrate job stayed on the OLD image (today's split: runner 3106bc7 / migrate 1ff07902).
+  # FIX: pick the newest SHA present in BOTH repos, so both image params always resolve to a
+  # real, fully-built pair. Both bicep params then derive from this one SHA (below).
+  local runner_newest newest head
+  runner_newest="$(printf '%s\n' "${runner_tags}" | head -1)"
+  [[ -n "${runner_newest}" ]] || fail "no SHA-tagged ${RUNNER_REPO} image found in ${ACR}."
+  newest="$(newest_common_sha "${runner_tags}" "${migrate_tags}" || true)"
+  [[ -n "${newest}" ]] || fail "no SHA tag present in BOTH ${RUNNER_REPO} and ${MIGRATE_REPO}."
+  if [[ "${newest}" != "${runner_newest}" ]]; then
+    c_yellow "WARN: newest runner image ${runner_newest:0:12} has no matching ${MIGRATE_REPO} image" >&2
+    c_yellow "      yet (CI likely mid-build); using the newest COMPLETE pair ${newest:0:12} instead." >&2
+  fi
   head="$(git rev-parse HEAD)"
 
   if [[ "${newest}" == "${head}" ]]; then
@@ -173,12 +207,7 @@ pick_sha() {
     fi
   fi
 
-  # Soft check: the migrate image is built alongside the runner; warn if its SHA tag is absent.
-  if ! az acr repository show-tags -n "${ACR}" --repository "${MIGRATE_REPO}" -o tsv 2>/dev/null \
-        | grep -qx "${newest}"; then
-    c_yellow "WARN: ${MIGRATE_REPO}:${newest:0:12} not found in registry — migrate image may lag." >&2
-  fi
-
+  # (Both images for ${newest} are guaranteed present — newest_common_sha required it.)
   printf '%s' "${newest}"
 }
 
@@ -280,6 +309,7 @@ do_deploy() {
 # 7. Verify what LANDED (always runs, even if create 'Failed'). Non-zero exit on any failure.
 # ---------------------------------------------------------------------------
 VERIFY_FAILS=0
+EXPECTED_MIGRATIONS=''   # set by handle_migrations: versions the deploy range shipped (BUG 3)
 pass() { c_green "  PASS  $*"; }
 flunk() { c_red   "  FAIL  $*"; VERIFY_FAILS=$((VERIFY_FAILS + 1)); }
 # check <ok-bool> <message> : pass if first arg is "1", else flunk. Avoids the A&&B||C trap.
@@ -323,11 +353,25 @@ verify() {
     check "${ok}" "${j} AZURE_CLIENT_ID present (or job absent)"
   done
 
-  # Deployed image SHA matches intent (runner job).
-  local img
-  img="$(job_image "${RUNNER_JOB}")"
-  [[ "${img}" == "${RUNNER_IMG}" ]] && ok=1 || ok=0
-  check "${ok}" "${RUNNER_JOB} image='${img##*:}' (expect ${SHA})"
+  # ★ BUG 2: EVERY job must be on the intended image — not just the runner job. A correct
+  # deploy puts the migrate job on migrate:SHA and every other job on runner:SHA. The old
+  # verify only checked the runner job, so today's split (migrate stuck on the old SHA while
+  # runner rolled) PASSED verify and 0032 silently didn't apply. Build a job->image map and
+  # diff it against the intended images; any mismatch (or an absent/unreadable job) fails.
+  local map="" j img mism
+  for j in "${RUNNER_IMAGE_JOBS[@]}" "${MIGRATE_JOB}"; do
+    img="$(job_image "${j}")"
+    map+="${j}"$'\t'"${img}"$'\n'
+  done
+  mism="$(printf '%s' "${map}" | image_mismatches "${RUNNER_IMG}" "${MIGRATE_IMG}")"
+  if [[ -z "${mism}" ]]; then
+    pass "all jobs on image ${SHA:0:12} (runner+migrate+narrative+rollup+reconcile+centralus)"
+  else
+    while IFS= read -r j; do
+      [[ -z "${j}" ]] && continue
+      flunk "${j} image='$(job_image "${j}" | sed 's#.*/##')' (expect ${SHA:0:12})"
+    done <<< "${mism}"
+  fi
 
   # Postgres reachable.
   if command -v psql >/dev/null 2>&1 && psql "${DATABASE_URL:-}" -tAc 'SELECT 1' >/dev/null 2>&1; then
@@ -342,12 +386,90 @@ verify() {
   [[ "${code}" == "200" ]] && ok=1 || ok=0
   check "${ok}" "API ${API_HEALTH_URL} -> '${code}' (expect 200)"
 
+  # ★ BUG 3: if the deploy shipped migration(s), CONFIRM each is recorded in
+  # schema_migrations (the migrate job ran them). This is what turns "migrate job exited 0"
+  # into "0032 actually applied".
+  if [[ -n "${EXPECTED_MIGRATIONS}" ]]; then
+    local mig n
+    while IFS= read -r mig || [[ -n "${mig}" ]]; do
+      [[ -z "${mig}" ]] && continue
+      if command -v psql >/dev/null 2>&1; then
+        n="$(psql "${DATABASE_URL:-}" -tAc \
+              "SELECT 1 FROM schema_migrations WHERE version='${mig}'" 2>/dev/null || true)"
+        [[ "${n}" == "1" ]] && ok=1 || ok=0
+        check "${ok}" "migration ${mig} recorded in schema_migrations"
+      else
+        flunk "migration ${mig} unverified — psql not on PATH"
+      fi
+    done <<< "${EXPECTED_MIGRATIONS}"
+  fi
+
   echo
   if [[ "${VERIFY_FAILS}" -eq 0 ]]; then
     c_green "VERIFY: all checks passed."
   else
     c_red "VERIFY: ${VERIFY_FAILS} check(s) FAILED."
   fi
+}
+
+# ---------------------------------------------------------------------------
+# 6b. Migration handling (BUG 3). The migrate job is Manual-trigger, so a deploy that ships
+#     a new migration does NOT apply it unless the job is separately started — today 0032
+#     silently didn't apply until a manual `job start`. We CHOSE option (a): auto-run the
+#     migrate job when the deploy's git range adds a db/migrations/ file, then wait + confirm.
+#     Justified: migrate.sh is idempotent (IF NOT EXISTS / only applies UNAPPLIED versions),
+#     the migrate job is the designated mechanism, and applying the migration the new code
+#     expects IS part of a correct deploy. It's gated on detection so it only fires when a
+#     migration actually shipped; the apply is the same safe step CD runs on merge.
+# ---------------------------------------------------------------------------
+job_image_sha() { job_image "$1" | sed 's/.*://'; }   # job -> just the :SHA tag
+
+# Re-point the migrate job to the intended migrate image (defensive: even if the bicep
+# deploy's migrate update half-failed, this guarantees we run the RIGHT migration set — the
+# OLD image wouldn't contain the new migration), then start a one-off execution and poll to a
+# terminal state (mirrors .github/workflows/deploy.yml). 0 = Succeeded.
+start_and_wait_migrate() {
+  local exec_name status _
+  az containerapp job update -n "${MIGRATE_JOB}" -g "${RG}" --image "${MIGRATE_IMG}" -o none 2>/dev/null \
+    || { c_red "  could not point ${MIGRATE_JOB} at ${MIGRATE_IMG##*/}"; return 1; }
+  exec_name="$(az containerapp job start -n "${MIGRATE_JOB}" -g "${RG}" --query name -o tsv 2>/dev/null)" \
+    || { c_red "  could not start ${MIGRATE_JOB}"; return 1; }
+  c_bold "  started ${MIGRATE_JOB} execution ${exec_name}; polling…"
+  for _ in $(seq 1 60); do
+    status="$(az containerapp job execution show -n "${MIGRATE_JOB}" -g "${RG}" \
+                --job-execution-name "${exec_name}" --query properties.status -o tsv 2>/dev/null || true)"
+    case "${status}" in
+      Succeeded) c_green "  ${MIGRATE_JOB} Succeeded."; return 0 ;;
+      Failed|Degraded|Cancelled) c_red "  ${MIGRATE_JOB} ended: ${status}."; return 1 ;;
+    esac
+    sleep 10
+  done
+  c_red "  ${MIGRATE_JOB} did not finish within timeout."
+  return 1
+}
+
+# handle_migrations <prev_sha> <new_sha>: detect migrations shipped in the deploy range and,
+# if any, auto-run the migrate job. Sets EXPECTED_MIGRATIONS so verify confirms they landed.
+handle_migrations() {
+  local prev="$1" new="$2" migs
+  c_bold "Migration handling…"
+  if [[ -z "${prev}" ]] \
+     || ! git rev-parse -q --verify "${prev}^{commit}" >/dev/null 2>&1 \
+     || ! git rev-parse -q --verify "${new}^{commit}" >/dev/null 2>&1; then
+    # UNRESOLVABLE range -> fall back to option (b): warn, don't silently skip.
+    c_yellow "  WARN: can't resolve the deploy range (${prev:0:12}..${new:0:12}) in local git."
+    c_yellow "        If this deploy shipped a migration, apply it manually:"
+    c_yellow "          az containerapp job start -n ${MIGRATE_JOB} -g ${RG}"
+    return
+  fi
+  migs="$(git diff --name-only "${prev}" "${new}" 2>/dev/null | migrations_in_diff)"
+  if [[ -z "${migs}" ]]; then
+    c_green "  no new migrations in ${prev:0:12}..${new:0:12} — migrate job not needed."
+    return
+  fi
+  EXPECTED_MIGRATIONS="${migs}"
+  c_bold "  deploy shipped migration(s): $(printf '%s' "${migs}" | tr '\n' ' ')"
+  start_and_wait_migrate || c_red "  migrate job did not succeed — migrations may NOT be applied (verify will flag)."
 }
 
 # ---------------------------------------------------------------------------
@@ -387,9 +509,14 @@ main() {
     c_green "Clean what-if — proceeding to deploy."
   fi
 
+  # Baseline BEFORE deploy: the runner job's current image SHA defines the migration range.
+  local prev_sha; prev_sha="$(job_image_sha "${RUNNER_JOB}")"
+
   do_deploy
   echo
-  verify
+  handle_migrations "${prev_sha}" "${SHA}"   # BUG 3: auto-run the migrate job if one shipped
+  echo
+  verify                                       # BUG 2: every job's image; + migration-applied
   exit "$(( VERIFY_FAILS > 0 ? 1 : 0 ))"
 }
 
