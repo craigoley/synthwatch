@@ -1,0 +1,110 @@
+name: CI gate
+
+# ──────────────────────────────────────────────────────────────────────────────────────────
+# ci-gate — ONE always-reporting required status check that aggregates the PR's other checks.
+#
+# WHY: a required status check that gets SKIPPED can permanently deadlock a merge. #102 (a
+# Dependabot esbuild bump) sat BLOCKED forever despite every check SUCCESS/SKIPPED, because
+# `scan-pr / osv-scan` is required but its workflow is `if:`-skipped on Dependabot PRs — and
+# because it's a REUSABLE-workflow call, a skipped caller creates NO check run with that nested
+# context name, so branch protection waits for "Expected" forever. (A skipped DIRECT job reports
+# a `skipped` check run, which GitHub counts as satisfied — that's why `Claude review`, also
+# skipped on Dependabot, didn't block.) This is a CLASS bug: ANY required check that can be
+# skipped (job `if:`, path filter, reusable caller) can deadlock a merge.
+#
+# THE FIX (GitHub's canonical answer): make branch protection require ONLY this one job. It
+# ALWAYS runs (no `if:`, no path filter) so its context ALWAYS reports, and it FAILS ONLY when a
+# sibling check actually FAILED. Skipped / absent siblings (the Dependabot / path-filter case)
+# do NOT block. So a skipped osv-scan no longer deadlocks, but a REAL failure still holds merge.
+#
+# NOTE ON IMPLEMENTATION: the textbook `needs: [job, …]` + `join(needs.*.result)` aggregator only
+# works WITHIN ONE workflow. This repo's required checks live in SIX workflow files (eslint /
+# semgrep / codeql / osv-scanner-pr / claude-review / + Copilot review), and `needs:` cannot
+# reference jobs across files. So ci-gate instead reads the PR head commit's CHECK RUNS (across
+# all workflows) and applies the same logic — fail only on a real failure conclusion.
+#
+# ★ Branch protection must be flipped to require ONLY `ci-gate` (the granular contexts can stay
+#   as jobs — they still run + report; ci-gate just aggregates them). That flip is admin config
+#   and is Craig's to run — see the PR description for the exact `gh api` PATCH.
+# ──────────────────────────────────────────────────────────────────────────────────────────
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  checks: read
+  contents: read
+
+concurrency:
+  group: ci-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  ci-gate:
+    name: ci-gate
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      SHA: ${{ github.event.pull_request.head.sha }}
+      # The check-run names that ALWAYS appear on a PR (run, or report a SKIPPED run) — the gate
+      # WAITS for all of these to reach a terminal state before deciding, so a slow-to-register
+      # check can never let the gate pass prematurely (the registration race). For the
+      # conditionally-skipped reusable osv scan we wait on the CALLER name "scan-pr" (which always
+      # reports — skipped on Dependabot, completed otherwise; its conclusion reflects the reusable
+      # result, so a real osv failure still fails here), NOT the nested "scan-pr / osv-scan" that
+      # never reports when skipped. Keep in sync if a required check is renamed/removed.
+      REQUIRED: >-
+        ["Lint","Scan","Analyze (javascript-typescript)","Analyze (actions)","Review","Claude review","scan-pr"]
+      # Not quality gates — never wait on or fail for these (ci-gate is self; automerge enables merge).
+      IGNORE: >-
+        ["ci-gate","automerge"]
+    steps:
+      - name: Aggregate sibling check results (fail only on a REAL failure; skipped/absent are OK)
+        run: |
+          set -euo pipefail
+
+          runs_json() {
+            # All check runs on the PR head SHA, across every workflow + app, merged across pages.
+            # (`--slurp` can't combine with `-q`, so flatten the page array with a separate jq.)
+            gh api "repos/${REPO}/commits/${SHA}/check-runs?per_page=100" --paginate --slurp \
+              | jq -c '[ .[].check_runs[] | {name, status, conclusion} ]'
+          }
+
+          # 1) WAIT until every REQUIRED check is present + completed (terminal). A required check
+          #    that never registers -> timeout -> ci-gate FAILS (fail-closed; never a silent pass).
+          deadline=$(( $(date +%s) + 900 ))   # 15-minute hard cap
+          while :; do
+            runs="$(runs_json)"
+            not_ready="$(jq -r --argjson req "${REQUIRED}" '
+              ([ .[] | select(.status=="completed") | .name ]) as $done
+              | ($req - $done) | .[]' <<< "${runs}")"
+            [ -z "${not_ready}" ] && break
+            if [ "$(date +%s)" -ge "${deadline}" ]; then
+              echo "::error::ci-gate: timed out waiting for required check(s) to complete:"
+              printf '%s\n' "${not_ready}" | sed 's/^/  - /'
+              exit 1
+            fi
+            echo "waiting for required check(s) to complete:"
+            printf '%s\n' "${not_ready}" | sed 's/^/  - /'
+            sleep 15
+          done
+
+          # 2) FAIL if ANY check (excluding IGNORE) concluded as a real failure. Skipped / neutral
+          #    / success all pass — so a Dependabot-skipped (or absent) check never blocks.
+          echo "--- gated check runs ---"
+          printf '%s' "${runs}" | jq -r '.[] | "  \(.conclusion // .status)\t\(.name)"' | sort
+
+          fails="$(jq -r --argjson ig "${IGNORE}" '
+            .[] | .name as $n | .conclusion as $c
+                | select(($ig | index($n)) == null)
+                | select(["failure","timed_out","cancelled","action_required","startup_failure"] | index($c))
+                | $n' <<< "${runs}")"
+
+          if [ -n "${fails}" ]; then
+            echo "::error::ci-gate: required check(s) FAILED — holding merge:"
+            printf '%s\n' "${fails}" | sed 's/^/  - /'
+            exit 1
+          fi
+          echo "ci-gate: all required checks terminal, no failures — merge may proceed."
