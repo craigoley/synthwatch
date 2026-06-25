@@ -285,19 +285,37 @@ function validShape(o: unknown): o is Narrative {
   );
 }
 
-/** Spot-check: the key figures (availability, p95, incident count) must appear in the
- *  prose. If the model omitted them, it's narrating something other than the facts ->
- *  prefer the fallback. */
-export function spotCheck(n: Narrative, fp: FactPack): boolean {
+/**
+ * The HEADLINE figures the prose must surface — proof the model used the fact pack rather
+ * than emitting generic filler/hallucination. Returns the labels of any MISSING figure
+ * (empty array = passes). Deliberately a REASONABLE SUBSET, not every number:
+ *  - availability — the primary reliability figure; rounding-tolerant (accept the
+ *    truncated OR rounded integer, e.g. 73.98% -> "73" or "74") so a faithful citation
+ *    in any rendering passes.
+ *  - incident COUNT — but only when there were incidents (>0); a 0-count is often phrased
+ *    "no incidents", so don't demand the literal "0".
+ * Secondary metrics (p95, downtime, vitals) are NOT required: a change-focused fleet
+ * summary legitimately leads with availability + incidents + anomalies and may omit or
+ * reformat p95 (e.g. "10.8s" not "10830") — that previously rejected good fleet prose.
+ * The guardrail still fires on filler (no real availability/incident figures -> missing).
+ */
+export function missingFigures(n: Narrative, fp: FactPack): string[] {
   const prose = `${n.headline} ${n.body}`;
-  const checks: string[] = [];
-  // Availability: match the INTEGER part (e.g. "77" in 77.66%) — lenient on decimals/
-  // rounding so a faithful citation ("77.66%", "77.7%", "77%") passes, while pure filler
-  // (no figure at all) fails.
-  if (fp.current.availabilityPct != null) checks.push(String(Math.trunc(fp.current.availabilityPct)));
-  if (fp.current.p95 != null) checks.push(String(fp.current.p95));
-  checks.push(String(fp.current.incidents));
-  return checks.every((fig) => prose.includes(fig));
+  const missing: string[] = [];
+  const pct = fp.current.availabilityPct;
+  if (pct != null) {
+    const alts = [String(Math.trunc(pct)), String(Math.round(pct))]; // rounding-tolerant
+    if (!alts.some((a) => prose.includes(a))) missing.push(`availability(${pct}%)`);
+  }
+  if (fp.current.incidents > 0 && !prose.includes(String(fp.current.incidents))) {
+    missing.push(`incidents(${fp.current.incidents})`);
+  }
+  return missing;
+}
+
+/** True when the prose surfaces the headline figures (see missingFigures). */
+export function spotCheck(n: Narrative, fp: FactPack): boolean {
+  return missingFigures(n, fp).length === 0;
 }
 
 /** Narrate the fact pack. Returns the narrative + which model produced it (the deployment,
@@ -319,8 +337,9 @@ export async function narrate(fp: FactPack): Promise<{ narrative: Narrative; mod
           body: parsed.body.trim(),
           highlights: parsed.highlights.slice(0, 5),
         };
-        if (spotCheck(n, fp)) return { narrative: n, model: DEFAULT_DEPLOYMENT ?? 'aoai' };
-        console.warn('[narrative] model output failed spot-check (key figures missing) — fallback');
+        const missing = missingFigures(n, fp);
+        if (missing.length === 0) return { narrative: n, model: DEFAULT_DEPLOYMENT ?? 'aoai' };
+        console.warn(`[narrative] model output failed spot-check (missing: ${missing.join(', ')}) — fallback`);
       } else {
         console.warn('[narrative] model output off-shape — fallback');
       }
