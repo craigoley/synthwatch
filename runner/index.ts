@@ -236,18 +236,32 @@ async function claim(id: number): Promise<Check | null> {
  * tick. Returns how many checks were force-run.
  */
 async function drainRunRequests(): Promise<number> {
-  // Claim every pending request in one atomic UPDATE; each row goes to exactly one replica.
-  const { rows: claimed } = await pool.query<{ check_id: number }>(
-    `UPDATE run_requests
-        SET status = 'done', completed_at = now()
-      WHERE id IN (SELECT id FROM run_requests WHERE status = 'pending'
-                    ORDER BY requested_at FOR UPDATE SKIP LOCKED)
-      RETURNING check_id`,
+  // Only consider pending requests whose check is ENABLED and ASSIGNED TO THIS LOCATION. ★ Robustness
+  // fix: the old version marked EVERY pending row 'done' in one atomic UPDATE up front, THEN tried to run
+  // each — so a runner that can't run a check (not assigned here / disabled) would CONSUME the request
+  // without running it (a lost on-demand run for any check not assigned to whichever location ticked
+  // first). Filtering to runnable-here requests first means a runner only ever claims what it can execute.
+  const { rows: pending } = await pool.query<{ id: number; check_id: number }>(
+    `SELECT rr.id, rr.check_id
+       FROM run_requests rr
+       JOIN check_locations cl ON cl.check_id = rr.check_id AND cl.location = $1
+       JOIN checks c           ON c.id = rr.check_id AND c.enabled
+      WHERE rr.status = 'pending'
+      ORDER BY rr.requested_at`,
+    [LOCATION],
   );
   let ran = 0;
-  for (const { check_id } of claimed) {
-    // Dedup: don't double-run if a scheduled (or prior on-demand) run is already in flight for this
-    // check at this location. Best-effort (a tiny race remains) — the common case is covered.
+  for (const { id, check_id } of pending) {
+    // Atomically claim THIS request — only one tick/replica wins (a concurrent claim updates 0 rows).
+    // We claim only AFTER confirming (above) this runner can run it, so a claimed row always runs here.
+    const { rowCount: won } = await pool.query(
+      `UPDATE run_requests SET status = 'done', completed_at = now() WHERE id = $1 AND status = 'pending'`,
+      [id],
+    );
+    if (!won) continue; // already claimed by another tick/replica
+
+    // Dedup: if a run is already in flight for this check here, the request is still consumed (the user's
+    // "run it now" intent is satisfied by the in-flight run) — just don't start a duplicate.
     const { rowCount: running } = await pool.query(
       `SELECT 1 FROM runs
         WHERE check_id = $1 AND location = $2 AND status = 'running'
@@ -255,11 +269,12 @@ async function drainRunRequests(): Promise<number> {
       [check_id, LOCATION],
     );
     if (running) {
-      console.log(`[run-now] check ${check_id} already running here — skipping the on-demand run`);
+      console.log(`[run-now] check ${check_id} already running here — request consumed, skipping a duplicate run`);
       continue;
     }
-    // Force-run: advance last_run_at unconditionally (so this tick's due-loop + other replicas skip
-    // it) and run it. Returns null if the check is disabled or not assigned to THIS location.
+
+    // Force-run: advance last_run_at unconditionally (so this tick's due-loop + other replicas skip it)
+    // and run it. Null only on a tiny race (disabled between the SELECT and now) — already consumed, fine.
     const check = await forceClaim(check_id);
     if (!check) continue;
     console.log(`[run-now] force-running check ${check.id} "${check.name}" (on-demand)`);
