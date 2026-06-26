@@ -489,6 +489,9 @@ CREATE TABLE reconcile_drift (
 -- The runner cold-starts every 5 min, so the spec cache lives in Postgres. Per due check:
 -- conditional-GET (If-None-Match: etag); 304 reuses compiled_js, 200 recompiles + upserts.
 -- last_good_* are populated here but only READ by slice 4's fetch-failure fallback.
+-- ★ LEAST-PRIVILEGE (0041): compiled_js is loaded + EXECUTED at runner privilege, so WRITE here is an
+-- RCE-equivalent surface. ONLY the runner (Postgres owner: synthadmin) may write it; the API role
+-- (synthwatch-api) is intentionally NOT granted INSERT/UPDATE/DELETE on spec_cache — do NOT add it.
 -- ---------------------------------------------------------------------------
 CREATE TABLE spec_cache (
     spec_path             text        PRIMARY KEY,
