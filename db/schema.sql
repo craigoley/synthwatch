@@ -224,6 +224,10 @@ CREATE TABLE runs (
     -- (mirrors db/migrations/0012_trace_url.sql). NULL for pass/non-browser runs
     -- and when capture/upload failed (non-fatal).
     trace_url      TEXT,
+    -- Compact, filtered trace SIGNALS extracted at capture time (mirrors 0040_trace_signals.sql):
+    -- network summary + real site console errors, same shape as the API's TraceExtractor. NULL = no
+    -- trace this run or extraction failed (non-fatal). Written for any traced run (success + failure).
+    trace_signals  JSONB,
     -- For kind='ssl' runs: signed days relative to the cert's notAfter (+ = until
     -- expiry, - = past expiry). NULL for non-ssl runs or when no cert was obtained.
     -- (Mirrors db/migrations/0007_cert_days_remaining.sql.) error_message keeps the
