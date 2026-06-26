@@ -85,6 +85,20 @@ nodeTest('real repo spec compiles + alias resolves to shim + test() captured', a
   assert.equal(typeof tests[0].fn, 'function');
 });
 
+// ★ Regression: the compiled_js is CACHED in Postgres and shared across machines (a Mac-mini
+// warm + the Azure runners at /app). It must NOT bake any ABSOLUTE filesystem path — a
+// machine path baked into the shim import is unresolvable on a different host ("Cannot find
+// module '/Users/.../specShim.js'"). compileSpec emits a placeholder; loadCompiledSpec resolves
+// it to THIS machine's shim at load time.
+nodeTest('compiled spec is machine-independent (placeholder, no absolute fs path)', async () => {
+  const { compileSpec } = await import('./compileSpec.js');
+  const js = await compileSpec(DASHBOARD_SPEC, 'dashboard.spec.ts');
+  assert.match(js, /from\s+"__SW_SPEC_SHIM__"/, 'shim import is the machine-independent placeholder');
+  assert.ok(!js.includes('/Users/'), 'no dev absolute path baked in');
+  assert.ok(!js.includes('/app/dist'), 'no container absolute path baked in');
+  assert.ok(!/from\s+"file:\/\//.test(js), 'no absolute file:// URL baked into the cached output');
+});
+
 // ===========================================================================================
 // PROOF 2 (a) — passing spec → run_steps + pass, MATCHING a native defineFlow equivalent.
 // ===========================================================================================
