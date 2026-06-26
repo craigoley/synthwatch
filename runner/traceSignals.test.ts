@@ -5,12 +5,19 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import AdmZip from 'adm-zip';
-import { writeFileSync, rmSync } from 'node:fs';
+import { writeFileSync, rmSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { extractNetwork, extractConsole, extractTraceSignals } from './traceSignals.js';
 
 const TARGET = 'www.wegmans.com';
+
+// A unique, unguessable temp dir per use (mkdtemp) — the SECURE temp-file pattern (a predictable
+// tmpdir()/<name> in a shared dir is a symlink/race vector; matches production loadCompiledSpec).
+// Caller writes a file inside the returned dir and rmSync(dir, { recursive }) in finally.
+function tmpDir(): string {
+  return mkdtempSync(join(tmpdir(), 'tsig-'));
+}
 
 // ── trace.trace console fixture: 2 info/log chatter, 5 extension-noise, 3 real (2 site + 1 third-party) ──
 const CONSOLE_NDJSON = [
@@ -96,7 +103,8 @@ test('extractTraceSignals parses a real zip (both streams) + derives targetHost 
   zip.addFile('trace.trace', Buffer.from(CONSOLE_NDJSON));
   // an unrelated multi-MB entry that must NOT be read (we only touch the two NDJSON entries):
   zip.addFile('resources/blob.bin', Buffer.alloc(64));
-  const path = join(tmpdir(), `tsig-${process.pid}-ok.zip`);
+  const dir = tmpDir();
+  const path = join(dir, 'trace.zip');
   zip.writeZip(path);
   try {
     const sig = extractTraceSignals(path, 'https://www.wegmans.com/checkout');
@@ -108,28 +116,30 @@ test('extractTraceSignals parses a real zip (both streams) + derives targetHost 
     const json = JSON.parse(JSON.stringify(sig));
     assert.deepEqual(Object.keys(json).sort(), ['console', 'network', 'targetHost']);
   } finally {
-    rmSync(path, { force: true });
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 
 test('extractTraceSignals is non-fatal: corrupt zip -> null (trace_signals stays null)', () => {
-  const path = join(tmpdir(), `tsig-${process.pid}-bad.zip`);
+  const dir = tmpDir();
+  const path = join(dir, 'bad.zip');
   writeFileSync(path, Buffer.from([1, 2, 3, 4])); // not a zip
   try {
     assert.equal(extractTraceSignals(path, 'https://www.wegmans.com/'), null);
   } finally {
-    rmSync(path, { force: true });
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 
 test('extractTraceSignals -> null when the zip has no trace entries (not a Playwright trace)', () => {
   const zip = new AdmZip();
   zip.addFile('unrelated.txt', Buffer.from('hi'));
-  const path = join(tmpdir(), `tsig-${process.pid}-empty.zip`);
+  const dir = tmpDir();
+  const path = join(dir, 'empty.zip');
   zip.writeZip(path);
   try {
     assert.equal(extractTraceSignals(path, 'https://www.wegmans.com/'), null);
   } finally {
-    rmSync(path, { force: true });
+    rmSync(dir, { recursive: true, force: true });
   }
 });
