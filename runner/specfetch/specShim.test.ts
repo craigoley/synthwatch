@@ -125,7 +125,7 @@ nodeTest('(a) passing spec matches native run_steps + pass', async () => {
   });
   // defineFlow body reads page from rec.context(); give the recorder a fake page.
   const nat: RecordedStep[] = [];
-  const r2WithPage = new StepRecorder(1, fakePage(), 'about:blank', async (s) => { nat.push(s); });
+  const r2WithPage = new StepRecorder(1, fakePage(), 'about:blank', async (s) => { nat.push(s); }, async () => {});
   await native(r2WithPage);
 
   assert.deepEqual(names(fetched), ['open the dashboard:pass', 'assert the monitor grid rendered:pass']);
@@ -158,7 +158,7 @@ nodeTest("(b) failing assertion classifies 'fail' (matches native expect)", asyn
     });
   });
   const natSteps: RecordedStep[] = [];
-  const r2 = new StepRecorder(1, fakePage(), 'about:blank', async (s) => { natSteps.push(s); });
+  const r2 = new StepRecorder(1, fakePage(), 'about:blank', async (s) => { natSteps.push(s); }, async () => {});
   await assert.rejects(() => native(r2));
   assert.equal(natSteps[0].status, 'fail', 'native assertion also fail');
 });

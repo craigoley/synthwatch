@@ -305,9 +305,15 @@ nodeTest('degraded last-good runs via the shim -> normal pass (real outcome, not
   // The degraded spec RUNS and produces a normal pass — not a false failure.
   const [t] = await loadCompiledSpec(res.compiledJs);
   const steps: RecordedStep[] = [];
-  const rec = new StepRecorder(1, null as unknown as Page, 'about:blank', async (s) => {
-    steps.push(s);
-  });
+  const rec = new StepRecorder(
+    1,
+    null as unknown as Page,
+    'about:blank',
+    async (s) => {
+      steps.push(s);
+    },
+    async () => {}, // running marker: no-op (keep this unit test off the real DB pool)
+  );
   await specToFlow(t.fn, fakePage())(rec);
   assert.deepEqual(
     steps.map((s) => `${s.name}:${s.status}`),
