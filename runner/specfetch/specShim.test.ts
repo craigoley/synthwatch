@@ -33,9 +33,15 @@ test('SynthWatch dashboard loads', async ({ page }) => {
 // --- a recorder whose steps land in an array (real StepRecorder.step logic, no DB) ----------
 function recordingRecorder(): { rec: StepRecorder; steps: RecordedStep[] } {
   const steps: RecordedStep[] = [];
-  const rec = new StepRecorder(1, null as unknown as Page, 'about:blank', async (s) => {
-    steps.push(s);
-  });
+  const rec = new StepRecorder(
+    1,
+    null as unknown as Page,
+    'about:blank',
+    async (s) => {
+      steps.push(s); // terminal sink: collect the finalized step
+    },
+    async () => {}, // running marker: no-op (the live 'running' INSERT is DB-only; tests assert terminal steps)
+  );
   return { rec, steps };
 }
 
@@ -119,7 +125,7 @@ nodeTest('(a) passing spec matches native run_steps + pass', async () => {
   });
   // defineFlow body reads page from rec.context(); give the recorder a fake page.
   const nat: RecordedStep[] = [];
-  const r2WithPage = new StepRecorder(1, fakePage(), 'about:blank', async (s) => { nat.push(s); });
+  const r2WithPage = new StepRecorder(1, fakePage(), 'about:blank', async (s) => { nat.push(s); }, async () => {});
   await native(r2WithPage);
 
   assert.deepEqual(names(fetched), ['open the dashboard:pass', 'assert the monitor grid rendered:pass']);
@@ -152,7 +158,7 @@ nodeTest("(b) failing assertion classifies 'fail' (matches native expect)", asyn
     });
   });
   const natSteps: RecordedStep[] = [];
-  const r2 = new StepRecorder(1, fakePage(), 'about:blank', async (s) => { natSteps.push(s); });
+  const r2 = new StepRecorder(1, fakePage(), 'about:blank', async (s) => { natSteps.push(s); }, async () => {});
   await assert.rejects(() => native(r2));
   assert.equal(natSteps[0].status, 'fail', 'native assertion also fail');
 });
