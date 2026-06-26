@@ -11,6 +11,13 @@ import { BlobServiceClient } from '@azure/storage-blob';
 const CONNECTION_STRING = process.env.AZURE_STORAGE_CONNECTION_STRING;
 const CONTAINER = process.env.AZURE_STORAGE_CONTAINER ?? 'synthwatch-artifacts';
 
+// ★ Blob key for a monitor's last-known-good success trace. STABLE (no runId/timestamp) so each
+// success OVERWRITES the prior baseline — exactly one slot per monitor. The `success-latest/` prefix
+// is DELIBERATELY OUTSIDE the 90d lifecycle purge (infra/main.bicep targets `traces/` and `run-`), so
+// the healthiest monitors keep their baseline. Exported as a pure helper so the purge-safety invariant
+// is unit-testable. Mirrors the `baselines/check-<id>.png` per-check-overwrite pattern.
+export const successTraceBlobName = (checkId: number): string => `success-latest/check-${checkId}.zip`;
+
 /**
  * Upload a PNG screenshot for a failed run. Returns the blob URL, or null if
  * storage is not configured (or the upload fails — never throws into the run).
@@ -84,6 +91,33 @@ export async function uploadTrace(runId: number, filePath: string): Promise<stri
     return blob.url;
   } catch (err) {
     console.error(`[artifacts] trace upload failed for run ${runId}:`, err);
+    return null;
+  }
+}
+
+/**
+ * Upload a SUCCESSFUL browser run's Playwright trace.zip to a STABLE per-monitor key
+ * (success-latest/check-<id>.zip) — OVERWRITING the previous baseline, so there's exactly one
+ * "last known good" trace per monitor (most-recent-success, not history). Unlike per-run failure
+ * traces, this key is OUTSIDE the 90d lifecycle purge, so it persists as long as the monitor stays
+ * green (until the next success overwrites it). Returns the blob URL, or null if storage is
+ * unconfigured / the upload fails — never throws into the run.
+ */
+export async function uploadSuccessTrace(checkId: number, filePath: string): Promise<string | null> {
+  if (!CONNECTION_STRING) return null; // storage disabled
+
+  try {
+    const service = BlobServiceClient.fromConnectionString(CONNECTION_STRING);
+    const container = service.getContainerClient(CONTAINER);
+    await container.createIfNotExists();
+
+    const blob = container.getBlockBlobClient(successTraceBlobName(checkId));
+    await blob.uploadFile(filePath, {
+      blobHTTPHeaders: { blobContentType: 'application/zip' },
+    });
+    return blob.url;
+  } catch (err) {
+    console.error(`[artifacts] success trace upload failed for check ${checkId}:`, err);
     return null;
   }
 }

@@ -286,10 +286,14 @@ resource artifactContainer 'Microsoft.Storage/storageAccounts/blobServices/conta
 }
 
 // Lifecycle policy: auto-delete failure artifacts older than artifactRetentionDays
-// (default 90). Covers BOTH prefixes in the artifact container — traces/ (zip) and
+// (default 90). Covers BOTH per-run prefixes in the artifact container — traces/ (zip) and
 // the root-level run-*.png screenshots — server-side, no cron/code. The DB still
 // holds runs.trace_url/screenshot_url after deletion (a dangling reference the
 // dashboard should 404 gracefully; tracked as a follow-up).
+// ★ DELIBERATELY NOT purged (do NOT add these prefixes): the per-MONITOR stable, OVERWRITE keys
+//   `baselines/check-<id>.png` (RCA visual baseline) and `success-latest/check-<id>.zip` (last-known-
+//   good trace). Each is a single overwritten slot per monitor (never accumulates), and a monitor that
+//   stays green for 90d must NOT lose its only baseline — so they live OUTSIDE this age-based purge.
 resource artifactRetention 'Microsoft.Storage/storageAccounts/managementPolicies@2023-05-01' = {
   parent: storage
   name: 'default'

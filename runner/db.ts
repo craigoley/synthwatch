@@ -119,6 +119,12 @@ export interface Check {
   // Most-recent-passing browser screenshot baseline (Blob URL); RCA's visual-diff
   // reference. Overwritten on each passing browser run; null = none yet.
   baseline_screenshot_url: string | null;
+  // Last-known-good Playwright TRACE baseline for this monitor (Blob URL at the stable,
+  // purge-EXEMPT key success-latest/check-<id>.zip — overwritten on each success, one slot
+  // per monitor). success_trace_at gates re-upload (refresh at most every few hours) and
+  // dates the baseline in the UI. null/null => none yet. See uploadSuccessTrace + 0039.
+  success_trace_url: string | null;
+  success_trace_at: Date | null;
   // Monitors-as-code spec path (Phase 6b Option C, mirrors 0033). A Git-managed browser
   // check fetches+runs this spec from synthwatch-monitors at run start (see executeBrowser);
   // null => a legacy/dashboard check that runs the baked-in flow_name. claim() does SELECT *,

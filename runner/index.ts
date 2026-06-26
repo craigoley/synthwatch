@@ -32,7 +32,12 @@ import { loadCompiledSpec } from './specfetch/compileSpec.js';
 import { specToFlow } from './specfetch/specShim.js';
 import { syncFlowManifest } from './flowManifest.js';
 import { drainTestSends } from './testSend.js';
-import { uploadScreenshot, uploadTrace, uploadBaselineScreenshot } from './artifacts.js';
+import {
+  uploadScreenshot,
+  uploadTrace,
+  uploadBaselineScreenshot,
+  uploadSuccessTrace,
+} from './artifacts.js';
 import os from 'node:os';
 import path from 'node:path';
 import { unlink } from 'node:fs/promises';
@@ -80,6 +85,12 @@ const STALE_RUNNING = "30 minutes";
 // doesn't just hit the same in-flight transient blip. Fixed (not exponential): retry
 // counts are tiny and the tick is time-bounded by the ACA replicaTimeout.
 const RETRY_BACKOFF_MS = 2000;
+
+// How fresh the per-monitor success-trace baseline must be before we SKIP re-uploading it on a pass.
+// Capturing+uploading a multi-MB trace on every successful tick would be wasteful for a healthy 5-min
+// monitor (288 uploads/day to maintain ONE overwritten slot); a baseline up to this stale is a fine
+// "last known good" to diff against / feed AI insights. Failures are never throttled (always traced).
+const SUCCESS_TRACE_REFRESH_MS = 6 * 60 * 60 * 1000; // 6h
 
 // This runner's vantage point, stamped onto every run it writes. The primary
 // region leaves this unset (=> 'default') so single-region behaviour is exactly
@@ -238,6 +249,11 @@ async function runOne(check: Check): Promise<void> {
   // failure_threshold (mechanism 2, AFTER this) never sees the retried-away attempts.
   // retries=0 => no retry (pre-0021 behaviour).
   const maxAttempts = check.retries + 1;
+  // Capture this run's trace as the SUCCESS baseline only if the monitor's existing baseline is
+  // missing or older than SUCCESS_TRACE_REFRESH_MS (throttle — see the const). Decided up front from
+  // the claimed check row; failures ignore this and are always traced.
+  const lastSuccessTraceMs = check.success_trace_at ? check.success_trace_at.getTime() : 0;
+  const captureSuccessTrace = Date.now() - lastSuccessTraceMs > SUCCESS_TRACE_REFRESH_MS;
   // Wall-clock start of the (final) executor attempt — the OTel root span's start.
   let execStartMs = Date.now();
   const outcome: Outcome = await runWithRetry<Outcome>(
@@ -249,7 +265,7 @@ async function runOne(check: Check): Promise<void> {
         if (check.kind === 'dns' || check.kind === 'tcp' || check.kind === 'ping')
           return await executeNet(check);
         if (check.kind === 'multistep') return await executeMultistep(check, runId);
-        return await executeBrowser(check, runId);
+        return await executeBrowser(check, runId, captureSuccessTrace);
       } catch (err) {
         // Unexpected runner error (e.g. flow loader threw) -> 'error', not 'fail'.
         return errorOutcome(err instanceof Error ? err.message : String(err));
@@ -285,10 +301,29 @@ async function runOne(check: Check): Promise<void> {
     screenshotUrl = await uploadScreenshot(runId, outcome.screenshot);
   }
 
-  // Upload the failure trace (non-fatal), then delete the temp file regardless.
+  // Upload the trace (non-fatal), then delete the temp file regardless. ROUTE by verdict:
+  //  • fail/error -> per-run key (runs.trace_url), rides the 90d artifact purge.
+  //  • pass/warn  -> the monitor's last-known-good baseline at the stable, purge-EXEMPT key
+  //                  (success-latest/check-<id>.zip), OVERWRITING the prior one. Recorded on the
+  //                  CHECK (not the run) since the slot is shared/overwritten — an old pass run must
+  //                  not point at a now-newer baseline, so runs.trace_url stays null for successes.
   let traceUrl: string | null = null;
   if (outcome.tracePath) {
-    traceUrl = await uploadTrace(runId, outcome.tracePath);
+    if (status === 'fail' || status === 'error') {
+      traceUrl = await uploadTrace(runId, outcome.tracePath);
+    } else if (status === 'pass' || status === 'warn') {
+      try {
+        const url = await uploadSuccessTrace(check.id, outcome.tracePath);
+        if (url) {
+          await pool.query(`UPDATE checks SET success_trace_url = $2, success_trace_at = now() WHERE id = $1`, [
+            check.id,
+            url,
+          ]);
+        }
+      } catch (err) {
+        console.warn(`[runner] check ${check.id} success trace skipped (non-fatal):`, err);
+      }
+    }
     await unlink(outcome.tracePath).catch(() => {});
   }
 
@@ -499,7 +534,14 @@ function errorOutcomeStandalone(msg: string): Outcome {
   };
 }
 
-async function executeBrowser(check: Check, runId: number): Promise<Outcome> {
+async function executeBrowser(
+  check: Check,
+  runId: number,
+  // Whether to KEEP the trace if this run passes (the success baseline). Failures are ALWAYS kept
+  // regardless. Decided upstream in runOne (throttled by the monitor's success_trace_at) so a
+  // healthy frequent monitor doesn't serialize+upload a multi-MB trace every tick.
+  captureSuccessTrace: boolean,
+): Promise<Outcome> {
   // Resolve the flow source BEFORE opening a browser. A Git-managed check (spec_path set) FETCHES
   // its Playwright spec from synthwatch-monitors via the durable cache (#101-#104): 304-reuse /
   // 200-recompile / fallback-to-last-known-good / infra-error. A legacy/dashboard check (no
@@ -538,9 +580,10 @@ async function executeBrowser(check: Check, runId: number): Promise<Outcome> {
   // the whole page load; collected in the finally below.
   const capture = await startMetricsCapture(context, page);
 
-  // Start a Playwright trace for the whole run. We KEEP it only on failure (see
-  // finally) so passing runs cost no storage. sources:false avoids embedding the
-  // flow source; screenshots+snapshots are the debugging value. Non-fatal.
+  // Start a Playwright trace for the whole run (recording always happened; the cost change is the
+  // SAVE). We keep it on FAILURE (per-run, rides the 90d purge) and on SUCCESS when captureSuccessTrace
+  // is set (the last-known-good baseline). sources:false avoids embedding the flow source;
+  // screenshots+snapshots are the debugging value. Non-fatal.
   let tracingOn = false;
   await context.tracing
     .start({ screenshots: true, snapshots: true, sources: false })
@@ -593,11 +636,13 @@ async function executeBrowser(check: Check, runId: number): Promise<Outcome> {
       screenshot = await page.screenshot().catch(() => null);
     }
   } finally {
-    // Stop tracing BEFORE closing the context. Keep the trace.zip on failure
-    // (write it to a temp file runOne uploads); discard it on pass. Non-fatal.
+    // Stop tracing BEFORE closing the context. Write the trace.zip to a temp file (which runOne
+    // uploads — to the per-run key on failure, or the per-monitor baseline key on success) when we
+    // want to keep it: ALWAYS on failure, and on a pass only when captureSuccessTrace says the
+    // baseline is due a refresh. Otherwise stop() discards it (no serialize, no upload). Non-fatal.
     if (tracingOn) {
       try {
-        if (failed) {
+        if (failed || captureSuccessTrace) {
           tracePath = path.join(os.tmpdir(), `sw-trace-${runId}-${Date.now()}.zip`);
           await context.tracing.stop({ path: tracePath });
         } else {
