@@ -458,6 +458,24 @@ CREATE TABLE test_send_requests (
 CREATE INDEX test_send_requests_pending_idx ON test_send_requests (requested_at) WHERE status = 'pending';
 
 -- ---------------------------------------------------------------------------
+-- run_requests: on-demand "Run now" queue (mirrors 0042_run_requests.sql). The API writes a
+-- 'pending' row + triggers the runner job on-demand (same path as test-sends); the runner drains
+-- it at startup, force-runs the check via the normal runOne path (trace/signals/verdict/RCA flow
+-- identically), and marks it done. The cron tick is the fallback. See runner/index.ts drainRunRequests.
+-- ---------------------------------------------------------------------------
+CREATE TABLE run_requests (
+    id           BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    check_id     BIGINT      NOT NULL REFERENCES checks(id) ON DELETE CASCADE,
+    status       TEXT        NOT NULL DEFAULT 'pending'
+                             CHECK (status IN ('pending', 'done')),
+    requested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at TIMESTAMPTZ
+);
+CREATE INDEX run_requests_pending_idx ON run_requests (requested_at) WHERE status = 'pending';
+-- Idempotency: at most one pending request per check (re-clicks coalesce).
+CREATE UNIQUE INDEX run_requests_one_pending_per_check ON run_requests (check_id) WHERE status = 'pending';
+
+-- ---------------------------------------------------------------------------
 -- flow_manifest: available browser flows (mirrors 0009_flow_manifest.sql).
 -- Populated by the runner (it discovers its own flow modules at tick start and
 -- upserts here); the API/dashboard read this instead of distinct checks.flow_name.
