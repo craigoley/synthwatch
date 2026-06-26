@@ -118,6 +118,12 @@ CREATE TABLE checks (
     -- browser run; RCA reads this as the visual-diff baseline. NULL = none yet.
     baseline_screenshot_url TEXT,
 
+    -- Last-known-good Playwright TRACE baseline (mirrors 0039_success_trace.sql). A stable,
+    -- purge-EXEMPT per-check Blob key (success-latest/check-<id>.zip) overwritten on each success;
+    -- success_trace_at dates it + throttles re-upload. NULL/NULL = none yet.
+    success_trace_url       TEXT,
+    success_trace_at        TIMESTAMPTZ,
+
     -- Monitors-as-code identity (mirrors 0030_source_key.sql). Binds this row to a
     -- synthwatch-monitors manifest `id`. NULL => dashboard/seed-created (reconcile
     -- ignores it); NOT NULL => Git-managed. NOT the same as flow_name (manifest id
