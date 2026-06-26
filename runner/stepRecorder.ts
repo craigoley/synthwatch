@@ -43,18 +43,39 @@ export interface RecordedStep {
   errorMessage: string | null;
 }
 
-/** Where a recorded step goes. Default writes run_steps; tests inject an in-memory sink. */
+/** Where a TERMINAL recorded step goes. Default finalizes the run_steps row; tests inject an in-memory sink. */
 export type StepSink = (step: RecordedStep) => Promise<void>;
 
-/** Production sink: the run_steps INSERT (unchanged behaviour). */
-const poolSink: StepSink = (s) =>
+/** Marks a step 'running' the moment it starts (one row per step). Default writes run_steps; tests inject a no-op. */
+export type RunningSink = (runId: number, index: number, name: string) => Promise<void>;
+
+/** Production running-marker: INSERT a 'running' run_steps row (duration 0; started_at=now() dates the step). */
+const poolRunningSink: RunningSink = (runId, index, name) =>
   pool
     .query(
+      `INSERT INTO run_steps (run_id, step_index, name, status, duration_ms)
+       VALUES ($1, $2, $3, 'running', 0)`,
+      [runId, index, name],
+    )
+    .then(() => undefined);
+
+/** Production terminal sink: FINALIZE the step's row in place (running -> pass/fail/error + real duration).
+ *  Falls back to an INSERT if the 'running' marker never landed (its write was non-fatally swallowed), so a
+ *  step is recorded exactly once either way. */
+const poolSink: StepSink = async (s) => {
+  const { rowCount } = await pool.query(
+    `UPDATE run_steps SET status = $3, duration_ms = $4, error_message = $5
+      WHERE run_id = $1 AND step_index = $2`,
+    [s.runId, s.index, s.status, s.durationMs, s.errorMessage],
+  );
+  if (!rowCount) {
+    await pool.query(
       `INSERT INTO run_steps (run_id, step_index, name, status, duration_ms, error_message)
        VALUES ($1, $2, $3, $4, $5, $6)`,
       [s.runId, s.index, s.name, s.status, s.durationMs, s.errorMessage],
-    )
-    .then(() => undefined);
+    );
+  }
+};
 
 export class StepRecorder {
   private stepIndex = 0;
@@ -67,18 +88,28 @@ export class StepRecorder {
     private readonly page: Page,
     /** The check's target_url, exposed to flows for navigation. */
     public readonly baseUrl: string,
-    /** Sink for recorded steps. Defaults to the run_steps INSERT; tests override it. */
+    /** Sink for TERMINAL recorded steps. Defaults to the run_steps finalize; tests override it. */
     private readonly sink: StepSink = poolSink,
+    /** Sink that marks a step 'running' on start. Defaults to the run_steps INSERT; tests pass a no-op. */
+    private readonly markRunningSink: RunningSink = poolRunningSink,
   ) {}
 
   /**
    * Run one instrumented step. The body uses `page` from its closure (idiomatic
-   * Playwright); the step is timed, persisted to run_steps, and on error the
-   * failure is recorded and rethrown (the flow must not continue past a break).
+   * Playwright); the step is marked 'running' as it starts (live progress), timed,
+   * finalized in run_steps to pass/fail/error, and on error the failure is recorded
+   * and rethrown (the flow must not continue past a break).
    */
   async step<T>(name: string, body: () => Promise<T>): Promise<T> {
     const index = this.stepIndex++;
     const start = Date.now();
+    // Mark 'running' so the live checklist shows ⟳ on the in-flight step. NON-FATAL: a failed marker just
+    // means no transient ⟳ (the terminal write still lands via the INSERT fallback) — never break the run.
+    try {
+      await this.markRunningSink(this.runId, index, name);
+    } catch (err) {
+      console.warn(`[steps] run ${this.runId} step ${index} running-marker skipped (non-fatal):`, err);
+    }
     try {
       const result = await body();
       await this.record(index, name, 'pass', Date.now() - start, null);

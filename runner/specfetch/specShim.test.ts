@@ -33,9 +33,15 @@ test('SynthWatch dashboard loads', async ({ page }) => {
 // --- a recorder whose steps land in an array (real StepRecorder.step logic, no DB) ----------
 function recordingRecorder(): { rec: StepRecorder; steps: RecordedStep[] } {
   const steps: RecordedStep[] = [];
-  const rec = new StepRecorder(1, null as unknown as Page, 'about:blank', async (s) => {
-    steps.push(s);
-  });
+  const rec = new StepRecorder(
+    1,
+    null as unknown as Page,
+    'about:blank',
+    async (s) => {
+      steps.push(s); // terminal sink: collect the finalized step
+    },
+    async () => {}, // running marker: no-op (the live 'running' INSERT is DB-only; tests assert terminal steps)
+  );
   return { rec, steps };
 }
 

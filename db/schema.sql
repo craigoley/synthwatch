@@ -252,8 +252,9 @@ CREATE TABLE run_steps (
     run_id         BIGINT      NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
     step_index     INTEGER     NOT NULL,
     name           TEXT        NOT NULL,
-    -- pass | fail (a flow expectation) | error (an exception/timeout).
-    status         TEXT        NOT NULL CHECK (status IN ('pass', 'fail', 'error')),
+    -- pass | fail (a flow expectation) | error (an exception/timeout) | running (transient — a step in
+    -- flight; finalized in place to a terminal status on completion). Mirrors 0043.
+    status         TEXT        NOT NULL CHECK (status IN ('pass', 'fail', 'error', 'running')),
     duration_ms    INTEGER     NOT NULL,
     error_message  TEXT,
     started_at     TIMESTAMPTZ NOT NULL DEFAULT now()
