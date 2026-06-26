@@ -38,6 +38,7 @@ import {
   uploadBaselineScreenshot,
   uploadSuccessTrace,
 } from './artifacts.js';
+import { extractTraceSignals } from './traceSignals.js';
 import os from 'node:os';
 import path from 'node:path';
 import { unlink } from 'node:fs/promises';
@@ -382,7 +383,17 @@ async function runOne(check: Check): Promise<void> {
   //                  CHECK (not the run) since the slot is shared/overwritten — an old pass run must
   //                  not point at a now-newer baseline, so runs.trace_url stays null for successes.
   let traceUrl: string | null = null;
+  // Compact, filtered trace SIGNALS persisted per run (0040) — extracted from the local zip while it's in
+  // hand (no later re-download), for ANY traced run (success baseline AND failure). Reuses the SAME extraction
+  // as the API's TraceExtractor so trace-diff + ai-insights share one schema. Non-fatal: a bad zip → null.
+  let traceSignalsJson: string | null = null;
   if (outcome.tracePath) {
+    try {
+      const signals = extractTraceSignals(outcome.tracePath, check.target_url);
+      if (signals) traceSignalsJson = JSON.stringify(signals);
+    } catch (err) {
+      console.warn(`[runner] run ${runId} trace-signals extraction skipped (non-fatal):`, err);
+    }
     if (status === 'fail' || status === 'error') {
       traceUrl = await uploadTrace(runId, outcome.tracePath);
     } else if (status === 'pass' || status === 'warn') {
@@ -419,7 +430,7 @@ async function runOne(check: Check): Promise<void> {
     `UPDATE runs
         SET status = $2, finished_at = now(), duration_ms = $3, http_status = $4,
             error_message = $5, failed_step = $6, screenshot_url = $7,
-            cert_days_remaining = $8, trace_url = $9
+            cert_days_remaining = $8, trace_url = $9, trace_signals = $10::jsonb
       WHERE id = $1`,
     [
       runId,
@@ -431,6 +442,7 @@ async function runOne(check: Check): Promise<void> {
       screenshotUrl,
       outcome.certDaysRemaining,
       traceUrl,
+      traceSignalsJson,
     ],
   );
 
