@@ -128,6 +128,15 @@ async function main(): Promise<void> {
   // — a sync failure must never break the tick.
   await syncFlowManifest().catch((err) => console.warn('[manifest] sync failed:', err));
 
+  // On-demand "Run now": force-run any queued run_requests BEFORE the due-loop (forceClaim advances
+  // last_run_at, so a check run here is then skipped by findDueChecks below — no double-run). Unlike
+  // test-sends, we do NOT exit: a triggered tick runs the requested check(s) AND its normal due work.
+  const forced = await drainRunRequests().catch((err) => {
+    console.error('[run-now] drain failed (non-fatal):', err);
+    return 0;
+  });
+  if (forced > 0) console.log(`[run-now] force-ran ${forced} on-demand check(s)`);
+
   const due = await findDueChecks();
   console.log(`[runner] ${due.length} check(s) due`);
 
@@ -210,6 +219,71 @@ async function claim(id: number): Promise<Check | null> {
      mirror AS (
        UPDATE checks SET last_run_at = now()
         WHERE id = (SELECT check_id FROM claimed)
+     )
+     SELECT c.* FROM checks c JOIN claimed ON claimed.check_id = c.id`,
+    [id, LOCATION],
+  );
+  return rows[0] ?? null;
+}
+
+/**
+ * On-demand "Run now" (mirrors drainTestSends): the API enqueues a run_requests row + fires this
+ * Job immediately (ARM jobs/start), so a triggered tick runs the check NOW instead of waiting for
+ * the timer. Atomically claim ALL pending requests (mark done; SKIP LOCKED so concurrent replicas
+ * each own a disjoint set), then force-run each at THIS location through the normal runOne path —
+ * so trace / signals / verdict / RCA flow identically. NON-FATAL: a drain failure never breaks the
+ * tick. Returns how many checks were force-run.
+ */
+async function drainRunRequests(): Promise<number> {
+  // Claim every pending request in one atomic UPDATE; each row goes to exactly one replica.
+  const { rows: claimed } = await pool.query<{ check_id: number }>(
+    `UPDATE run_requests
+        SET status = 'done', completed_at = now()
+      WHERE id IN (SELECT id FROM run_requests WHERE status = 'pending'
+                    ORDER BY requested_at FOR UPDATE SKIP LOCKED)
+      RETURNING check_id`,
+  );
+  let ran = 0;
+  for (const { check_id } of claimed) {
+    // Dedup: don't double-run if a scheduled (or prior on-demand) run is already in flight for this
+    // check at this location. Best-effort (a tiny race remains) — the common case is covered.
+    const { rowCount: running } = await pool.query(
+      `SELECT 1 FROM runs
+        WHERE check_id = $1 AND location = $2 AND status = 'running'
+          AND started_at > now() - make_interval(secs => 240) LIMIT 1`,
+      [check_id, LOCATION],
+    );
+    if (running) {
+      console.log(`[run-now] check ${check_id} already running here — skipping the on-demand run`);
+      continue;
+    }
+    // Force-run: advance last_run_at unconditionally (so this tick's due-loop + other replicas skip
+    // it) and run it. Returns null if the check is disabled or not assigned to THIS location.
+    const check = await forceClaim(check_id);
+    if (!check) continue;
+    console.log(`[run-now] force-running check ${check.id} "${check.name}" (on-demand)`);
+    await runOne(check);
+    ran++;
+  }
+  return ran;
+}
+
+/**
+ * Like claim(), but UNCONDITIONAL (no due predicate) — for an on-demand run. Advances last_run_at
+ * for (check, $LOCATION) so the normal due-loop and concurrent replicas treat it as just-run, and
+ * returns the check row if it's enabled AND assigned to this location (else null).
+ */
+async function forceClaim(id: number): Promise<Check | null> {
+  const { rows } = await pool.query<Check>(
+    `WITH claimed AS (
+       UPDATE check_locations cl
+          SET last_run_at = now()
+         FROM checks c
+        WHERE cl.check_id = $1 AND cl.location = $2 AND c.id = cl.check_id AND c.enabled
+       RETURNING cl.check_id
+     ),
+     mirror AS (
+       UPDATE checks SET last_run_at = now() WHERE id = (SELECT check_id FROM claimed)
      )
      SELECT c.* FROM checks c JOIN claimed ON claimed.check_id = c.id`,
     [id, LOCATION],
