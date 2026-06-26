@@ -1,10 +1,19 @@
-// Phase 6b Option C — SLICE 1 (SPIKE). Runtime compile of a fetched .spec.ts.
+// Phase 6b Option C — runtime compile of a fetched .spec.ts.
 //
 // esbuild transforms the TypeScript spec to a JS ESM module string, ALIASING the spec's
 // `lib/flow` import to the runner's shim (specShim.js) and marking it EXTERNAL so the output
 // imports the real shim module at runtime (the SAME instance the runner uses → shared test
-// registry + ALS). `playwright` is external too (image-provided). ★ The alias resolving to the
-// shim is the key uncertainty the spike must prove; loadCompiledSpec exercises it end to end.
+// registry + ALS). `playwright` is external too (image-provided).
+//
+// ★ MACHINE-INDEPENDENT OUTPUT (the spec_cache portability fix): the compiled JS is CACHED in
+// Postgres and SHARED across machines (the Mac mini that warms the cache, and the Azure runners
+// at /app). Baking the COMPILING machine's absolute specShim path into the output (the old
+// `new URL('./specShim.js', import.meta.url)` alias) produced JS that only resolves on THAT
+// machine — a cache warmed locally imported `/Users/.../runner/dist/specfetch/specShim.js`,
+// which does not exist in the Azure container → every Option C run errored with "Cannot find
+// module". So compileSpec emits a STABLE PLACEHOLDER, and loadCompiledSpec substitutes the
+// EXECUTING machine's real shim URL at load time. The cached JS is portable; each runner
+// resolves the shim against ITS OWN install path.
 import { build } from 'esbuild';
 import { pathToFileURL } from 'node:url';
 import { writeFile, mkdtemp, rm } from 'node:fs/promises';
@@ -12,8 +21,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { drainCapturedTests, type CapturedTest } from './specShim.js';
 
-// Absolute path to the COMPILED shim (dist/specfetch/specShim.js at runtime). The compiled
-// spec will `import { ... } from "<file://this>"`.
+// A machine-independent sentinel emitted into compiled_js in place of the shim's absolute path;
+// loadCompiledSpec replaces it with the executing machine's specShim.js URL at load time.
+const SHIM_PLACEHOLDER = '__SW_SPEC_SHIM__';
+
+// The EXECUTING machine's compiled shim (dist/specfetch/specShim.js next to THIS module).
+// Resolved per-process, so it's correct on whatever host runs the spec (Azure /app, dev /Users).
 const SHIM_URL = new URL('./specShim.js', import.meta.url).href;
 
 /** Match the spec's `'../../lib/flow'` (or any `…/lib/flow`) import. */
@@ -21,7 +34,8 @@ const LIB_FLOW_RE = /(^|\/)lib\/flow$/;
 
 /**
  * Compile a fetched spec's TypeScript source to a JS ESM module string. The lib/flow import is
- * rewritten to the runner shim (external, so it loads the shared instance at runtime).
+ * rewritten to a machine-independent placeholder (resolved to the real shim at load time), so
+ * the output is safe to cache + share across machines.
  */
 export async function compileSpec(source: string, sourcefile = 'monitor.spec.ts'): Promise<string> {
   const result = await build({
@@ -35,8 +49,10 @@ export async function compileSpec(source: string, sourcefile = 'monitor.spec.ts'
     plugins: [
       {
         name: 'specfetch-libflow-alias',
+        // External + the placeholder path (NOT the absolute SHIM_URL) -> the output imports
+        // from "__SW_SPEC_SHIM__"; loadCompiledSpec swaps it for the local shim at load time.
         setup(b) {
-          b.onResolve({ filter: LIB_FLOW_RE }, () => ({ path: SHIM_URL, external: true }));
+          b.onResolve({ filter: LIB_FLOW_RE }, () => ({ path: SHIM_PLACEHOLDER, external: true }));
         },
       },
     ],
@@ -45,15 +61,17 @@ export async function compileSpec(source: string, sourcefile = 'monitor.spec.ts'
 }
 
 /**
- * Load a compiled spec module and return its captured tests. Writes the JS to a temp .mjs and
- * dynamic-imports it (which runs the spec's top-level test() calls → the shim registry), then
- * drains the registry. Caller runs the returned fn via specToFlow.
+ * Load a compiled spec module and return its captured tests. Substitutes the shim placeholder
+ * with THIS machine's specShim.js URL (so cross-machine-cached JS resolves locally), writes the
+ * JS to a temp .mjs, dynamic-imports it (which runs the spec's top-level test() calls → the
+ * shared shim registry), then drains the registry. Caller runs the returned fn via specToFlow.
  */
 export async function loadCompiledSpec(compiledJs: string): Promise<CapturedTest[]> {
+  const resolved = compiledJs.replaceAll(SHIM_PLACEHOLDER, SHIM_URL);
   const dir = await mkdtemp(join(tmpdir(), 'sw-specfetch-'));
   const file = join(dir, 'spec.mjs');
   try {
-    await writeFile(file, compiledJs, 'utf8');
+    await writeFile(file, resolved, 'utf8');
     await import(pathToFileURL(file).href); // triggers test() capture in the shared shim
     return drainCapturedTests();
   } finally {
