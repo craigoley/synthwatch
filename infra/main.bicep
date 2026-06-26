@@ -128,6 +128,9 @@ param identityName string = 'synthwatch-runner-id'
 @description('objectId (principalId) of the synthwatch-runner-id MI — the Postgres Entra admin.')
 param aadAdminObjectId string = '5ca727ad-06a2-42a9-b31c-4e7b9382ab96'
 
+@description('principalId of the synthwatch-api Function App MI — granted Container Apps Jobs Operator on the runner job so its on-demand "Run now" / test-send ARM jobs/start succeeds.')
+param apiManagedIdentityPrincipalId string = '67f2bd0c-1334-42a7-b521-3005064d7171'
+
 @description('Blob container for failure screenshots. Matches the runner default (AZURE_STORAGE_CONTAINER).')
 param artifactContainerName string = 'synthwatch-artifacts'
 
@@ -168,6 +171,12 @@ param alertEmailFrom string = 'donotreply@0ad660ff-ac71-4b63-a5f6-ce885666c796.a
 
 // AcrPull built-in role.
 var acrPullRoleId = '7f951dda-4ed3-4680-a7ca-43fe172d538d'
+
+// Container Apps Jobs Operator built-in role — grants Microsoft.App/jobs/*/action (incl. .../start).
+// The API's managed identity needs this ON THE RUNNER JOB so its on-demand "Run now" / test-send ARM
+// `jobs/start` call succeeds (without it the start 403s, StartAsync returns false, and the trigger
+// silently never fires an off-schedule execution — the request only runs on the next */5 cron tick).
+var jobsOperatorRoleId = 'b9a307c4-5aa3-4b52-ba60-2b17c136cd7b'
 
 // ---------------------------------------------------------------------------
 // Observability: Log Analytics workspace backing the ACA environment.
@@ -344,6 +353,21 @@ resource acrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', acrPullRoleId)
     principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+// ★ (a) on-demand trigger fix: let the API's managed identity START the runner job (its `jobs/start`
+// ARM call for "Run now" + test-sends). Scoped to JUST the primary runner job (least-privilege — that's
+// the job the API's StartUrl targets). Without this the start 403s and the trigger silently never fires
+// an off-schedule execution, so on-demand runs only happen on the next */5 cron tick. (`job` is declared
+// below; bicep resolves the forward reference.)
+resource apiRunnerJobStart 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(job.id, apiManagedIdentityPrincipalId, jobsOperatorRoleId)
+  scope: job
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', jobsOperatorRoleId)
+    principalId: apiManagedIdentityPrincipalId
     principalType: 'ServicePrincipal'
   }
 }
