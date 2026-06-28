@@ -691,8 +691,14 @@ async function executeBrowser(
     .then(() => {
       tracingOn = true;
     })
-    .catch(() => {
-      /* tracing unavailable -> no trace captured */
+    .catch((err) => {
+      // Non-fatal (the run still proceeds), but it MUST be visible: a swallowed
+      // trace-start failure means every run this tick has no trace to debug from,
+      // silently and undiagnosably. Log it (same [trace] channel as the stop path).
+      console.warn(
+        `[trace] run ${runId} tracing.start failed (non-fatal; no trace will be captured):`,
+        err,
+      );
     });
 
   // Decide the verdict in the try/catch, capture metrics in the finally, then
