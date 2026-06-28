@@ -74,9 +74,8 @@ common failures early.
   `Page` privately and only hands it to the step callback, so funnel telemetry is
   not optional — a flow that bypasses `rec.step` cannot drive the browser at all.
 - **Selectors must be real.** Inspect the live DOM and use selectors you've
-  verified. Never ship guessed/placeholder selectors (the
-  `checks/homepage-search.ts` template's selectors are placeholders — replace
-  them).
+  verified. Never ship guessed/placeholder selectors — see the real flows under
+  `runner/checks/` (e.g. `wegmans-search.ts`) for verified-selector examples.
 - **One concern per PR; `tsc` + all scanners must pass green.**
 
 ### Minimal shape
