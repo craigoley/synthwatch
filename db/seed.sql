@@ -91,4 +91,19 @@ VALUES ('httpbin auth chain', 'multistep', 'https://httpbin.org/', 600, 15000, 3
   {"name":"use-token","method":"GET","url":"https://httpbin.org/bearer","headers":{"Authorization":"Bearer {{token}}"},"assertions":[{"source":"status","comparison":"eq","expected":200},{"source":"json_path","target":"$.authenticated","comparison":"eq","expected":true}]}
 ]'::jsonb);
 
+-- Assign every seeded check to all active locations. REQUIRED: a check's
+-- assignment IS its set of check_locations cursors — findDueChecks/claim
+-- INNER JOIN check_locations with NO lazy-insert (see runner/index.ts), so a
+-- check with no cursor never runs. Without this, a fresh `schema.sql + seed.sql`
+-- bootstrap produces a runner that ticks but runs nothing. Mirrors
+-- runner/locations.ts assignDefaultLocations() (the API's create-path default),
+-- applied here to all seeded rows at once. Idempotent. (Prod is unaffected: this
+-- file is the bootstrap/demo seed and is never applied to a provisioned DB.)
+INSERT INTO check_locations (check_id, location)
+SELECT c.id, l.name
+  FROM checks c
+ CROSS JOIN locations l
+ WHERE l.enabled
+ON CONFLICT (check_id, location) DO NOTHING;
+
 COMMIT;
