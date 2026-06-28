@@ -230,8 +230,9 @@ async function claim(id: number): Promise<Check | null> {
 /**
  * On-demand "Run now" (mirrors drainTestSends): the API enqueues a run_requests row + fires this
  * Job immediately (ARM jobs/start), so a triggered tick runs the check NOW instead of waiting for
- * the timer. Atomically claim ALL pending requests (mark done; SKIP LOCKED so concurrent replicas
- * each own a disjoint set), then force-run each at THIS location through the normal runOne path —
+ * the timer. Claim each pending request with a conditional UPDATE (set status='done' WHERE
+ * status='pending'), so exactly one tick/replica wins a given request and the rest skip it (the
+ * rowCount gate, not row locks), then force-run each at THIS location through the normal runOne path —
  * so trace / signals / verdict / RCA flow identically. NON-FATAL: a drain failure never breaks the
  * tick. Returns how many checks were force-run.
  */
