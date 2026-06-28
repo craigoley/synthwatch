@@ -41,7 +41,9 @@ runner/
   artifacts.ts            Failure screenshot -> Azure Blob (no-op if unconfigured)
   checks/
     index.ts              Dynamic flow loader (validates flow name)
-    homepage-search.ts    TEMPLATE flow (placeholder selectors)
+    homepage-load.ts      Real flow — asserts a rich page actually rendered
+    wegmans-homepage.ts   Real flow (verified selectors)
+    wegmans-search.ts     Real flow (verified selectors)
   Dockerfile              Built on the official Playwright image
   package.json            Pinned dependencies
   tsconfig.json           NodeNext / ES2022, strict
@@ -388,8 +390,10 @@ export const flow: Flow = async (rec) => {
 };
 ```
 
-`checks/homepage-search.ts` is a **template** with **placeholder selectors** —
-inspect the real DOM and replace them before trusting it.
+`checks/homepage-load.ts` is a minimal **real** flow (assertions that hold for
+any real HTML page); `checks/wegmans-homepage.ts` and `checks/wegmans-search.ts`
+are fuller real flows with **verified selectors**. When writing your own flow,
+inspect the live DOM and use real selectors — never guess.
 
 <!-- claude-review end-to-end validation: trivial docs touch, safe to merge. -->
 
