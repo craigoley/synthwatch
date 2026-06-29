@@ -1,7 +1,11 @@
 name: Lib-flow parity
 
-# Fails the PR when runner/specfetch/specShim.ts (the lib/flow copy the runner EXECUTES) drifts from
-# monitors/lib/flow.ts (the authoring copy, dead at runtime). See scripts/check-libflow-parity.mjs.
+# Two parity checks for the runner's specShim.ts (the lib/flow copy the runner EXECUTES) vs the
+# monitors repo (the authoring copy, dead at runtime):
+#   1. VENDORED BLOCK — specShim's vendored helpers drift from monitors/lib/flow.ts (check-libflow-parity.mjs).
+#   2. MATCHER SURFACE — a spec uses an expect() matcher the mini-shim doesn't implement, which throws a
+#      TypeError in a LIVE run while passing local `playwright test` (check-expect-matchers.mjs).
+# Both fail closed; both skip on a checkout blip.
 #
 # No path filter — it ALWAYS runs so the "Lib-flow parity" check is ALWAYS present for ci-gate (a
 # path-filtered required check that skips can deadlock the gate's wait loop). It's cheap (~20s).
@@ -38,7 +42,12 @@ jobs:
         with:
           node-version: 20
 
-      - name: specShim.ts ↔ lib/flow.ts parity
+      - name: specShim.ts ↔ lib/flow.ts vendored-block parity
         env:
           LIBFLOW_SRC: _monitors/lib/flow.ts
         run: node scripts/check-libflow-parity.mjs
+
+      - name: specShim expect() covers every matcher the specs use
+        env:
+          MONITORS_SRC: _monitors
+        run: node scripts/check-expect-matchers.mjs
