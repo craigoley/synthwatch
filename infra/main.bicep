@@ -372,6 +372,20 @@ resource apiRunnerJobStart 'Microsoft.Authorization/roleAssignments@2022-04-01' 
   }
 }
 
+// Reconcile-now prerequisite: let the API MI START the reconcile job too (the upcoming "Reconcile now"
+// button's `jobs/start` call). Same role + principal as the runner grant above, scoped to JUST the
+// reconcile job (least-privilege). Deterministic guid() name (same pattern) → a redeploy adopts it
+// idempotently. (`reconcileJob` is declared below; bicep resolves the forward reference.)
+resource apiReconcileJobStart 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(reconcileJob.id, apiManagedIdentityPrincipalId, jobsOperatorRoleId)
+  scope: reconcileJob
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', jobsOperatorRoleId)
+    principalId: apiManagedIdentityPrincipalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Container Apps managed environment, wired to Log Analytics.
 // ---------------------------------------------------------------------------
