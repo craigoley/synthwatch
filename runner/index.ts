@@ -366,7 +366,7 @@ async function runOne(check: Check): Promise<void> {
   const captureSuccessTrace = Date.now() - lastSuccessTraceMs > SUCCESS_TRACE_REFRESH_MS;
   // Wall-clock start of the (final) executor attempt — the OTel root span's start.
   let execStartMs = Date.now();
-  const outcome: Outcome = await runWithRetry<Outcome>(
+  const { result: outcome, attempts: retryCount } = await runWithRetry<Outcome>(
     async () => {
       execStartMs = Date.now();
       try {
@@ -485,7 +485,8 @@ async function runOne(check: Check): Promise<void> {
     `UPDATE runs
         SET status = $2, finished_at = now(), duration_ms = $3, http_status = $4,
             error_message = $5, failed_step = $6, screenshot_url = $7,
-            cert_days_remaining = $8, trace_url = $9, trace_signals = $10::jsonb
+            cert_days_remaining = $8, trace_url = $9, trace_signals = $10::jsonb,
+            retry_count = $11
       WHERE id = $1`,
     [
       runId,
@@ -498,6 +499,8 @@ async function runOne(check: Check): Promise<void> {
       outcome.certDaysRemaining,
       traceUrl,
       traceSignalsJson,
+      // attempts taken to reach this verdict: 1 = first try; >1 + status=pass = degrading-but-green.
+      retryCount,
     ],
   );
 

@@ -34,12 +34,17 @@ export async function runWithRetry<T extends { status: string }>(
   execute: (attempt: number) => Promise<T>,
   retries: number,
   onBeforeRetry?: (prev: T, attempt: number) => Promise<void>,
-): Promise<T> {
+): Promise<{ result: T; attempts: number }> {
   const maxAttempts = retries + 1;
   let result = await execute(1);
+  // `attempts` = how many times execute() ran to reach the FINAL verdict — the per-run telemetry
+  // (1 = settled first try; 2 = settled on the 2nd; maxAttempts = exhausted retries). A status=pass
+  // with attempts>1 is the "degrading-but-green" monitor that never opens an incident.
+  let attempts = 1;
   for (let attempt = 2; attempt <= maxAttempts && isRetryable(result.status); attempt++) {
     if (onBeforeRetry) await onBeforeRetry(result, attempt);
     result = await execute(attempt);
+    attempts = attempt;
   }
-  return result;
+  return { result, attempts };
 }
