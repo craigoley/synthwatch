@@ -74,7 +74,17 @@ export type SpecOrigin =
  * point) — failures become either a degraded 'runnable' (last-good) or a distinct 'infra-error'.
  */
 export type SpecResolution =
-  | { kind: 'runnable'; compiledJs: string; origin: SpecOrigin }
+  | {
+      kind: 'runnable';
+      compiledJs: string;
+      origin: SpecOrigin;
+      // Spec-provenance telemetry (queryable per run): the version identity the runner RESOLVED for this
+      // spec (etag — a commit SHA since #138) and the spec_cache.fetched_at the run saw. Lets a run record
+      // exactly which cached spec it executed + whether it re-fetched, so "is it running the spec I think?"
+      // is forensically answerable (runs.spec_provenance).
+      resolvedEtag: string | null;
+      cacheFetchedAt: Date | null;
+    }
   | { kind: 'infra-error'; reason: string };
 
 export function sha256(s: string): string {
@@ -100,7 +110,13 @@ function degradeOrInfraError(
         `(last_good_at=${existing.last_good_at?.toISOString() ?? '?'}). ` +
         `Monitor NOT failed; the spec-fetch path is flaky.`,
     );
-    return { kind: 'runnable', compiledJs: existing.last_good_compiled_js, origin: 'fallback-last-good' };
+    return {
+      kind: 'runnable',
+      compiledJs: existing.last_good_compiled_js,
+      origin: 'fallback-last-good',
+      resolvedEtag: existing.etag,
+      cacheFetchedAt: existing.last_good_at,
+    };
   }
   console.warn(
     `[specfetch] INFRA-ERROR ${specPath}: ${why} — and NO last-known-good cached. ` +
@@ -134,7 +150,13 @@ export async function getCompiledSpec(specPath: string, deps: SpecCacheDeps): Pr
   // 2) 304 Not Modified.
   if (fetched.kind === 'unchanged') {
     if (existing) {
-      return { kind: 'runnable', compiledJs: existing.compiled_js, origin: 'cache-304' };
+      return {
+        kind: 'runnable',
+        compiledJs: existing.compiled_js,
+        origin: 'cache-304',
+        resolvedEtag: existing.etag,
+        cacheFetchedAt: existing.fetched_at,
+      };
     }
     // 304 with no cached row (we couldn't have sent a matching etag) -> treat as cache-miss:
     // force a full unconditional fetch.
@@ -165,7 +187,8 @@ export async function getCompiledSpec(specPath: string, deps: SpecCacheDeps): Pr
     source_sha: deps.hash(source),
     compiled_js: compiledJs,
   });
-  return { kind: 'runnable', compiledJs, origin: 'compiled-200' };
+  // Just upserted: the resolved version identity is the fetched etag (commit SHA), fetched_at = now.
+  return { kind: 'runnable', compiledJs, origin: 'compiled-200', resolvedEtag: etag, cacheFetchedAt: new Date() };
 }
 
 // ---------------------------------------------------------------------------

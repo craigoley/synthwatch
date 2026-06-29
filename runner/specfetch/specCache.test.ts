@@ -154,6 +154,9 @@ nodeTest('200: compiles once, upserts, populates last_good, kind runnable/compil
   assert.ok(res.kind === 'runnable' && res.origin === 'compiled-200' && res.compiledJs === 'COMPILED(SRC)');
   assert.equal(compiles, 1);
   assert.equal(store.rows.get('monitors/x.spec.ts')!.last_good_compiled_js, 'COMPILED(SRC)');
+  // provenance (0047): a fresh compile resolves to the fetched etag + a just-now fetched_at.
+  assert.ok(res.kind === 'runnable' && res.resolvedEtag === '"abc"');
+  assert.ok(res.kind === 'runnable' && res.cacheFetchedAt instanceof Date);
 });
 
 nodeTest('304 + cache: reuses compiled_js, sends cached etag, no recompile/upsert', async () => {
@@ -176,6 +179,10 @@ nodeTest('304 + cache: reuses compiled_js, sends cached etag, no recompile/upser
   assert.equal(compiles, 0);
   assert.equal(etagSent, '"abc"');
   assert.equal(store.upserts.length, 0);
+  // ★ provenance (0047): a cache-304 reuse resolves to the CACHED etag the run saw — this is the
+  // signal that proves a "reused, never re-fetched" run (the meals2go frozen-fetched_at case).
+  assert.ok(res.kind === 'runnable' && res.resolvedEtag === '"abc"');
+  assert.ok(res.kind === 'runnable' && res.cacheFetchedAt instanceof Date);
 });
 
 nodeTest('304 + NO cache row (etag desync): forces a full fetch (cache-miss), warns', async () => {
