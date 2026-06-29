@@ -118,9 +118,16 @@ async function gatherContext(
       [run.id],
     )
   ).rows;
+  // B10: a sensitive monitor's per-step messages are already genericised at write time (StepRecorder);
+  // this is the defense-in-depth guard for the AI funnel — never forward per-step error detail for a
+  // sensitive check (covers any row written before the monitor was flagged). Step name + status only.
   const funnel = steps.length
     ? steps
-        .map((s) => `  step ${s.step_index} "${s.name}" [${s.status}]${s.error_message ? `: ${s.error_message.slice(0, 120)}` : ''}`)
+        .map(
+          (s) =>
+            `  step ${s.step_index} "${s.name}" [${s.status}]` +
+            (!check.sensitive && s.error_message ? `: ${s.error_message.slice(0, 120)}` : ''),
+        )
         .join('\n')
     : '  (none — not a stepped check)';
 

@@ -740,7 +740,8 @@ async function executeBrowser(
   let baselineScreenshot: Buffer | null = null;
 
   try {
-    const rec = new StepRecorder(runId, page, check.target_url);
+    // B10: pass `sensitive` so per-step error_message is genericised in run_steps (default sinks).
+    const rec = new StepRecorder(runId, page, check.target_url, undefined, undefined, check.sensitive);
     try {
       // Build the Flow: the fetched/compiled spec (run via the #101 shim) or the baked-in
       // flow_name. Both satisfy Flow = (rec) => Promise<void>; a load failure here is a normal
