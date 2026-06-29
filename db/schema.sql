@@ -68,14 +68,18 @@ CREATE TABLE checks (
 
     timeout_ms         INTEGER     NOT NULL DEFAULT 30000 CHECK (timeout_ms > 0),
 
-    -- Flap debounce: open an incident only after this many CONSECUTIVE failures.
-    failure_threshold  INTEGER     NOT NULL DEFAULT 3 CHECK (failure_threshold > 0),
+    -- Consecutive-SCHEDULED-failure debounce: open an incident only after this many consecutive
+    -- down RUNS (each = one scheduled tick). DEFAULT 1 (mirrors 0045) = page on the FIRST confirmed
+    -- failure — confirmation now comes from in-run fast-retry (below), so we no longer wait multiple
+    -- ticks. >1 stays available as an OPTIONAL debounce for intentionally-noisy monitors.
+    failure_threshold  INTEGER     NOT NULL DEFAULT 1 CHECK (failure_threshold > 0),
 
-    -- Fast-retry (mirrors 0021_retries.sql): within ONE run, re-run up to `retries`
-    -- times when the run ERRORS (couldn't complete — never on an assertion 'fail');
-    -- only the final attempt counts. Sits IN FRONT of failure_threshold. Default 1
-    -- (transient-blip absorption on); 0 = no retry. Distinct from failure_threshold.
-    retries            INTEGER     NOT NULL DEFAULT 1 CHECK (retries >= 0),
+    -- Fast-retry (mirrors 0021 + 0045): within ONE run, re-run up to `retries` times on ANY failure
+    -- — 'error' (couldn't complete) OR 'fail' (assertion missed); only the FINAL attempt counts
+    -- (intermediate attempts discarded). Sits IN FRONT of failure_threshold: it confirms a failure
+    -- in-run (seconds) so the incident can open immediately. DEFAULT 2 (3 attempts total — Datadog's
+    -- recommended default); 0 = no retry. Distinct from failure_threshold.
+    retries            INTEGER     NOT NULL DEFAULT 2 CHECK (retries >= 0),
 
     -- For kind='ssl': days-until-expiry threshold. Cert with more days -> pass;
     -- within this window -> warn; expired/invalid -> fail; unreachable -> error.
