@@ -92,7 +92,7 @@ test('no token → no Authorization header (anon works; public repo)', async () 
 
 test('a non-200 content fetch throws (the cache layer degrades to last-good)', async () => {
   installFetch({ contentsStatus: 404 });
-  await assert.rejects(() => conditionalFetchSpec(SPEC, null), /spec fetch failed: 404/);
+  await assert.rejects(() => conditionalFetchSpec(SPEC, null), /contents fetch failed: 404/);
 });
 
 test('assertValidSpecPath still guards traversal', () => {

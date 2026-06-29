@@ -101,9 +101,8 @@ async function persistSpecCatalog(
 }
 
 async function main(): Promise<void> {
-  const url = manifestUrl();
-  console.log(`[reconcile] fetching manifest: ${url}`);
-  const manifest = await fetchManifest(url);
+  console.log(`[reconcile] fetching manifest: ${manifestUrl() ?? 'GitHub contents API (main@HEAD)'}`);
+  const manifest = await fetchManifest();
 
   // ★ Option C (slice 6): orphan = a manifest spec that ISN'T fetchable+compilable from main
   // (no longer "no baked-in module"). Probe every manifest spec (fetch+compile) for runnability;

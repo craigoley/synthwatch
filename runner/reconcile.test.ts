@@ -1,20 +1,23 @@
-// Unit tests for the monitors-as-code reconcile (Phase 6b). Pure — no DB, no network.
-// Run via `npm test` (node --test over compiled dist). Covers: manifest validation,
-// flow-name binding, the read-only drift diff, and — critically — the GATED field-split
-// apply upsert (Git fields overwrite, seed fields insert-only, dashboard fields never).
-import { test } from 'node:test';
+// Unit tests for the monitors-as-code reconcile (Phase 6b). No DB; no REAL network (the fetchManifest
+// tests mock global fetch + restore it). Run via `npm test` (node --test over compiled dist). Covers:
+// manifest validation, flow-name binding, the read-only drift diff, the GATED field-split apply upsert
+// (Git fields overwrite, seed fields insert-only, dashboard fields never), and the strongly-consistent
+// contents-API manifest fetch.
+import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   validateManifest,
   flowNameFor,
   computeDrift,
   buildApplyUpsert,
+  fetchManifest,
   GIT_AUTHORITATIVE_COLUMNS,
   SEED_ONLY_COLUMNS,
   type Monitor,
   type ManagedCheck,
   type SpecRunnability,
 } from './reconcile.js';
+import { _resetMainShaCache } from './specfetch/fetchSpec.js';
 
 // Option C (slice 6): orphan now keys on per-spec runnability (fetchable+compilable), not baked
 // modules. The monitor()'s script is the default-runnable spec; helpers build the probe map.
@@ -271,4 +274,47 @@ test('buildApplyUpsert wires sensitive + redact_patterns (Git-authoritative) int
   // sensitive=true + the declared patterns serialized as JSONB text.
   assert.equal(values[insertColumns.indexOf('sensitive')], true);
   assert.equal(values[insertColumns.indexOf('redact_patterns')], JSON.stringify(['token=[A-Z0-9]+']));
+});
+
+// --- fetchManifest now reads STRONGLY-CONSISTENTLY via the contents API at main@HEAD (mirrors #138) ---
+const realFetch = globalThis.fetch;
+const MSHA = 'c'.repeat(40);
+const MANIFEST_JSON = JSON.stringify({
+  schemaVersion: 1,
+  monitors: [
+    { id: 'wegmans-search-product', name: 'X', script: 'monitors/wegmans/search-product.spec.ts', kind: 'browser' },
+  ],
+});
+afterEach(() => {
+  globalThis.fetch = realFetch;
+  delete process.env.SYNTHWATCH_MONITORS_MANIFEST_URL;
+});
+
+test('★ fetchManifest (no override) reads via the GitHub contents API at main@HEAD, never raw CDN', async () => {
+  _resetMainShaCache();
+  const urls: string[] = [];
+  globalThis.fetch = (async (url: string) => {
+    urls.push(String(url));
+    if (String(url).includes('/commits/')) return new Response(MSHA + '\n', { status: 200 });
+    return new Response(MANIFEST_JSON, { status: 200 }); // /contents/manifest.json?ref=sha
+  }) as unknown as typeof fetch;
+  const m = await fetchManifest();
+  assert.equal(m.monitors[0].id, 'wegmans-search-product');
+  assert.ok(urls.some((u) => u.includes('/commits/main')), 'resolved main HEAD via the commits API');
+  const contents = urls.find((u) => u.includes('/contents/manifest.json'));
+  assert.ok(contents && contents.includes(`?ref=${MSHA}`), 'manifest pinned to the resolved sha (consistent)');
+  assert.ok(contents!.startsWith('https://api.github.com/'), 'api.github.com, NOT raw.githubusercontent');
+  assert.ok(!urls.some((u) => u.includes('raw.githubusercontent')), 'never hits the raw CDN');
+});
+
+test('fetchManifest honors an explicit override URL (direct fetch — tests/forks)', async () => {
+  process.env.SYNTHWATCH_MONITORS_MANIFEST_URL = 'https://example.test/manifest.json';
+  const urls: string[] = [];
+  globalThis.fetch = (async (url: string) => {
+    urls.push(String(url));
+    return new Response(MANIFEST_JSON, { status: 200 });
+  }) as unknown as typeof fetch;
+  const m = await fetchManifest();
+  assert.equal(m.monitors.length, 1);
+  assert.deepEqual(urls, ['https://example.test/manifest.json'], 'direct-fetched the override; no contents API');
 });

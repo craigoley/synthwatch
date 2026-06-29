@@ -69,6 +69,26 @@ async function resolveMainSha(): Promise<string> {
   return sha;
 }
 
+/**
+ * Fetch a repo file's RAW content at main's HEAD SHA — strongly consistent (commits API resolves the
+ * SHA, contents API serves the immutable bytes at it), no raw-CDN propagation/flapping. Generic over
+ * the path so BOTH the spec fetch (conditionalFetchSpec) AND reconcile's manifest fetch share one path
+ * + the per-process SHA memo. The caller is responsible for path trust (the paths here are hardcoded
+ * constants or already-validated spec paths — a poisoned row can't redirect the fetch).
+ */
+export async function fetchContentsAtMain(
+  path: string,
+  accept: string,
+): Promise<{ source: string; sha: string }> {
+  const sha = await resolveMainSha();
+  const url = `${API_BASE}/contents/${path}?ref=${sha}`;
+  const res = await fetch(url, { headers: ghHeaders(accept) });
+  if (!res.ok) {
+    throw new Error(`contents fetch failed: ${res.status} ${res.statusText} (${url})`);
+  }
+  return { source: await res.text(), sha };
+}
+
 /** Result of a conditional fetch: the spec is unchanged (main still at the last SHA) or fresh source.
  *  `etag` carries the COMMIT SHA (the version identity the cache stores + passes back). */
 export type ConditionalFetch =
@@ -90,11 +110,8 @@ export async function conditionalFetchSpec(
   // STRONGLY CONSISTENT 304-equivalent: main hasn't moved since we last compiled this spec. The commits
   // API reflects a merge immediately, so unlike the raw CDN this can't falsely report unchanged.
   if (lastSha && lastSha === sha) return { kind: 'unchanged' };
-  // Fetch the EXACT content at the pinned SHA — content-addressed by commit, so no CDN inconsistency.
-  const url = `${API_BASE}/contents/${scriptPath}?ref=${sha}`;
-  const res = await fetch(url, { headers: ghHeaders('application/vnd.github.raw') });
-  if (!res.ok) {
-    throw new Error(`spec fetch failed: ${res.status} ${res.statusText} (${url})`);
-  }
-  return { kind: 'fetched', source: await res.text(), etag: sha };
+  // Fetch the EXACT content at the pinned SHA — content-addressed by commit (resolveMainSha is memoised,
+  // so this re-uses the SHA just resolved; no second commits call).
+  const { source } = await fetchContentsAtMain(scriptPath, 'application/vnd.github.raw');
+  return { kind: 'fetched', source, etag: sha };
 }
