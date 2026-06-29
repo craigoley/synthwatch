@@ -513,8 +513,11 @@ CREATE TABLE reconcile_drift (
 
 -- ---------------------------------------------------------------------------
 -- spec_cache: durable runtime-spec cache (mirrors 0034_spec_cache.sql, Phase 6b Option C).
--- The runner cold-starts every 5 min, so the spec cache lives in Postgres. Per due check:
--- conditional-GET (If-None-Match: etag); 304 reuses compiled_js, 200 recompiles + upserts.
+-- The runner cold-starts every 5 min, so the spec cache lives in Postgres. Per due check the runner
+-- resolves monitors-repo main's HEAD commit SHA (GitHub commits API — strongly consistent, NOT the
+-- raw CDN) and fetches the spec content AT that SHA (contents API). `etag` stores that commit SHA (the
+-- version identity): if main still points at it, compiled_js is reused with no content fetch; otherwise
+-- recompile + upsert. (Was a raw-CDN If-None-Match etag — swapped to kill the CDN propagation window.)
 -- last_good_* are populated here but only READ by slice 4's fetch-failure fallback.
 -- ★ LEAST-PRIVILEGE (0041): compiled_js is loaded + EXECUTED at runner privilege, so WRITE here is an
 -- RCE-equivalent surface. ONLY the runner (Postgres owner: synthadmin) may write it; the API role
