@@ -253,6 +253,10 @@ CREATE TABLE runs (
     -- (Mirrors db/migrations/0007_cert_days_remaining.sql.) error_message keeps the
     -- human-readable cert line; this is the structured value for the API/dashboard.
     cert_days_remaining INTEGER,
+    -- Attempts taken to reach this verdict (mirrors 0048): 1 = first try; >1 = settled after fast-retry;
+    -- = retries+1 when retries were exhausted. status=pass AND retry_count>1 is the degrading-but-green
+    -- monitor that never opens an incident. NULL = pre-telemetry (historical rows).
+    retry_count    INTEGER,
     -- The location (vantage point) that produced this run, from the runner's
     -- SYNTHWATCH_LOCATION (mirrors 0014_multi_location.sql). DEFAULT 'default' so
     -- a single-region deploy uses one location and behaves exactly as before.

@@ -24,7 +24,7 @@ function scripted(script: string[]): { execute: (attempt: number) => Promise<R>;
 // (a) a 'fail' now RETRIES up to `retries` times (was: never retried) and recovers to the final verdict.
 test("(a) a 'fail' retries up to `retries` times, final attempt is the verdict", async () => {
   const { execute, calls } = scripted(['fail', 'fail', 'pass']); // fail, fail, then pass on attempt 3
-  const result = await runWithRetry(execute, 2);
+  const { result } = await runWithRetry(execute, 2);
   assert.deepEqual(calls, [1, 2, 3], 'ran 3 attempts (1 + 2 retries) — the fail WAS retried');
   assert.equal(result.status, 'pass', 'recovered on retry → final verdict is pass');
 });
@@ -32,7 +32,7 @@ test("(a) a 'fail' retries up to `retries` times, final attempt is the verdict",
 // (a') a persistent 'fail' exhausts retries; the final 'fail' is the confirmed verdict.
 test("(a') a persistent 'fail' exhausts retries → confirmed 'fail'", async () => {
   const { execute, calls } = scripted(['fail', 'fail', 'fail']);
-  const result = await runWithRetry(execute, 2);
+  const { result } = await runWithRetry(execute, 2);
   assert.deepEqual(calls, [1, 2, 3], 'exactly maxAttempts = retries + 1 = 3');
   assert.equal(result.status, 'fail', 'confirmed failure after all retries exhausted');
 });
@@ -40,7 +40,7 @@ test("(a') a persistent 'fail' exhausts retries → confirmed 'fail'", async () 
 // regression: 'error' still retries (unchanged from 0021).
 test("'error' still retries (regression)", async () => {
   const { execute, calls } = scripted(['error', 'pass']);
-  const result = await runWithRetry(execute, 2);
+  const { result } = await runWithRetry(execute, 2);
   assert.deepEqual(calls, [1, 2]);
   assert.equal(result.status, 'pass');
 });
@@ -48,13 +48,13 @@ test("'error' still retries (regression)", async () => {
 // pass/warn are NEVER retried — don't waste a (60–90s browser) run on a success; warn = degraded-but-up.
 test('pass is final immediately (no retry of a success)', async () => {
   const { execute, calls } = scripted(['pass', 'fail']);
-  const result = await runWithRetry(execute, 2);
+  const { result } = await runWithRetry(execute, 2);
   assert.deepEqual(calls, [1], 'stopped after the first pass');
   assert.equal(result.status, 'pass');
 });
 test('warn is final immediately (available-but-degraded, not a failure)', async () => {
   const { execute, calls } = scripted(['warn', 'pass']);
-  const result = await runWithRetry(execute, 2);
+  const { result } = await runWithRetry(execute, 2);
   assert.deepEqual(calls, [1]);
   assert.equal(result.status, 'warn');
 });
@@ -62,7 +62,7 @@ test('warn is final immediately (available-but-degraded, not a failure)', async 
 // retries=0 disables retry even for a fail (pre-0021 behaviour preserved).
 test('retries=0 disables retry (a fail is final)', async () => {
   const { execute, calls } = scripted(['fail', 'pass']);
-  const result = await runWithRetry(execute, 0);
+  const { result } = await runWithRetry(execute, 0);
   assert.deepEqual(calls, [1]);
   assert.equal(result.status, 'fail');
 });
@@ -73,7 +73,7 @@ test('retries=0 disables retry (a fail is final)', async () => {
 test("(b) the discard hook fires once per retried-away attempt, including 'fail'", async () => {
   const { execute } = scripted(['fail', 'error', 'fail']); // 3 attempts (2 retries): fail → error → fail
   const discarded: Array<{ status: string; attempt: number }> = [];
-  const result = await runWithRetry(execute, 2, async (prev, attempt) => {
+  const { result } = await runWithRetry(execute, 2, async (prev, attempt) => {
     discarded.push({ status: prev.status, attempt });
   });
   // attempt-1 'fail' discarded before attempt 2; attempt-2 'error' discarded before attempt 3; the
@@ -105,4 +105,30 @@ test('effectiveRetries: a RECOVERED monitor (no open incident) gets full retry a
 test('effectiveRetries: retries=0 stays 0 either way (retry already disabled)', () => {
   assert.equal(effectiveRetries(0, false), 0);
   assert.equal(effectiveRetries(0, true), 0);
+});
+
+// ── retry_count telemetry (0048): `attempts` = how many tries to reach the verdict ──────────────
+test('attempts=1 when the run passes first try', async () => {
+  const { execute } = scripted(['pass']);
+  const { result, attempts } = await runWithRetry(execute, 2);
+  assert.equal(result.status, 'pass');
+  assert.equal(attempts, 1);
+});
+test('★ attempts=2 when it passes on the 2nd try (degrading-but-green)', async () => {
+  const { execute } = scripted(['fail', 'pass']);
+  const { result, attempts } = await runWithRetry(execute, 2);
+  assert.equal(result.status, 'pass', 'ultimately green — never opens an incident');
+  assert.equal(attempts, 2, 'but it took a retry → the signal a degrading monitor leaks');
+});
+test('attempts=maxAttempts (retries+1) when all attempts fail', async () => {
+  const { execute } = scripted(['fail', 'fail', 'fail']);
+  const { result, attempts } = await runWithRetry(execute, 2); // maxAttempts = 3
+  assert.equal(result.status, 'fail');
+  assert.equal(attempts, 3);
+});
+test('attempts=1 when retry is skipped (retries=0 — the #136 already-failing case)', async () => {
+  const { execute } = scripted(['fail', 'pass']);
+  const { result, attempts } = await runWithRetry(execute, 0); // effectiveRetries→0 on an open incident
+  assert.equal(result.status, 'fail', 'one attempt, fail fast');
+  assert.equal(attempts, 1);
 });
