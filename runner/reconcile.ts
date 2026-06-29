@@ -49,6 +49,10 @@ export interface ManagedCheck {
   kind: string;
   target_url: string;
   flow_name: string | null;
+  // B10: read so the scoped sync can detect + correct a check whose sensitive/redact_patterns
+  // diverge from the manifest (the leak: manifest says sensitive but the live row defaulted to false).
+  sensitive: boolean;
+  redact_patterns: string[] | null;
 }
 
 export type DriftType = 'new' | 'changed' | 'missing' | 'orphan';
@@ -285,6 +289,14 @@ export function computeDrift(
       diff.target_url = { git: m.target, live: existing.target_url };
     }
     if (existing.flow_name !== flow) diff.flow_name = { git: flow, live: existing.flow_name };
+    // B10 detection (read-only): surface a sensitive/redact_patterns divergence in reconcile_drift so
+    // the leak is auditable. (The scoped sync below is what actually corrects it — see b10FieldUpdates.)
+    if ((m.sensitive ?? false) !== existing.sensitive) {
+      diff.sensitive = { git: m.sensitive ?? false, live: existing.sensitive };
+    }
+    if (JSON.stringify(m.redact_patterns ?? null) !== JSON.stringify(existing.redact_patterns ?? null)) {
+      diff.redact_patterns = { git: m.redact_patterns ?? null, live: existing.redact_patterns ?? null };
+    }
     if (Object.keys(diff).length > 0) {
       rows.push({ source_key: m.id, drift_type: 'changed', detail: { fields: diff } });
     }
@@ -360,4 +372,41 @@ export function buildApplyUpsert(monitor: Monitor): {
     `ON CONFLICT (source_key) DO UPDATE SET ${setClause}`;
 
   return { text, values, insertColumns, updateColumns };
+}
+
+// ---------------------------------------------------------------------------
+// SCOPED B10-ONLY SYNC — the ONLY thing reconcile applies to `checks` today. The full git-authoritative
+// apply (buildApplyUpsert above) remains GATED OFF (it would auto-rewrite ALL config — schedules,
+// locations, URLs — fleet-wide hourly; a separate deliberate decision). This corrects ONLY a SAFETY
+// control: a check whose manifest declares sensitive/redact_patterns but whose live row defaulted to
+// false/NULL (the B10 leak). Pure + unit-testable; reconcileMain runs the narrow UPDATE per result.
+// ---------------------------------------------------------------------------
+
+/** One scoped correction: set checks.sensitive + checks.redact_patterns for a diverging managed check.
+ *  redact_patterns is JSONB text (the SAME encoding buildApplyUpsert uses: JSON.stringify, 'null' = none). */
+export interface B10Update {
+  source_key: string;
+  sensitive: boolean;
+  redact_patterns: string;
+}
+
+/**
+ * Which EXISTING managed checks need their sensitive/redact_patterns corrected to match the manifest.
+ * Only diverging checks are returned (a matching check is left untouched). NEW checks (no live row) are
+ * NOT created here — apply is off; this only fixes the safety field on checks that already exist.
+ */
+export function b10FieldUpdates(monitors: Monitor[], managed: ManagedCheck[]): B10Update[] {
+  const byKey = new Map(managed.map((c) => [c.source_key, c]));
+  const updates: B10Update[] = [];
+  for (const m of monitors) {
+    const existing = byKey.get(m.id);
+    if (!existing) continue;
+    const wantSensitive = m.sensitive ?? false;
+    const wantPatternsJson = JSON.stringify(m.redact_patterns ?? null);
+    const livePatternsJson = JSON.stringify(existing.redact_patterns ?? null);
+    if (existing.sensitive !== wantSensitive || livePatternsJson !== wantPatternsJson) {
+      updates.push({ source_key: m.id, sensitive: wantSensitive, redact_patterns: wantPatternsJson });
+    }
+  }
+  return updates;
 }
