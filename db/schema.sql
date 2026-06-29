@@ -81,6 +81,15 @@ CREATE TABLE checks (
     -- recommended default); 0 = no retry. Distinct from failure_threshold.
     retries            INTEGER     NOT NULL DEFAULT 2 CHECK (retries >= 0),
 
+    -- B10 trace redaction (mirrors 0046). `sensitive` = a cart/auth monitor whose trace can carry
+    -- session tokens / cart contents / account PII: the runner skips the success-trace baseline +
+    -- failure trace zips, omits screenshots from RCA (and doesn't store them), scrubs trace_signals
+    -- (built-in token denylist + redact_patterns), and genericises error_message. redact_patterns =
+    -- a JSONB array of regex strings the monitor declares (NULL = none; the denylist still applies).
+    -- DEFAULT false → non-sensitive monitors are unchanged. Reconcile sets both from the manifest.
+    sensitive          BOOLEAN     NOT NULL DEFAULT false,
+    redact_patterns    JSONB,
+
     -- For kind='ssl': days-until-expiry threshold. Cert with more days -> pass;
     -- within this window -> warn; expired/invalid -> fail; unreachable -> error.
     -- Harmless on http/browser rows. (Mirrors db/migrations/0005_ssl_checks.sql.)

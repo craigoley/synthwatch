@@ -30,6 +30,10 @@ export interface Monitor {
   description?: string;
   target?: string;
   enabledByDefault?: boolean;
+  // B10: declare a cart/auth monitor as sensitive + its redaction patterns. validateManifest REQUIRES
+  // redact_patterns when sensitive is true (the enable gate); reconcile writes both to checks (Git-auth).
+  sensitive?: boolean;
+  redact_patterns?: string[];
 }
 
 export interface Manifest {
@@ -155,6 +159,30 @@ export function validateManifest(raw: unknown): Manifest {
     if (e.description !== undefined && typeof e.description !== 'string') {
       throw new Error(`${where}.description invalid (string)`);
     }
+    if (e.sensitive !== undefined && typeof e.sensitive !== 'boolean') {
+      throw new Error(`${where}.sensitive invalid (boolean)`);
+    }
+    if (e.redact_patterns !== undefined) {
+      if (!Array.isArray(e.redact_patterns) || !e.redact_patterns.every((p) => typeof p === 'string')) {
+        throw new Error(`${where}.redact_patterns invalid (array of strings)`);
+      }
+      for (const p of e.redact_patterns as string[]) {
+        try {
+          new RegExp(p);
+        } catch {
+          throw new Error(`${where}.redact_patterns: invalid regex ${JSON.stringify(p)}`);
+        }
+      }
+    }
+    // ★ B10 ENABLE GATE: "redaction REQUIRED before enable." A monitor marked sensitive MUST declare
+    // redact_patterns — a sensitive-but-unwired entry is REJECTED here, so it never reconciles into
+    // checks, never gets a check_locations row, and therefore can NEVER run. (The built-in token
+    // denylist still applies at runtime, but the declared patterns are the monitor's own redaction.)
+    if (e.sensitive === true && (!Array.isArray(e.redact_patterns) || e.redact_patterns.length === 0)) {
+      throw new Error(
+        `${where} is marked sensitive but declares no redact_patterns — B10 requires a sensitive monitor to declare redaction before it can be enabled.`,
+      );
+    }
 
     return {
       id: e.id,
@@ -166,6 +194,8 @@ export function validateManifest(raw: unknown): Manifest {
       description: e.description as string | undefined,
       target: e.target as string | undefined,
       enabledByDefault: e.enabledByDefault as boolean | undefined,
+      sensitive: e.sensitive as boolean | undefined,
+      redact_patterns: e.redact_patterns as string[] | undefined,
     };
   });
 
@@ -260,8 +290,17 @@ export function computeDrift(
 }
 
 // --- Field-split policy (the strict column allow-list), as data so tests can assert on it.
-/** Git-authoritative: overwritten on every apply (INSERT and UPDATE). */
-export const GIT_AUTHORITATIVE_COLUMNS = ['name', 'kind', 'target_url', 'flow_name'] as const;
+/** Git-authoritative: overwritten on every apply (INSERT and UPDATE). B10's sensitive/redact_patterns
+ *  are here (NOT seed-only/dashboard-owned) ON PURPOSE: the manifest is the single source of truth for
+ *  the redaction policy, so a manifest change re-syncs it and the dashboard can't silently disable it. */
+export const GIT_AUTHORITATIVE_COLUMNS = [
+  'name',
+  'kind',
+  'target_url',
+  'flow_name',
+  'sensitive',
+  'redact_patterns',
+] as const;
 /** Git-seeds-then-dashboard-owns: written on INSERT only, never in the UPDATE SET. */
 export const SEED_ONLY_COLUMNS = ['interval_seconds', 'enabled'] as const;
 
@@ -289,6 +328,8 @@ export function buildApplyUpsert(monitor: Monitor): {
     monitor.kind,
     monitor.target ?? null,
     flow,
+    monitor.sensitive ?? false, // sensitive
+    JSON.stringify(monitor.redact_patterns ?? null), // redact_patterns (jsonb; assignment-cast from text)
     monitor.suggestedIntervalSeconds ?? DEFAULT_INTERVAL_SECONDS,
     monitor.enabledByDefault ?? false,
   ];

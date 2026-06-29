@@ -133,12 +133,12 @@ async function gatherContext(
     )
   ).rows.map((r) => r.status);
 
-  // Most-recent-passing screenshot as the visual-diff baseline. The runner stores it
-  // per check (checks.baseline_screenshot_url), overwritten on each passing browser
-  // run (see executeBrowser/runOne) — so a browser check that has passed since the
-  // feature shipped has a baseline to compare the failure against. NULL otherwise.
-  const failureB64 = await downloadBlobBase64(runRow?.screenshot_url ?? null);
-  const baselineB64 = await downloadBlobBase64(check.baseline_screenshot_url);
+  // ★ B10: a SENSITIVE monitor's RCA is TEXT-ONLY — never send screenshots to the (3rd-party) AI: a
+  // rendered cart/auth page shows cart contents / logged-in name·email·address. The runner already
+  // stores no screenshots for sensitive monitors, so these are normally null anyway; this is the
+  // explicit guard (defense-in-depth — e.g. a baseline lingering from before the monitor was flagged).
+  const failureB64 = check.sensitive ? null : await downloadBlobBase64(runRow?.screenshot_url ?? null);
+  const baselineB64 = check.sensitive ? null : await downloadBlobBase64(check.baseline_screenshot_url);
 
   const text = [
     `Check: "${check.name}" (kind=${check.kind}, target=${check.target_url})`,
