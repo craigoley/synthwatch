@@ -72,26 +72,93 @@ export function specToFlow(fn: (args: { page: Page }) => Promise<void>, page: Pa
 }
 
 // ---------------------------------------------------------------------------
-// expect() — mini-matcher shim. ONLY the matchers the real specs use:
-//   - toBeVisible  (7 direct uses + assertLoaded)  -> locator.waitFor({state:'visible'})
-//   - toHaveURL    (assertLoaded)                  -> page.waitForURL(pattern)
-// A miss throws ExpectationError => the run records 'fail' (a clean assertion miss), exactly
-// like Playwright's web-first expect. ★ FLAG: any OTHER matcher a spec adds is UNMAPPED and
-// will throw "unmapped matcher" — the monitors-repo CI lint should keep specs to this surface.
+// expect() — the mini-matcher shim. lib/flow re-exports the REAL @playwright/test expect (all matchers)
+// for local `playwright test`; this is the RUNTIME stand-in the runner substitutes. They can't be
+// identical, so it must cover every matcher specs ACTUALLY use — and the matcher-coverage guard
+// (scripts/check-expect-matchers.mjs, run by the "Lib-flow parity" job) fails CI if a spec uses one
+// this shim doesn't implement, instead of letting it throw a TypeError in a LIVE run (the bug that
+// took down meals2go: .toBe(200)/.toBeGreaterThan(0) on VALUE targets → ".toBe is not a function").
+//
+//   Locator|Page (async, web-first): toBeVisible, toHaveURL.
+//   value (sync): toBe, toBeNull, toBeGreaterThan(OrEqual), toBeLessThan(OrEqual), toBeTruthy/Falsy,
+//                 toBeDefined — each with a `.not` negation, and Playwright's optional 2-arg message
+//                 form `expect(value, "message").toBe(x)` (the message is surfaced in the failure).
+//   A miss throws ExpectationError => the run records 'fail' (a clean assertion miss), like Playwright.
 // ---------------------------------------------------------------------------
-export interface SpecExpect {
-  toBeVisible(opts?: { timeout?: number }): Promise<void>;
-  toHaveURL(pattern: RegExp | string, opts?: { timeout?: number }): Promise<void>;
+
+// The matcher names this shim implements — the SINGLE SOURCE the coverage guard greps + diffs against
+// the specs' usage. Keep in sync when adding a matcher to expect() below.
+export const SUPPORTED_MATCHERS = [
+  'toBeVisible',
+  'toHaveURL',
+  'toBe',
+  'toBeNull',
+  'toBeGreaterThan',
+  'toBeGreaterThanOrEqual',
+  'toBeLessThan',
+  'toBeLessThanOrEqual',
+  'toBeTruthy',
+  'toBeFalsy',
+  'toBeDefined',
+] as const;
+
+interface ValueMatchers {
+  toBe(expected: unknown): void;
+  toBeNull(): void;
+  toBeGreaterThan(n: number): void;
+  toBeGreaterThanOrEqual(n: number): void;
+  toBeLessThan(n: number): void;
+  toBeLessThanOrEqual(n: number): void;
+  toBeTruthy(): void;
+  toBeFalsy(): void;
+  toBeDefined(): void;
 }
 
-export function expect(target: Locator | Page): SpecExpect {
+export interface SpecExpect extends ValueMatchers {
+  toBeVisible(opts?: { timeout?: number }): Promise<void>;
+  toHaveURL(pattern: RegExp | string, opts?: { timeout?: number }): Promise<void>;
+  not: ValueMatchers;
+}
+
+export function expect(target: unknown, message?: string): SpecExpect {
+  const lead = message ? `${message} — ` : '';
+  const show = (v: unknown): string => {
+    try {
+      return JSON.stringify(v) ?? String(v);
+    } catch {
+      return String(v);
+    }
+  };
+  // Sync value matchers. `negate` flips the pass condition (the `.not` chain). A non-number target
+  // makes the numeric comparisons false (NaN), so `expect('x').toBeGreaterThan(0)` fails honestly.
+  const valueMatchers = (negate: boolean): ValueMatchers => {
+    const check = (pass: boolean, detail: string): void => {
+      if (negate ? pass : !pass) {
+        throw new ExpectationError(`${lead}expected ${show(target)} ${negate ? 'not ' : ''}${detail}`);
+      }
+    };
+    const n = typeof target === 'number' ? target : NaN;
+    return {
+      toBe: (expected) => check(target === expected, `to be ${show(expected)}`),
+      toBeNull: () => check(target === null, `to be null`),
+      toBeGreaterThan: (x) => check(n > x, `to be greater than ${x}`),
+      toBeGreaterThanOrEqual: (x) => check(n >= x, `to be >= ${x}`),
+      toBeLessThan: (x) => check(n < x, `to be less than ${x}`),
+      toBeLessThanOrEqual: (x) => check(n <= x, `to be <= ${x}`),
+      toBeTruthy: () => check(Boolean(target), `to be truthy`),
+      toBeFalsy: () => check(!target, `to be falsy`),
+      toBeDefined: () => check(target !== undefined, `to be defined`),
+    };
+  };
   return {
+    ...valueMatchers(false),
+    not: valueMatchers(true),
     async toBeVisible(opts) {
       const timeout = opts?.timeout ?? 15000;
       try {
         await (target as Locator).waitFor({ state: 'visible', timeout });
       } catch {
-        throw new ExpectationError(`expected element to be visible within ${timeout}ms`);
+        throw new ExpectationError(`${lead}expected element to be visible within ${timeout}ms`);
       }
     },
     async toHaveURL(pattern, opts) {
@@ -99,7 +166,7 @@ export function expect(target: Locator | Page): SpecExpect {
       try {
         await (target as Page).waitForURL(pattern, { timeout });
       } catch {
-        throw new ExpectationError(`expected URL to match ${String(pattern)} within ${timeout}ms`);
+        throw new ExpectationError(`${lead}expected URL to match ${String(pattern)} within ${timeout}ms`);
       }
     },
   };
