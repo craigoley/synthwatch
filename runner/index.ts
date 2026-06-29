@@ -82,10 +82,13 @@ interface Outcome {
 // lingering as in-flight forever.
 const STALE_RUNNING = "30 minutes";
 
-// Fixed backoff between fast-retry attempts — a short pause so an instant re-run
-// doesn't just hit the same in-flight transient blip. Fixed (not exponential): retry
-// counts are tiny and the tick is time-bounded by the ACA replicaTimeout.
-const RETRY_BACKOFF_MS = 2000;
+// Fixed backoff between fast-retry attempts — a short pause so an immediate re-run doesn't just
+// re-hit the same in-flight transient blip. Now that we also retry 'fail' (not just 'error'), a
+// browser flow retried with too short a pause can catch the site still mid-blip — so 5s, in the
+// field-standard 5–15s range, while staying small vs a 60–90s browser run. Fixed (not exponential):
+// retry counts are tiny and the tick is time-bounded by the ACA replicaTimeout. (Per-check backoff
+// config is a possible follow-up; a single sane default keeps this PR one concern.)
+const RETRY_BACKOFF_MS = 5000;
 
 // How fresh the per-monitor success-trace baseline must be before we SKIP re-uploading it on a pass.
 // Capturing+uploading a multi-MB trace on every successful tick would be wasteful for a healthy 5-min
@@ -331,14 +334,15 @@ async function runOne(check: Check): Promise<void> {
     baselineScreenshot: null,
   });
 
-  // FAST-RETRY (mechanism 1, within ONE run): runWithRetry re-runs on a transient
-  // 'error' (the check couldn't COMPLETE — network/timeout/DNS) up to `retries` times.
-  // NOT retried on 'fail' (an assertion failed = a real, completed result) nor
-  // pass/warn. The LAST attempt is the verdict; onBeforeRetry discards the prior
-  // errored attempt's partial per-run side effects (run_steps, run_metrics, the temp
-  // trace file) + backs off, so EXACTLY ONE verdict persists — the run history /
-  // failure_threshold (mechanism 2, AFTER this) never sees the retried-away attempts.
-  // retries=0 => no retry (pre-0021 behaviour).
+  // FAST-RETRY (mechanism 1, within ONE run): runWithRetry re-runs on ANY failure — 'error'
+  // (couldn't COMPLETE — network/timeout/DNS) OR 'fail' (an assertion missed) — up to `retries`
+  // times. NOT retried on pass/warn (a success; warn = available-but-degraded). The LAST attempt
+  // is the verdict; onBeforeRetry discards the prior attempt's partial per-run side effects
+  // (run_steps, run_metrics, the temp trace file) REGARDLESS of its status + backs off, so EXACTLY
+  // ONE verdict persists — the run history / failure_threshold (mechanism 2, AFTER this) never sees
+  // the retried-away attempts (no phantom intermediate-failure metrics pollute the success-baseline
+  // or trace-diff). retries=0 => no retry (pre-0021 behaviour). Retrying 'fail' lets an in-run-
+  // confirmed failure page immediately (with failure_threshold=1) instead of after N scheduled ticks.
   const maxAttempts = check.retries + 1;
   // Capture this run's trace as the SUCCESS baseline only if the monitor's existing baseline is
   // missing or older than SUCCESS_TRACE_REFRESH_MS (throttle — see the const). Decided up front from
