@@ -61,7 +61,7 @@ jobs:
       #   ruleset's `copilot_code_review` rule. The failure-check below STILL fails ci-gate if a
       #   "Review" (or any) run is present and failed.
       REQUIRED: >-
-        ["Lint","Scan","Analyze (javascript-typescript)","Analyze (actions)","Claude review"]
+        ["Lint","Scan","Analyze (javascript-typescript)","Analyze (actions)","Claude review","Lib-flow parity"]
       # Not quality gates — never wait on or fail for these (ci-gate is self; automerge enables merge).
       IGNORE: >-
         ["ci-gate","automerge"]

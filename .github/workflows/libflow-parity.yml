@@ -1,0 +1,44 @@
+name: Lib-flow parity
+
+# Fails the PR when runner/specfetch/specShim.ts (the lib/flow copy the runner EXECUTES) drifts from
+# monitors/lib/flow.ts (the authoring copy, dead at runtime). See scripts/check-libflow-parity.mjs.
+#
+# No path filter — it ALWAYS runs so the "Lib-flow parity" check is ALWAYS present for ci-gate (a
+# path-filtered required check that skips can deadlock the gate's wait loop). It's cheap (~20s).
+# Checks out monitors@main with actions/checkout (deterministic — NO raw-CDN propagation lag).
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: libflow-parity-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  libflow-parity:
+    name: Lib-flow parity
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the runner repo
+        uses: actions/checkout@v4
+
+      - name: Check out synthwatch-monitors@main (the authoring lib/flow.ts)
+        uses: actions/checkout@v4
+        with:
+          repository: craigoley/synthwatch-monitors
+          ref: main
+          path: _monitors
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: specShim.ts ↔ lib/flow.ts parity
+        env:
+          LIBFLOW_SRC: _monitors/lib/flow.ts
+        run: node scripts/check-libflow-parity.mjs
