@@ -42,7 +42,7 @@ import { extractTraceSignals } from './traceSignals.js';
 import os from 'node:os';
 import path from 'node:path';
 import { unlink } from 'node:fs/promises';
-import { evaluate, maybeBurnAlert, perfBudgetBreach } from './evaluate.js';
+import { evaluate, maybeBurnAlert, perfBudgetBreach, hasOpenIncident } from './evaluate.js';
 import {
   startMetricsCapture,
   writeRunMetrics,
@@ -50,7 +50,7 @@ import {
   type RunMetrics,
 } from './metrics.js';
 import { isExpectationError } from './errors.js';
-import { runWithRetry } from './retry.js';
+import { runWithRetry, effectiveRetries } from './retry.js';
 
 // A run's terminal outcome. `status` is the real taxonomy, not a boolean:
 //   pass / fail / error come from execution; `warn` is derived later in runOne
@@ -343,7 +343,21 @@ async function runOne(check: Check): Promise<void> {
   // the retried-away attempts (no phantom intermediate-failure metrics pollute the success-baseline
   // or trace-diff). retries=0 => no retry (pre-0021 behaviour). Retrying 'fail' lets an in-run-
   // confirmed failure page immediately (with failure_threshold=1) instead of after N scheduled ticks.
-  const maxAttempts = check.retries + 1;
+  //
+  // ★ SKIP fast-retry when ALREADY confirmed-down: fast-retry absorbs a TRANSIENT blip on a HEALTHY
+  // monitor — moot once the failure is SUSTAINED. If an incident is already open for this check, a
+  // prior run already confirmed it's failing, so retrying ×2 every tick is wasted browser work
+  // (~2-3 min/tick). effectiveRetries() drops to 0 (1 attempt) then. The FIRST failure of a healthy
+  // monitor still gets full retry (no incident yet); only SUBSEQUENT failures while the incident is
+  // open skip it; on recovery evaluate() resolves the incident, so the next fresh failure retries again.
+  const alreadyFailing = await hasOpenIncident(check.id);
+  const retries = effectiveRetries(check.retries, alreadyFailing);
+  const maxAttempts = retries + 1;
+  if (alreadyFailing && check.retries > 0) {
+    console.log(
+      `[runner] check ${check.id} "${check.name}" already has an open incident — skipping fast-retry (1 attempt).`,
+    );
+  }
   // Capture this run's trace as the SUCCESS baseline only if the monitor's existing baseline is
   // missing or older than SUCCESS_TRACE_REFRESH_MS (throttle — see the const). Decided up front from
   // the claimed check row; failures ignore this and are always traced.
@@ -366,7 +380,7 @@ async function runOne(check: Check): Promise<void> {
         return errorOutcome(err instanceof Error ? err.message : String(err));
       }
     },
-    check.retries,
+    retries,
     async (prev, attempt) => {
       if (prev.tracePath) await unlink(prev.tracePath).catch(() => {});
       await pool.query(`DELETE FROM run_steps WHERE run_id = $1`, [runId]);

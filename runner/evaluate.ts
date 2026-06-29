@@ -512,6 +512,17 @@ async function getOpenIncident(checkId: number): Promise<OpenIncident | null> {
   return rows[0] ?? null;
 }
 
+/**
+ * Cheap "is this check ALREADY confirmed-down?" signal for the fast-retry skip (one lookup on the
+ * partial-unique one_open_incident_per_check index). An OPEN incident means a prior run already
+ * confirmed the failure and it hasn't recovered — so the in-run fast-retry's transient-absorption is
+ * moot. It self-resets: evaluate() resolves the incident on a recovery pass, so the next fresh
+ * failure sees no open incident and gets full retry again.
+ */
+export async function hasOpenIncident(checkId: number): Promise<boolean> {
+  return (await getOpenIncident(checkId)) !== null;
+}
+
 async function countConsecutiveDown(
   checkId: number,
   threshold: number,
