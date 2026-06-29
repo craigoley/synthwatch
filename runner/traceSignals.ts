@@ -8,6 +8,7 @@
 //   match what GetTraceSignals returns so trace-diff + ai-insights agree on one schema. Do NOT diverge here;
 //   change both sides together. Pure + non-fatal: a missing entry / unparseable line yields an empty section.
 import AdmZip from 'adm-zip';
+import { type Redactor, IDENTITY_REDACTOR } from './redact.js';
 
 // ── output shape (camelCase — matches TraceSignalsDto serialized with JsonSerializerDefaults.Web) ──────────
 export interface TraceRequest {
@@ -84,7 +85,11 @@ const MAX_CONSOLE_MESSAGES = 40;
  * null). A valid zip with no notable signals → a well-shaped, mostly-empty object (0 errors IS a signal).
  * Only reads the two small NDJSON entries (trace.network, trace.trace) — NOT the multi-MB resources/.
  */
-export function extractTraceSignals(zipPath: string, targetUrl: string | null): TraceSignals | null {
+export function extractTraceSignals(
+  zipPath: string,
+  targetUrl: string | null,
+  redact: Redactor = IDENTITY_REDACTOR,
+): TraceSignals | null {
   const targetHost = hostOf(targetUrl ?? '') || null;
   try {
     const zip = new AdmZip(zipPath);
@@ -93,8 +98,8 @@ export function extractTraceSignals(zipPath: string, targetUrl: string | null): 
     if (networkNdjson === null && traceNdjson === null) return null; // not a Playwright trace
     return {
       targetHost,
-      network: networkNdjson !== null ? extractNetwork(networkNdjson, targetHost) : EMPTY_NETWORK,
-      console: traceNdjson !== null ? extractConsole(traceNdjson, targetHost) : EMPTY_CONSOLE,
+      network: networkNdjson !== null ? extractNetwork(networkNdjson, targetHost, redact) : EMPTY_NETWORK,
+      console: traceNdjson !== null ? extractConsole(traceNdjson, targetHost, redact) : EMPTY_CONSOLE,
     };
   } catch {
     return null; // bad zip / read error — non-fatal
@@ -119,7 +124,11 @@ interface Req {
   third: boolean;
 }
 
-export function extractNetwork(networkNdjson: string, targetHost: string | null): NetworkSummary {
+export function extractNetwork(
+  networkNdjson: string,
+  targetHost: string | null,
+  redact: Redactor = IDENTITY_REDACTOR,
+): NetworkSummary {
   const reqs: Req[] = [];
   for (const line of lines(networkNdjson)) {
     const root = tryParse(line);
@@ -142,8 +151,10 @@ export function extractNetwork(networkNdjson: string, targetHost: string | null)
     });
   }
 
+  // Redact the STORED url (session-token query params etc.) for sensitive monitors; host-grouping
+  // above runs on the raw url (hosts carry no secrets). No-op for non-sensitive monitors.
   const slim = (r: Req): TraceRequest => ({
-    url: r.url,
+    url: redact(r.url),
     status: r.status,
     resourceType: r.rtype,
     timeMs: r.time,
@@ -197,7 +208,11 @@ export function extractNetwork(networkNdjson: string, targetHost: string | null)
 }
 
 // ── console (the filter) ────────────────────────────────────────────────────────────────────────────────────
-export function extractConsole(traceNdjson: string, targetHost: string | null): ConsoleSummary {
+export function extractConsole(
+  traceNdjson: string,
+  targetHost: string | null,
+  redact: Redactor = IDENTITY_REDACTOR,
+): ConsoleSummary {
   const kept: ConsoleMessage[] = [];
   const seen = new Set<string>();
   let droppedLevel = 0;
@@ -207,7 +222,9 @@ export function extractConsole(traceNdjson: string, targetHost: string | null): 
     const root = tryParse(line);
     if (!root || root.type !== 'console') continue;
     const level = str(root.messageType) || 'log';
-    const text = str(root.text).trim();
+    // Redact BEFORE dedup/slice so a session token the site logs is scrubbed uniformly (no-op for
+    // non-sensitive monitors). The location url is only host-derived for `origin`, never stored.
+    const text = redact(str(root.text).trim());
     const loc = isObj(root.location) ? str(root.location.url) : '';
 
     if (level !== 'error' && level !== 'warning') {

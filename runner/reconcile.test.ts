@@ -218,14 +218,57 @@ test('apply upsert NEVER writes dashboard-owned columns', () => {
 test('apply upsert conflict-targets source_key and seeds the right values', () => {
   const { text, values } = buildApplyUpsert(monitor({ suggestedIntervalSeconds: undefined }));
   assert.match(text, /ON CONFLICT \(source_key\) DO UPDATE/);
-  // values order = [source_key, name, kind, target_url, flow_name, interval, enabled]
+  // values order = [source_key, name, kind, target_url, flow_name, sensitive, redact_patterns, interval, enabled]
   assert.deepEqual(values, [
     'wegmans-search-product',
     'Wegmans: search → product page',
     'browser',
     'https://www.wegmans.com',
     'search-product',
+    false, // sensitive default
+    'null', // redact_patterns: JSON.stringify(null) — none declared
     300, // omitted suggestedIntervalSeconds -> column default 300
     false, // enabledByDefault false
   ]);
+});
+
+// --- B10: the sensitive enable gate + the redaction-policy wiring -----------
+test('★ GATE: a sensitive monitor with NO redact_patterns is REJECTED (cannot be enabled)', () => {
+  const bad = {
+    ...VALID,
+    monitors: [{ ...VALID.monitors[0], sensitive: true }], // sensitive, but no redact_patterns
+  };
+  assert.throws(() => validateManifest(bad), /sensitive but declares no redact_patterns/);
+});
+
+test('a sensitive monitor WITH redact_patterns validates + carries them through', () => {
+  const ok = {
+    ...VALID,
+    monitors: [{ ...VALID.monitors[0], sensitive: true, redact_patterns: ['member-\\d+'] }],
+  };
+  const m = validateManifest(ok).monitors[0];
+  assert.equal(m.sensitive, true);
+  assert.deepEqual(m.redact_patterns, ['member-\\d+']);
+});
+
+test('validateManifest rejects an invalid regex in redact_patterns', () => {
+  const bad = {
+    ...VALID,
+    monitors: [{ ...VALID.monitors[0], sensitive: true, redact_patterns: ['('] }],
+  };
+  assert.throws(() => validateManifest(bad), /invalid regex/);
+});
+
+test('buildApplyUpsert wires sensitive + redact_patterns (Git-authoritative) into INSERT + UPDATE', () => {
+  const { insertColumns, updateColumns, values } = buildApplyUpsert(
+    monitor({ sensitive: true, redact_patterns: ['token=[A-Z0-9]+'] }),
+  );
+  // both columns are inserted AND in the UPDATE SET (manifest is the source of truth → re-synced).
+  for (const c of ['sensitive', 'redact_patterns']) {
+    assert.ok(insertColumns.includes(c), `${c} inserted`);
+    assert.ok((updateColumns as string[]).includes(c), `${c} updated (Git-authoritative)`);
+  }
+  // sensitive=true + the declared patterns serialized as JSONB text.
+  assert.equal(values[insertColumns.indexOf('sensitive')], true);
+  assert.equal(values[insertColumns.indexOf('redact_patterns')], JSON.stringify(['token=[A-Z0-9]+']));
 });

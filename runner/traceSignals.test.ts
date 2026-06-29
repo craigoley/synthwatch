@@ -9,6 +9,7 @@ import { writeFileSync, rmSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { extractNetwork, extractConsole, extractTraceSignals } from './traceSignals.js';
+import { makeRedactor, IDENTITY_REDACTOR } from './redact.js';
 
 const TARGET = 'www.wegmans.com';
 
@@ -142,4 +143,30 @@ test('extractTraceSignals -> null when the zip has no trace entries (not a Playw
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ── B10: trace_signals are SCRUBBED when a redactor is passed (sensitive monitors) ───────────────
+test('extractNetwork redacts session tokens in the STORED url when given a redactor', () => {
+  const ndjson = [
+    '{"type":"resource-snapshot","snapshot":{"_resourceType":"fetch","time":10,"timings":{"wait":5},"request":{"url":"https://www.wegmans.com/shop/cart?session=SECRET123&item=42","method":"GET"},"response":{"status":200,"_transferSize":100,"content":{"size":50,"mimeType":"application/json"},"headers":[]}}}',
+  ].join('\n');
+  const redacted = extractNetwork(ndjson, TARGET, makeRedactor(null));
+  assert.equal(redacted.slowest[0].url, 'https://www.wegmans.com/shop/cart?session=<redacted>&item=42');
+  // host-grouping/classification still works (host carries no secret) — it's still a same-site request.
+  assert.equal(redacted.totalRequests, 1);
+  // ...and WITHOUT a redactor (non-sensitive) the url is byte-for-byte unchanged.
+  const plain = extractNetwork(ndjson, TARGET, IDENTITY_REDACTOR);
+  assert.equal(plain.slowest[0].url, 'https://www.wegmans.com/shop/cart?session=SECRET123&item=42');
+});
+
+test('extractConsole redacts a token the site logs when given a redactor', () => {
+  const ndjson = [
+    '{"type":"console","messageType":"error","text":"checkout failed for token=abc987ZZZ retry","location":{"url":"https://www.wegmans.com/checkout"}}',
+  ].join('\n');
+  const redacted = extractConsole(ndjson, TARGET, makeRedactor(null));
+  assert.equal(redacted.messages.length, 1);
+  assert.equal(redacted.messages[0].text, 'checkout failed for token=<redacted> retry');
+  // non-sensitive: unchanged.
+  const plain = extractConsole(ndjson, TARGET, IDENTITY_REDACTOR);
+  assert.equal(plain.messages[0].text, 'checkout failed for token=abc987ZZZ retry');
 });
