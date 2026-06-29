@@ -4,7 +4,7 @@
 // so a retried-away 'fail' is discarded identically to a retried-away 'error'.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { runWithRetry } from './retry.js';
+import { runWithRetry, effectiveRetries } from './retry.js';
 
 type R = { status: string; attempt: number };
 
@@ -87,4 +87,22 @@ test("(b) the discard hook fires once per retried-away attempt, including 'fail'
     'every non-final attempt (fail AND error) is handed to the discard hook exactly once',
   );
   assert.equal(result.status, 'fail');
+});
+
+// ── effectiveRetries: skip fast-retry when the monitor is ALREADY confirmed-down (open incident) ──
+// A HEALTHY monitor keeps its full retries (first failure is still retried to confirm before paging);
+// an ALREADY-failing monitor drops to 0 (1 attempt, fail fast — don't re-pay ~2-3 min/tick).
+test('effectiveRetries: healthy monitor keeps full retries (first-failure retry preserved)', () => {
+  assert.equal(effectiveRetries(2, false), 2); // healthy fails -> maxAttempts = 3 (full fast-retry)
+});
+test('effectiveRetries: already-failing monitor skips retry (1 attempt)', () => {
+  assert.equal(effectiveRetries(2, true), 0); // open incident -> maxAttempts = 1 (no retry)
+});
+test('effectiveRetries: a RECOVERED monitor (no open incident) gets full retry again', () => {
+  // after recovery the incident is resolved -> alreadyFailing=false -> fresh transient candidate.
+  assert.equal(effectiveRetries(2, false), 2);
+});
+test('effectiveRetries: retries=0 stays 0 either way (retry already disabled)', () => {
+  assert.equal(effectiveRetries(0, false), 0);
+  assert.equal(effectiveRetries(0, true), 0);
 });

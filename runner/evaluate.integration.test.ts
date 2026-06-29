@@ -9,7 +9,7 @@
 import { test as nodeTest } from 'node:test';
 import assert from 'node:assert/strict';
 import { pool, type Check, type RunRecord } from './db.js';
-import { evaluate } from './evaluate.js';
+import { evaluate, hasOpenIncident } from './evaluate.js';
 
 const SKIP = !process.env.DATABASE_URL;
 
@@ -81,6 +81,47 @@ nodeTest('(d) failure_threshold>1 still debounces across consecutive scheduled r
     const run3 = await seedFailRun(check.id, 0);
     await evaluate(check, run3);
     assert.equal(await openIncidentCount(check.id), 1, '3 consecutive down → incident opens on the 3rd');
+  } finally {
+    await pool.query(`DELETE FROM checks WHERE id = $1`, [check.id]);
+  }
+});
+
+// A passing run (recovery), newest by default — drives evaluate() to resolve any open incident.
+async function seedPassRun(checkId: number, minutesAgo: number): Promise<RunRecord> {
+  const { rows } = await pool.query<{ id: number }>(
+    `INSERT INTO runs (check_id, status, started_at, finished_at, location)
+     VALUES ($1, 'pass', now() - make_interval(mins => $2::int), now() - make_interval(mins => $2::int), 'default')
+     RETURNING id`,
+    [checkId, minutesAgo],
+  );
+  return {
+    id: rows[0].id,
+    check_id: checkId,
+    status: 'pass',
+    error_message: null,
+    failed_step: null,
+    screenshot_url: null,
+    location: 'default',
+  };
+}
+
+// (skip-fast-retry signal) hasOpenIncident drives the fast-retry skip and handles the heal→re-fail
+// cycle: healthy=false (full retry) → first fail opens incident=true (subsequent failures skip retry)
+// → recovery pass RESOLVES the incident=false (full retry returns; a fresh fail is a new transient
+// candidate). Proves effectiveRetries(check.retries, hasOpenIncident) covers all 4 task cases.
+nodeTest('(skip-retry signal) hasOpenIncident: healthy→down→recovered cycle resets correctly (live)', { skip: SKIP }, async () => {
+  const check = await makeCheck(1, '__eval_skipretry_e2e__');
+  try {
+    // 1) healthy monitor: no open incident → signal false → a failure here gets FULL fast-retry.
+    assert.equal(await hasOpenIncident(check.id), false, 'healthy → alreadyFailing=false → full retry');
+
+    // 2) first confirmed failure opens the incident → signal true → SUBSEQUENT failures skip retry.
+    await evaluate(check, await seedFailRun(check.id, 1));
+    assert.equal(await hasOpenIncident(check.id), true, 'open incident → alreadyFailing=true → 1 attempt');
+
+    // 3) recovery: a passing run → evaluate() resolves the incident → 4) signal false → full retry again.
+    await evaluate(check, await seedPassRun(check.id, 0));
+    assert.equal(await hasOpenIncident(check.id), false, 'recovery pass resolves incident → full retry returns');
   } finally {
     await pool.query(`DELETE FROM checks WHERE id = $1`, [check.id]);
   }

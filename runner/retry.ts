@@ -17,6 +17,19 @@ function isRetryable(status: string): boolean {
   return status === 'error' || status === 'fail';
 }
 
+/**
+ * The fast-retry budget for ONE run. On a monitor that's ALREADY confirmed-down (an open incident),
+ * the in-run fast-retry — which exists to absorb a TRANSIENT blip on a HEALTHY monitor — is moot: the
+ * failure is sustained, so retrying ×N every tick is wasted browser work (~2–3 min/tick). Skip it
+ * (0 retries → 1 attempt, fail fast). A healthy monitor keeps its full `retries` so the FIRST failure
+ * is still retried to confirm it's real before paging (the transient-absorption that prevents a false
+ * page). Pairs with failure_threshold=1: first failure retries→confirms→opens incident; subsequent
+ * failures while it's open skip retry; on recovery the incident resolves and full retry returns.
+ */
+export function effectiveRetries(retries: number, alreadyFailing: boolean): number {
+  return alreadyFailing ? 0 : retries;
+}
+
 export async function runWithRetry<T extends { status: string }>(
   execute: (attempt: number) => Promise<T>,
   retries: number,
