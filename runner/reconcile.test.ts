@@ -10,6 +10,7 @@ import {
   flowNameFor,
   computeDrift,
   buildApplyUpsert,
+  b10FieldUpdates,
   fetchManifest,
   GIT_AUTHORITATIVE_COLUMNS,
   SEED_ONLY_COLUMNS,
@@ -107,6 +108,8 @@ const managed = (over: Partial<ManagedCheck> = {}): ManagedCheck => ({
   kind: 'browser',
   target_url: 'https://www.wegmans.com',
   flow_name: 'search-product',
+  sensitive: false,
+  redact_patterns: null,
   ...over,
 });
 
@@ -317,4 +320,57 @@ test('fetchManifest honors an explicit override URL (direct fetch — tests/fork
   const m = await fetchManifest();
   assert.equal(m.monitors.length, 1);
   assert.deepEqual(urls, ['https://example.test/manifest.json'], 'direct-fetched the override; no contents API');
+});
+
+// --- ★ SCOPED B10-only sync (the leak fix) — writes ONLY sensitive + redact_patterns ----------
+test('★ b10FieldUpdates: a sensitive monitor whose live check defaulted to false → corrects it', () => {
+  const ups = b10FieldUpdates(
+    [monitor({ sensitive: true, redact_patterns: ['eyJ[A-Za-z0-9_-]+', '[Bb]earer\\s+\\S+'] })],
+    [managed({ sensitive: false, redact_patterns: null })], // the leak: manifest says sensitive, DB defaulted false
+  );
+  assert.equal(ups.length, 1);
+  assert.equal(ups[0].source_key, 'wegmans-search-product');
+  assert.equal(ups[0].sensitive, true);
+  assert.equal(ups[0].redact_patterns, JSON.stringify(['eyJ[A-Za-z0-9_-]+', '[Bb]earer\\s+\\S+']));
+});
+
+test('b10FieldUpdates: a check ALREADY matching the manifest → NO update (untouched)', () => {
+  assert.deepEqual(
+    b10FieldUpdates(
+      [monitor({ sensitive: true, redact_patterns: ['x'] })],
+      [managed({ sensitive: true, redact_patterns: ['x'] })],
+    ),
+    [],
+  );
+  // a non-sensitive monitor + non-sensitive check (the default fleet) → also untouched.
+  assert.deepEqual(b10FieldUpdates([monitor()], [managed()]), []);
+});
+
+test('★ b10FieldUpdates writes ONLY source_key + the 2 B10 columns (no other field)', () => {
+  const u = b10FieldUpdates([monitor({ sensitive: true, redact_patterns: ['x'] })], [managed({ sensitive: false })])[0];
+  assert.deepEqual(Object.keys(u).sort(), ['redact_patterns', 'sensitive', 'source_key']);
+});
+
+test('★ FULL git-authoritative apply stays OFF: b10FieldUpdates IGNORES name/target/etc.', () => {
+  // name + target_url diverge, but sensitive matches → the scoped sync produces NO update
+  // (it does NOT apply name/target — that is the still-gated full apply).
+  assert.deepEqual(
+    b10FieldUpdates(
+      [monitor({ name: 'NEW name', target: 'https://changed.example', sensitive: false })],
+      [managed({ name: 'OLD name', target_url: 'https://old.example', sensitive: false })],
+    ),
+    [],
+  );
+});
+
+test('computeDrift DETECTS a sensitive/redact_patterns divergence (read-only audit)', () => {
+  const rows = computeDrift(
+    [monitor({ sensitive: true, redact_patterns: ['x'] })],
+    [managed({ sensitive: false, redact_patterns: null })],
+    runnable(SPEC),
+  );
+  const changed = rows.find((r) => r.drift_type === 'changed');
+  assert.ok(changed, 'a B10 divergence shows as changed drift');
+  const fields = (changed!.detail as { fields: Record<string, unknown> }).fields;
+  assert.ok('sensitive' in fields && 'redact_patterns' in fields, 'both B10 fields surfaced in the drift');
 });

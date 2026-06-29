@@ -10,6 +10,7 @@ import { pool } from './db.js';
 import {
   fetchManifest,
   computeDrift,
+  b10FieldUpdates,
   manifestUrl,
   type Monitor,
   type ManagedCheck,
@@ -20,7 +21,7 @@ import { probeSpecsFromPool, type SpecProbe } from './specfetch/specCache.js';
 /** Read the Git-managed checks (source_key set). Unmanaged rows are intentionally excluded. */
 async function loadManagedChecks(): Promise<ManagedCheck[]> {
   const { rows } = await pool.query<ManagedCheck>(
-    `SELECT source_key, name, kind, target_url, flow_name
+    `SELECT source_key, name, kind, target_url, flow_name, sensitive, redact_patterns
        FROM checks
       WHERE source_key IS NOT NULL`,
   );
@@ -116,6 +117,25 @@ async function main(): Promise<void> {
 
   const drift = computeDrift(manifest.monitors, managed, specRunnable);
   await persistDrift(drift);
+
+  // ★ SCOPED B10 SYNC — the ONLY thing reconcile writes to `checks`. The full git-authoritative apply
+  // (buildApplyUpsert) stays GATED OFF; this corrects ONLY the sensitive/redact_patterns SAFETY control
+  // so a manifest-declared sensitive monitor actually redacts (the leak otherwise stays unwired). The
+  // UPDATE touches exactly those two columns — no schedule/location/URL/name is applied here.
+  const b10 = b10FieldUpdates(manifest.monitors, managed);
+  for (const u of b10) {
+    await pool.query(`UPDATE checks SET sensitive = $2, redact_patterns = $3::jsonb WHERE source_key = $1`, [
+      u.source_key,
+      u.sensitive,
+      u.redact_patterns,
+    ]);
+    console.log(`[reconcile] B10 sync: ${u.source_key} -> sensitive=${u.sensitive}, redact_patterns corrected`);
+  }
+  console.log(
+    b10.length === 0
+      ? '[reconcile] B10 sync: all checks already match the manifest (no sensitive/redact_patterns drift).'
+      : `[reconcile] B10 sync: corrected ${b10.length} check(s) (sensitive/redact_patterns only).`,
+  );
 
   // Snapshot the full manifest (every spec + its probe result) for the read-only catalog
   // (GET /api/specs). Reuses the probe just computed — no second fetch/compile.
