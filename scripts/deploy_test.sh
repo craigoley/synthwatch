@@ -292,6 +292,24 @@ if [[ "${rc}" -ne 0 ]]; then green "PASS  post_reconcile surfaces failure (rc!=0
 check_contains "post_reconcile prints the error" "${out}" "ERROR: synthwatch-reconcile-job ended: Failed"
 unset -f az psql sleep check_contains
 
+# ===========================================================================
+# E. git_drift_state — local HEAD vs origin/main, in a throwaway repo (no working-tree mutation of
+#    THIS repo). The deploy targets origin/main; this only classifies what to warn.
+# ===========================================================================
+run_drift_tests() {
+  local repo cwd A B
+  repo="$(mktemp -d)"; cwd="${PWD}"
+  cd "${repo}"
+  git init -q; git config user.email t@t; git config user.name t
+  git commit -q --allow-empty -m A; A="$(git rev-parse HEAD)"
+  git commit -q --allow-empty -m B; B="$(git rev-parse HEAD)" # B is a child of A
+  expect_eq "drift same (local == origin)"        "same"     "$(git_drift_state "${A}" "${A}")"
+  expect_eq "drift behind (local A, origin B)"     "behind"   "$(git_drift_state "${A}" "${B}")"
+  expect_eq "drift diverged (local B ahead of A)"  "diverged" "$(git_drift_state "${B}" "${A}")"
+  cd "${cwd}"; rm -rf "${repo}"
+}
+run_drift_tests
+
 echo
 if [[ "${FAILS}" -eq 0 ]]; then
   green "ALL TESTS PASSED"

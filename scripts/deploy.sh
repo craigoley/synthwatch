@@ -12,12 +12,17 @@
 #
 # This is a LOCAL helper Craig runs — not CD/automation. Scope: this script only.
 #
-# The newest-image≠HEAD check is SMART: if HEAD's commits since the newest image touch only
-# infra/docs/scripts (no runner build expected), it PROCEEDS silently; but if HEAD touches RUNNER
+# The deploy TARGET is origin/main, NOT local HEAD. The script `git fetch`es first and derives the
+# target from origin/main — the CI-built, deployable truth — so a drifted local checkout (stale, or an
+# orphan local commit never pushed/built) neither blocks the deploy nor needs manual git surgery. It
+# NEVER touches the working tree: it warns if local differs and deploys origin/main regardless.
+#
+# The newest-image≠target check is SMART: if the target's commits since the newest image touch only
+# infra/docs/scripts (no runner build expected), it PROCEEDS silently; but if the target touches RUNNER
 # CODE (or db/, or an unclassifiable path) since the newest DEPLOYABLE image — meaning CI is still
-# building HEAD's image or its build failed — it HALTS. It never silently ships an image that
-# predates HEAD's runner code, because that applies HEAD's DB migrations WITHOUT the matching code
-# (the DB-ahead-of-code half-state). The escape hatch is --sha (deploy a specific fully-built pair).
+# building the target's image or its build failed — it HALTS. It never silently ships an image that
+# predates the target's runner code, because that applies the target's DB migrations WITHOUT the matching
+# code (the DB-ahead-of-code half-state). The escape hatch is --sha (deploy a specific fully-built pair).
 #
 # Usage:
 #   scripts/deploy.sh                 # pick SHA, what-if (auto-proceed if clean / prompt on drop), deploy, verify
@@ -69,6 +74,9 @@ readonly TEMPLATE="${ROOT}/infra/main.bicep"
 WHATIF_ONLY=0
 POST_RECONCILE=0
 SHA_OVERRIDE=''
+# The deploy TARGET commit — derived from origin/main (the CI-built, deployable truth), NOT local HEAD.
+# Set by sync_target_to_origin(); read by pick_sha(). Empty under --sha (override skips the sync).
+TARGET_HEAD=''
 
 # Pure, testable helpers (path classifier + the confirmation gates). Shared with deploy_test.sh.
 [[ -f "${ROOT}/scripts/lib/deploy-lib.sh" ]] || { echo "missing scripts/lib/deploy-lib.sh" >&2; exit 1; }
@@ -189,10 +197,12 @@ pick_sha() {
     c_yellow "WARN: newest runner image ${runner_newest:0:12} has no matching ${MIGRATE_REPO} image" >&2
     c_yellow "      yet (CI likely mid-build); using the newest COMPLETE pair ${newest:0:12} instead." >&2
   fi
-  head="$(git rev-parse HEAD)"
+  # The TARGET is origin/main (sync_target_to_origin set TARGET_HEAD), NOT local HEAD — local main drifts
+  # (stale, or an orphan local commit with no image). All #135 guards below operate on this target.
+  head="${TARGET_HEAD}"
 
   if [[ "${newest}" == "${head}" ]]; then
-    c_green "Newest image == main HEAD (${newest:0:12}) — building from the current commit." >&2
+    c_green "Newest image == origin/main (${newest:0:12}) — that commit is built." >&2
   else
     local verdict; verdict="$(mismatch_verdict "${newest}" "${head}")"
     if [[ "${verdict}" == "benign" ]]; then
@@ -202,10 +212,10 @@ pick_sha() {
     else
       # AMBIGUOUS (runner code changed / unclassifiable) or UNRESOLVED — REFUSE a real deploy.
       if [[ "${verdict}" == "unresolved" ]]; then
-        c_yellow "WARN: newest image ${newest:0:12} is NOT main HEAD ${head:0:12}, and I can't classify" >&2
+        c_yellow "WARN: newest image ${newest:0:12} is NOT origin/main ${head:0:12}, and I can't classify" >&2
         c_yellow "      why (image SHA not an ancestor of HEAD? diverged / shallow clone)." >&2
       else
-        c_yellow "WARN: newest image ${newest:0:12} is NOT main HEAD ${head:0:12}, and HEAD touches runner" >&2
+        c_yellow "WARN: newest image ${newest:0:12} is NOT origin/main ${head:0:12}, and HEAD touches runner" >&2
         c_yellow "      code since that image — CI may still be building, or a build failed." >&2
       fi
       case "$(deploy_action_for_mismatch "${verdict}" "${WHATIF_ONLY}")" in
@@ -230,6 +240,43 @@ pick_sha() {
   # (Both images for ${newest} are guaranteed present — newest_common_sha required it.)
   printf '%s' "${newest}"
 }
+
+# ---------------------------------------------------------------------------
+# Sync the deploy TARGET to origin/main — the CI-built, deployable truth. We deploy what is on ORIGIN,
+# not local HEAD: local main drifts (stale and needs a pull, or carries an orphan local commit never
+# pushed/built — which has NO image, so deriving the target from it would falsely HALT #135's "no image
+# for HEAD"). ★ We NEVER touch the working tree (no reset/checkout): target origin/main, WARN if local
+# differs, leave local commits untouched. Sets TARGET_HEAD, which pick_sha uses as `head`.
+# ---------------------------------------------------------------------------
+sync_target_to_origin() {
+  c_bold "Fetching origin (the deploy target is origin/main, not local HEAD)…" >&2
+  git fetch --quiet origin 2>/dev/null \
+    || c_yellow "WARN: 'git fetch origin' failed — using the last-fetched origin/main (it may be stale)." >&2
+  local origin_head local_head state
+  origin_head="$(git rev-parse origin/main 2>/dev/null)" \
+    || fail "cannot resolve origin/main — is the 'origin' remote configured with a 'main' branch?"
+  local_head="$(git rev-parse HEAD 2>/dev/null || echo '')"
+  state="$(git_drift_state "${local_head}" "${origin_head}")"
+  case "${state}" in
+    same)
+      c_green "Local main == origin/main (${origin_head:0:12}) — deploying that." >&2 ;;
+    behind)
+      c_yellow "NOTE: local main is BEHIND origin/main — deploying origin/main ${origin_head:0:12}." >&2
+      c_yellow "      (Your checkout is stale; 'git pull' to catch up — not required, the deploy targets origin.)" >&2 ;;
+    diverged)
+      # local has commit(s) NOT on origin (e.g. an orphan never pushed). DO NOT reset — IGNORE them.
+      c_yellow "WARN: local main has commit(s) NOT on origin/main — IGNORING them; deploying origin/main ${origin_head:0:12}:" >&2
+      git log --oneline origin/main..HEAD 2>/dev/null | sed 's/^/        local-only (untouched): /' >&2 || true
+      c_yellow "      (Push + let CI build a local commit to deploy it, or use --sha. Your tree is left as-is.)" >&2 ;;
+  esac
+  TARGET_HEAD="${origin_head}"
+}
+
+# Derive the target from origin/main (unless --sha overrides the whole pick). --sha is the manual escape
+# hatch and bypasses the origin sync entirely.
+if [[ -z "${SHA_OVERRIDE}" ]]; then
+  sync_target_to_origin
+fi
 
 SHA="$(pick_sha)"
 readonly SHA

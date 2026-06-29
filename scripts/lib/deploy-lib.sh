@@ -188,3 +188,18 @@ post_reconcile() {
   printf '  reconcile_drift: %s\n' "${drift_summary}"
   return 0
 }
+
+# ---------------------------------------------------------------------------
+# git_drift_state — classify local HEAD vs origin/main WITHOUT touching the working tree. The deploy
+# TARGET is always origin/main (the CI-built, deployable truth); this only decides what to WARN.
+#   same     — local HEAD == origin/main.
+#   behind   — local is an ancestor of origin/main (fast-forwardable; a stale checkout).
+#   diverged — local has commit(s) NOT on origin/main (ahead or diverged — e.g. an orphan local commit
+#              never pushed/built; it has no image and must NOT be the deploy target).
+# Pure (just two SHAs + the repo's commit graph) so it's unit-testable. Returns the word on stdout.
+git_drift_state() {
+  local local_head="$1" origin_head="$2"
+  if [[ "${local_head}" == "${origin_head}" ]]; then echo "same"; return; fi
+  if git merge-base --is-ancestor "${local_head}" "${origin_head}" 2>/dev/null; then echo "behind"; return; fi
+  echo "diverged"
+}
