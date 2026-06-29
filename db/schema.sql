@@ -241,6 +241,13 @@ CREATE TABLE runs (
     -- network summary + real site console errors, same shape as the API's TraceExtractor. NULL = no
     -- trace this run or extraction failed (non-fatal). Written for any traced run (success + failure).
     trace_signals  JSONB,
+    -- Spec-load forensics (mirrors 0047). For browser spec_path runs: which spec the run loaded, from
+    -- where (origin: cache-304 | compiled-200 | fallback-last-good), the resolved version identity
+    -- (resolved_etag — a commit SHA since #138), the spec_cache.fetched_at it saw, and a sha256 of the
+    -- compiled_js it ACTUALLY executed (executed_sha256 — compare to the cache's compiled_js hash to
+    -- prove "is it running the spec I think?"). NULL for http/baked-in-flow runs. Written EARLY (before
+    -- execution) so even a failing/crashing run records it.
+    spec_provenance JSONB,
     -- For kind='ssl' runs: signed days relative to the cert's notAfter (+ = until
     -- expiry, - = past expiry). NULL for non-ssl runs or when no cert was obtained.
     -- (Mirrors db/migrations/0007_cert_days_remaining.sql.) error_message keeps the

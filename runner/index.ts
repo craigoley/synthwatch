@@ -27,7 +27,7 @@ import {
 } from './otel.js';
 import { StepRecorder } from './stepRecorder.js';
 import { loadFlow, type Flow } from './checks/index.js';
-import { getCompiledSpecFromPool } from './specfetch/specCache.js';
+import { getCompiledSpecFromPool, sha256 } from './specfetch/specCache.js';
 import { loadCompiledSpec } from './specfetch/compileSpec.js';
 import { specToFlow } from './specfetch/specShim.js';
 import { syncFlowManifest } from './flowManifest.js';
@@ -705,6 +705,23 @@ async function executeBrowser(
       );
     }
     compiledJs = resolution.compiledJs;
+
+    // ★ SPEC PROVENANCE (0047): record EXACTLY what this run loaded, BEFORE executing it, so even a
+    // failing/crashing run leaves the forensic trail. executed_sha256 is decisive — compare it to the
+    // cache's compiled_js hash to prove whether the run executed the cached spec or something else.
+    // Cheap (reuses the in-hand compiledJs; no extra fetch). Non-fatal: a provenance write never breaks a run.
+    const provenance = {
+      spec_path: check.spec_path,
+      origin: resolution.origin,
+      resolved_etag: resolution.resolvedEtag,
+      cache_fetched_at: resolution.cacheFetchedAt?.toISOString() ?? null,
+      executed_sha256: sha256(compiledJs),
+      executed_len: compiledJs.length,
+      has_preclick: compiledJs.includes('PRE-CLICK'),
+    };
+    await pool
+      .query(`UPDATE runs SET spec_provenance = $2::jsonb WHERE id = $1`, [runId, JSON.stringify(provenance)])
+      .catch((err) => console.warn(`[specprov] run ${runId} provenance write failed (non-fatal):`, err));
   } else if (!check.flow_name) {
     // Neither a Git spec nor a baked-in flow — schema's browser_needs_flow should prevent this.
     return errorOutcomeStandalone('browser check has no spec_path or flow_name');
