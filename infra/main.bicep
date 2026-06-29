@@ -942,7 +942,7 @@ resource reconcileJob 'Microsoft.App/jobs@2024-03-01' = {
       replicaTimeout: 600
       replicaRetryLimit: 1
       scheduleTriggerConfig: {
-        cronExpression: '0 1 * * *'
+        cronExpression: '0 * * * *'
         parallelism: 1
         replicaCompletionCount: 1
       }
