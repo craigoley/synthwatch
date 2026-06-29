@@ -130,32 +130,44 @@ expect_verdict "unknown-path-prompts" "prompt" $'some-new-top-level/thing.bin'
 expect_verdict "mixed-has-code-prompts" "prompt" $'infra/main.bicep\nrunner/db.ts'
 expect_verdict "other-workflow-benign" "benign" $'.github/workflows/eslint.yml'
 expect_verdict "empty-diff-benign" "benign" ''
+# ★ the exact incident: HEAD (#133) added runner code + migration 0045 since the deployed image
+#    (#132) -> "prompt" -> a real deploy HALTS (section C 4b), instead of shipping stale runner code
+#    while applying 0045 (the DB-ahead-of-code half-state).
+expect_verdict "issue133-runner+migration-prompts" "prompt" \
+  $'runner/retry.ts\nrunner/index.ts\ndb/schema.sql\ndb/migrations/0045_fast_retry_on_fail_immediate_alert.sql'
 
 # ===========================================================================
-# C. --yes semantics + the drop never being auto-proceeded (confirm gates).
-#    confirm_head_mismatch / confirm_drop read stdin; we inject answers and toggle ASSUME_YES.
+# C. ★ The newest-image≠HEAD ACTION (deploy_action_for_mismatch) + the drop never being
+#    auto-proceeded. A runner-code mismatch must HALT a real deploy (never silently ship an image
+#    that predates HEAD's runner code → DB-ahead-of-code), NOT prompt-then-proceed.
 # ===========================================================================
 assert_proceed() { local name="$1"; shift; if "$@"; then green "PASS  ${name} (proceed)"; else red "FAIL  ${name} — expected proceed"; FAILS=$((FAILS + 1)); fi; }
 assert_abort()   { local name="$1"; shift; if "$@"; then red "FAIL  ${name} — expected abort"; FAILS=$((FAILS + 1)); else green "PASS  ${name} (abort)"; fi; }
+# expect_action <name> <want> <verdict> <whatif_only>
+expect_action() {
+  local name="$1" want="$2" got; got="$(deploy_action_for_mismatch "$3" "$4")"
+  if [[ "${got}" == "${want}" ]]; then green "PASS  ${name} (${got})"; else
+    red "FAIL  ${name} — want '${want}', got '${got}'"; FAILS=$((FAILS + 1)); fi
+}
 
-WHATIF_ONLY=0
+# (4a) benign (infra/docs-only) -> proceed silently (the SMART skip — UNCHANGED), whatif or not.
+expect_action "benign real -> proceed-infra"   "proceed-infra" "benign"     0
+expect_action "benign whatif -> proceed-infra" "proceed-infra" "benign"     1
+# (4b) ★ THE FIX: a runner-code mismatch on a REAL deploy -> HALT (was: prompt-then-proceed).
+expect_action "runner-code real -> HALT"       "halt"          "prompt"     0
+# (4c) ★ unresolved (can't verify the image includes HEAD's code) on a REAL deploy -> HALT.
+expect_action "unresolved real -> HALT"        "halt"          "unresolved" 0
+# (4d) --what-if-only ships nothing -> PREVIEW the (stale) image instead of halting.
+expect_action "runner-code whatif -> preview"  "preview"       "prompt"     1
+expect_action "unresolved whatif -> preview"   "preview"       "unresolved" 1
 
-# (4a) --yes skips the benign HEAD-mismatch prompt (proceeds without reading stdin).
-ASSUME_YES=1; assert_proceed "head-mismatch --yes proceeds" confirm_head_mismatch </dev/null; ASSUME_YES=0
-# (4b) interactive HEAD-mismatch: 'y' proceeds, anything else aborts (default No).
-assert_proceed "head-mismatch 'y' proceeds" confirm_head_mismatch <<< "y"
-assert_abort   "head-mismatch 'n' aborts"   confirm_head_mismatch <<< "n"
-assert_abort   "head-mismatch '' aborts"    confirm_head_mismatch <<< ""
-
-# (4c) ★ the drop gate is NEVER auto-proceeded — typing 'yes' is the ONLY way through,
-#      even with --yes set. This is the core safety guarantee.
-assert_proceed "drop 'yes' proceeds"               confirm_drop <<< "yes"
-assert_abort   "drop 'no' aborts"                  confirm_drop <<< "no"
-ASSUME_YES=1
-assert_abort   "drop ignores --yes ('no' aborts)"  confirm_drop <<< "no"
-assert_abort   "drop ignores --yes ('' aborts)"    confirm_drop <<< ""
-assert_proceed "drop still needs 'yes' under --yes" confirm_drop <<< "yes"
-ASSUME_YES=0
+# (4e) ★ the drop gate ALWAYS requires a typed 'yes' — it is never auto-proceeded (confirm_drop
+#      deliberately ignores --yes, which is now a no-op everywhere). The head-mismatch is a hard
+#      HALT now, so its old interactive/--yes tests are gone.
+assert_proceed "drop 'yes' proceeds"          confirm_drop <<< "yes"
+assert_abort   "drop 'no' aborts"             confirm_drop <<< "no"
+assert_abort   "drop '' aborts"               confirm_drop <<< ""
+assert_proceed "drop needs exactly 'yes'"     confirm_drop <<< "yes"
 
 # ===========================================================================
 # D. BUG 1 — runner/migrate pinned to ONE SHA present in BOTH repos (newest_common_sha).

@@ -47,18 +47,25 @@ classify_paths() {
 }
 
 # ---------------------------------------------------------------------------
-# confirm_head_mismatch — the AMBIGUOUS newest-image≠HEAD gate. Returns 0 to proceed, 1 to
-# abort. Honors the non-interactive flags: WHATIF_ONLY (no deploy happens anyway) and
-# ASSUME_YES (--yes: the user pre-decided). Otherwise asks [y/N] (default No).
-# Reads from stdin so it's unit-testable.
-confirm_head_mismatch() {
-  if [[ "${WHATIF_ONLY:-0}" -eq 1 || "${ASSUME_YES:-0}" -eq 1 ]]; then
-    return 0
-  fi
-  local ans
-  printf '      Deploy the existing image anyway? [y/N] ' >&2
-  read -r ans
-  [[ "${ans}" == "y" || "${ans}" == "Y" ]]
+# deploy_action_for_mismatch — DECIDE what to do when the newest DEPLOYABLE image (the newest SHA
+# present in BOTH the runner+migrate repos) is NOT main HEAD. Pure + unit-testable.
+#   $1 verdict (from mismatch_verdict): benign | prompt | unresolved
+#   $2 whatif_only (0/1)
+# Echoes one of:
+#   proceed-infra — benign: HEAD changed only infra/docs/scripts since the image, so CI built no
+#                   new image; deploy it silently (the SMART infra-only skip — UNCHANGED behavior).
+#   preview       — non-benign but --what-if-only: a dry-run ships nothing, so preview the diff
+#                   against the (stale) image for information (with a loud caveat at the call site).
+#   halt          — non-benign + a REAL deploy: REFUSE. The image PREDATES HEAD's runner code, so
+#                   deploying it would apply HEAD's DB migrations WITHOUT the matching runner code
+#                   (the DB-ahead-of-code half-state). NOT a prompt — like a what-if DROP this hazard
+#                   is never auto-proceeded and --yes does NOT bypass it; the escape hatch is --sha.
+deploy_action_for_mismatch() {
+  local verdict="$1" whatif_only="${2:-0}"
+  case "${verdict}" in
+    benign) echo "proceed-infra" ;;
+    *)      [[ "${whatif_only}" -eq 1 ]] && echo "preview" || echo "halt" ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------

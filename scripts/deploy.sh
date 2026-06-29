@@ -13,14 +13,18 @@
 # This is a LOCAL helper Craig runs — not CD/automation. Scope: this script only.
 #
 # The newest-image≠HEAD check is SMART: if HEAD's commits since the newest image touch only
-# infra/docs/scripts (no runner build expected), it PROCEEDS silently; it only prompts when
-# HEAD touches runner code (CI may still be building) or an unclassifiable path (conservative).
+# infra/docs/scripts (no runner build expected), it PROCEEDS silently; but if HEAD touches RUNNER
+# CODE (or db/, or an unclassifiable path) since the newest DEPLOYABLE image — meaning CI is still
+# building HEAD's image or its build failed — it HALTS. It never silently ships an image that
+# predates HEAD's runner code, because that applies HEAD's DB migrations WITHOUT the matching code
+# (the DB-ahead-of-code half-state). The escape hatch is --sha (deploy a specific fully-built pair).
 #
 # Usage:
 #   scripts/deploy.sh                 # pick SHA, what-if (auto-proceed if clean / prompt on drop), deploy, verify
-#   scripts/deploy.sh --what-if-only  # steps 1-4 only: show the classified diff, then stop
-#   scripts/deploy.sh --yes | -y      # non-interactive: skip the benign HEAD-mismatch prompt.
-#                                     #   ★ Does NOT skip a what-if DROP halt — a drop always stops.
+#   scripts/deploy.sh --what-if-only  # steps 1-4 only: show the classified diff, then stop (PREVIEWS even a stale image)
+#   scripts/deploy.sh --yes | -y      # accepted for back-compat, now a NO-OP. It can NOT bypass a
+#                                     #   what-if DROP halt NOR a stale-runner-image halt (HEAD's runner
+#                                     #   code has no built image). For the latter, use --sha.
 #   scripts/deploy.sh --sha <sha>     # override the image SHA (skip the HEAD/registry check)
 #   scripts/deploy.sh --post-reconcile # after deploy+verify: trigger the reconcile job, WAIT,
 #                                     #   then print spec_catalog + reconcile_drift (no manual sleep).
@@ -63,7 +67,6 @@ readonly ROOT
 readonly TEMPLATE="${ROOT}/infra/main.bicep"
 
 WHATIF_ONLY=0
-ASSUME_YES=0
 POST_RECONCILE=0
 SHA_OVERRIDE=''
 
@@ -100,7 +103,10 @@ usage() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --what-if-only) WHATIF_ONLY=1; shift ;;
-    --yes|-y) ASSUME_YES=1; shift ;;
+    # Accepted for back-compat; NO-OP. The newest-image≠HEAD case is now a hard HALT (never silently
+    # ship runner code that predates HEAD), a what-if DROP still needs a typed 'yes', and a stale
+    # image is overridden only with --sha — so there is nothing left for --yes to auto-proceed.
+    --yes|-y) shift ;;
     --post-reconcile) POST_RECONCILE=1; shift ;;
     --sha) [[ $# -ge 2 ]] || fail "--sha needs a value"; SHA_OVERRIDE="$2"; shift 2 ;;
     --help|-h) usage ;;
@@ -126,9 +132,10 @@ az account show >/dev/null 2>&1 || fail "az not logged in (run: az login)"
 # 2. Pick the image SHA.
 #    The newest SHA-tagged runner image from the registry, time-desc. NOTE: --top 1 returns
 #    the floating `latest` tag, so we filter to 40-hex commit tags and take the newest.
-#    Then reconcile with main HEAD — but SMARTLY (see mismatch_verdict): an infra/docs-only
-#    HEAD legitimately has no new image and PROCEEDS silently; only a runner-code mismatch
-#    (or one we can't classify) prompts. runner+migrate share the SHA.
+#    Then reconcile with main HEAD — but SMARTLY (see mismatch_verdict + deploy_action_for_mismatch):
+#    an infra/docs-only HEAD legitimately has no new image and PROCEEDS silently; a runner-code
+#    mismatch (or one we can't classify) HALTS a real deploy — never ship an image that predates
+#    HEAD's runner code (DB-ahead-of-code). runner+migrate share the SHA.
 # ---------------------------------------------------------------------------
 
 # mismatch_verdict <image_sha> <head_sha> -> "benign" | "prompt" | "unresolved".
@@ -193,7 +200,7 @@ pick_sha() {
       c_green "INFO: HEAD (${head:0:12}) is infra/docs-only since the newest image (${newest:0:12});" >&2
       c_green "      deploying ${newest:0:12} — this is normal for an infra/config deploy." >&2
     else
-      # AMBIGUOUS (runner code changed / unclassifiable) or UNRESOLVED — a human should decide.
+      # AMBIGUOUS (runner code changed / unclassifiable) or UNRESOLVED — REFUSE a real deploy.
       if [[ "${verdict}" == "unresolved" ]]; then
         c_yellow "WARN: newest image ${newest:0:12} is NOT main HEAD ${head:0:12}, and I can't classify" >&2
         c_yellow "      why (image SHA not an ancestor of HEAD? diverged / shallow clone)." >&2
@@ -201,13 +208,22 @@ pick_sha() {
         c_yellow "WARN: newest image ${newest:0:12} is NOT main HEAD ${head:0:12}, and HEAD touches runner" >&2
         c_yellow "      code since that image — CI may still be building, or a build failed." >&2
       fi
-      if [[ "${WHATIF_ONLY}" -eq 1 ]]; then
-        c_yellow "      (--what-if-only: proceeding against the existing image ${newest:0:12}.)" >&2
-      elif [[ "${ASSUME_YES}" -eq 1 ]]; then
-        c_yellow "      (--yes: proceeding against the existing image ${newest:0:12}.)" >&2
-      else
-        confirm_head_mismatch || fail "aborted — no image for HEAD yet."
-      fi
+      case "$(deploy_action_for_mismatch "${verdict}" "${WHATIF_ONLY}")" in
+        preview)
+          c_yellow "      (--what-if-only: PREVIEWING against ${newest:0:12} — NOT what a real deploy would ship.)" >&2
+          ;;
+        halt)
+          # ★ REFUSE — never silently ship a runner image that predates HEAD's runner code. Deploying
+          # ${newest} would apply HEAD's DB migrations WITHOUT the matching runner code (the
+          # DB-ahead-of-code half-state that paged ft=1 monitors with no retry absorption). This is a
+          # HALT, not a prompt: --yes does NOT bypass it (like a what-if drop). Escape hatch: --sha.
+          if [[ "${runner_newest}" == "${head}" ]]; then
+            fail "refusing to deploy STALE runner code: HEAD's runner image ${head:0:12} IS built, but its ${MIGRATE_REPO} pair isn't pushed yet (CI mid-build), so the newest COMPLETE pair is the OLDER ${newest:0:12} — deploying it would apply HEAD's migrations without the matching runner code. Wait for CI to finish building ${head:0:12} (runner AND migrate), then re-run; or --sha <sha> to deploy a specific fully-built pair."
+          else
+            fail "refusing to deploy STALE runner code: the newest deployable image ${newest:0:12} PREDATES HEAD's runner code ${head:0:12} (CI may still be building ${head:0:12}, or its build failed) — deploying it would apply HEAD's DB migrations without the matching runner code (DB-ahead-of-code). Wait for CI, or --sha <sha> to deploy a specific fully-built pair."
+          fi
+          ;;
+      esac
     fi
   fi
 
