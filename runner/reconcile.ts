@@ -17,7 +17,7 @@
 // dashboard own DISJOINT fields; the reconcile keeps a strict column allow-list to honor it.
 //
 // IDENTITY: manifest `id` -> checks.source_key (NOT flow_name — they deliberately differ).
-import { assertValidSpecPath } from './specfetch/fetchSpec.js';
+import { assertValidSpecPath, fetchContentsAtMain } from './specfetch/fetchSpec.js';
 
 /** A monitor entry from synthwatch-monitors' manifest.json (kind is browser-only today). */
 export interface Monitor {
@@ -59,14 +59,15 @@ export interface DriftRow {
   detail: Record<string, unknown>;
 }
 
-// The default raw-manifest URL. Overridable (tests / a fork) via env. Raw HTTPS read of
-// `main` — no git clone, which config-only reconcile doesn't need (it reads manifest.json,
-// not the .spec.ts files).
-export const DEFAULT_MANIFEST_URL =
-  'https://raw.githubusercontent.com/craigoley/synthwatch-monitors/main/manifest.json';
+// The manifest is read STRONGLY-CONSISTENTLY via the GitHub contents API at main's HEAD SHA (mirrors
+// #138 — resolve /commits/main, fetch /contents/manifest.json?ref=<sha>). This kills the raw-CDN
+// propagation window/flapping the hourly drift check used to suffer. An explicit
+// SYNTHWATCH_MONITORS_MANIFEST_URL (a full URL — tests / a fork) is direct-fetched instead.
+const MANIFEST_PATH = 'manifest.json';
 
-export function manifestUrl(): string {
-  return process.env.SYNTHWATCH_MONITORS_MANIFEST_URL || DEFAULT_MANIFEST_URL;
+/** The override URL if one is set (tests / a fork), else null = use the contents API at main@HEAD. */
+export function manifestUrl(): string | null {
+  return process.env.SYNTHWATCH_MONITORS_MANIFEST_URL || null;
 }
 
 // Default cadence for a monitor that omits suggestedIntervalSeconds — matches the
@@ -202,13 +203,28 @@ export function validateManifest(raw: unknown): Manifest {
   return { schemaVersion: 1, description: m.description as string | undefined, monitors };
 }
 
-/** Fetch + validate the manifest over HTTPS. Throws on network / non-200 / invalid. */
-export async function fetchManifest(url = manifestUrl()): Promise<Manifest> {
-  const res = await fetch(url, { headers: { accept: 'application/json' } });
-  if (!res.ok) {
-    throw new Error(`manifest fetch failed: ${res.status} ${res.statusText} (${url})`);
+/** Fetch + validate the manifest. Default: strongly-consistent via the GitHub contents API at main's
+ *  HEAD SHA (no raw-CDN lag). An explicit override URL (env) is direct-fetched. Throws on net/non-200/
+ *  invalid-JSON/schema. */
+export async function fetchManifest(): Promise<Manifest> {
+  const override = manifestUrl();
+  let raw: unknown;
+  if (override) {
+    const res = await fetch(override, { headers: { accept: 'application/json' } });
+    if (!res.ok) {
+      throw new Error(`manifest fetch failed: ${res.status} ${res.statusText} (${override})`);
+    }
+    raw = await res.json();
+  } else {
+    const { source, sha } = await fetchContentsAtMain(MANIFEST_PATH, 'application/vnd.github.raw');
+    try {
+      raw = JSON.parse(source);
+    } catch (err) {
+      throw new Error(`manifest at ${sha} is not valid JSON: ${err instanceof Error ? err.message : String(err)}`, {
+        cause: err,
+      });
+    }
   }
-  const raw: unknown = await res.json();
   return validateManifest(raw);
 }
 
