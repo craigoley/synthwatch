@@ -106,7 +106,14 @@ export function expect(target: Locator | Page): SpecExpect {
 }
 
 // ---------------------------------------------------------------------------
-// Vendored verbatim from synthwatch-monitors/lib/flow.ts (pure; page + expect only).
+// Vendored from synthwatch-monitors/lib/flow.ts (pure; page + expect only).
+//
+// ★★ KEEP IN SYNC with monitors/lib/flow.ts. THIS is the copy the RUNNER EXECUTES: the spec's
+// `lib/flow` import is esbuild-aliased to this shim + marked external (compileSpec.ts), so
+// monitors/lib/flow.ts is a LOCAL-DEV/authoring shim ONLY — never run by the runner. A fix made
+// there is DEAD at runtime until mirrored HERE (that's exactly why #10's flow-modal exclusion never
+// took effect until this port). The two copies can drift SILENTLY — a CI parity-check / shared-source
+// refactor is a flagged follow-up, NOT this PR.
 // ---------------------------------------------------------------------------
 export async function assertLoaded(
   page: Page,
@@ -121,20 +128,64 @@ export async function assertLoaded(
   }
 }
 
+// ★ Flow-modal exclusion (ported from #10's monitors/lib/flow.ts — mirror, NOT a redesign). A
+// spec-driven modal (e.g. meals2go's fulfillment-type-change store modal) must NOT be auto-closed by
+// the generic dismisser — its close button matches /^close$/. Exclude by BOTH the modal CONTAINER
+// selector AND the close-button CLASS: the class check makes this robust to the mount-timing race —
+// the dismisser fires between steps and may run BEFORE the app-fulfillment-type-change wrapper has
+// mounted (so closest() finds no ancestor), but the close button itself always carries the excluded
+// class. Both guards live in isInsideFlowModal, so either path catches it.
+const FLOW_MODAL_EXCLUDE_SELECTOR =
+  'app-fulfillment-type-change, app-modal-form, [role="dialog"].weg-modal-outer';
+const FLOW_MODAL_EXCLUDE_CLASSES = ['store-modal-close-button'];
+
+/** True if `el` belongs to a flow-driven modal the spec controls itself. */
+async function isInsideFlowModal(el: Locator): Promise<boolean> {
+  try {
+    return await el.evaluate(
+      (node, { sel, classes }) => {
+        const e = node as Element;
+        if (e.closest(sel)) return true;
+        return classes.some((c) => e.classList.contains(c));
+      },
+      { sel: FLOW_MODAL_EXCLUDE_SELECTOR, classes: FLOW_MODAL_EXCLUDE_CLASSES },
+    );
+  } catch {
+    // If we can't introspect (detached, etc.), be conservative and do NOT skip: a missed flow
+    // modal is rare; not dismissing a real nuisance popup is worse.
+    return false;
+  }
+}
+
 export async function dismissInterstitials(page: Page): Promise<void> {
+  // Cookie/newsletter/consent matchers UNCHANGED — the exclusion is scoped, not a gutting.
   const candidates: Array<{ role: 'button'; name: RegExp }> = [
     { role: 'button', name: /accept( all)?( cookies)?/i },
     { role: 'button', name: /^(close|no thanks|not now|dismiss)$/i },
     { role: 'button', name: /continue/i },
   ];
   for (const c of candidates) {
-    const el = page.getByRole(c.role, { name: c.name }).first();
+    const matches = page.getByRole(c.role, { name: c.name });
+    // Declared without an initializer (the runner's eslint flags the dead `= 0`); the catch's
+    // `continue` means count is always assigned by the time the loop below reads it.
+    let count: number;
     try {
-      if (await el.isVisible({ timeout: 1000 })) {
-        await el.click({ timeout: 2000 });
-      }
+      count = await matches.count();
     } catch {
-      // best-effort; ignore
+      continue;
+    }
+    // Iterate REAL matches (not just .first()) so a flow-modal close button can't shadow a genuine
+    // cookie/newsletter button of the same accessible name.
+    for (let i = 0; i < count; i++) {
+      const el = matches.nth(i);
+      try {
+        if (!(await el.isVisible({ timeout: 1000 }))) continue;
+        if (await isInsideFlowModal(el)) continue; // never close a modal the active flow is driving
+        await el.click({ timeout: 2000 });
+        break; // one genuine dismissal per candidate is enough
+      } catch {
+        // best-effort; ignore
+      }
     }
   }
 }
