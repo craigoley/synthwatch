@@ -112,8 +112,13 @@ export function expect(target: Locator | Page): SpecExpect {
 // `lib/flow` import is esbuild-aliased to this shim + marked external (compileSpec.ts), so
 // monitors/lib/flow.ts is a LOCAL-DEV/authoring shim ONLY — never run by the runner. A fix made
 // there is DEAD at runtime until mirrored HERE (that's exactly why #10's flow-modal exclusion never
-// took effect until this port). The two copies can drift SILENTLY — a CI parity-check / shared-source
-// refactor is a flagged follow-up, NOT this PR.
+// took effect until this port).
+//
+// ★ ENFORCED by CI: the "Lib-flow parity" check (scripts/check-libflow-parity.mjs, wired into ci-gate)
+// hashes lib/flow.ts's SHARED block and compares it to LIBFLOW-VENDOR-SHA below. When lib/flow.ts's
+// shared helpers change, that check FAILS until you mirror the change into the functions below AND
+// update this sha to the value the check prints. (Single-source refactor — option b — is a follow-up.)
+// LIBFLOW-VENDOR-SHA: c28d4f84d56d329ae91e5ee0f204251855b55bc23ff6a9ac1400a59b4463a539
 // ---------------------------------------------------------------------------
 export async function assertLoaded(
   page: Page,
