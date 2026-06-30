@@ -426,31 +426,85 @@ export function buildApplyUpsert(monitor: Monitor): {
 
 /** One scoped correction: set checks.sensitive + checks.redact_patterns for a diverging managed check.
  *  redact_patterns is JSONB text (the SAME encoding buildApplyUpsert uses: JSON.stringify, 'null' = none). */
+// ★ B10 WRITE-PATH STRIP GUARD. A "redaction strip" = the LIVE check is sensitive but the manifest wants
+// it NOT sensitive (sensitive true→false). Auto-stripping silently removes the redaction safety control
+// from a monitor that was protecting something — so b10FieldUpdates REFUSES a strip UNLESS the source_key
+// is explicitly listed here. This is the same fail-safe the plan path (computeApplyPlan) advertises, but
+// moved onto the ACTUAL write path (#144 b10FieldUpdates → reconcileMain) where it was previously absent.
+//
+// Seam choice (in-repo runner allowlist, NOT a manifest field / env flag): it's (a) in-repo + reviewable
+// in a PR diff, (b) per-monitor not global, (c) auditable via git blame on this constant — and keeps the
+// security gate in the RUNNER (where the guard lives), independent of the manifest authors. The tradeoff
+// vs an `allow_redaction_strip` manifest field: that would co-locate the allowance with `sensitive` but
+// splits the change cross-repo (the allowance would ride in the synthwatch-monitors PR) and needs a new
+// manifest field + schema. We keep the allowance HERE so this one PR carries it and the monitors pullback
+// applies cleanly. To intentionally un-sensitive a monitor: add its source_key here in a reviewed PR.
+export const REDACTION_STRIP_ALLOWANCE: ReadonlySet<string> = new Set<string>([
+  // The meals2go monitors were marked sensitive on the rejected "guest Bearer ⇒ sensitive" premise —
+  // anonymous, accountless, public flows carrying no real secret (see ANALYSIS-redaction-policy-2026-06-30.md).
+  // Their manifest pullback (sensitive true→false) is intentional + pre-approved.
+  'meals2go-cheese-pizza-cart',
+  'meals2go-browse-menu',
+]);
+
+/**
+ * A B10 redaction STRIP: the live check IS sensitive but the manifest wants it non-sensitive (true→false).
+ * A false→true (un-sensitive→sensitive) or a pattern-only edit is NOT a strip. One definition, shared by
+ * the write path (b10FieldUpdates) and the plan path (computeApplyPlan), so the two guards can never disagree.
+ */
+export function isRedactionStrip(wantSensitive: boolean, liveSensitive: boolean): boolean {
+  return liveSensitive === true && wantSensitive === false;
+}
+
 export interface B10Update {
   source_key: string;
   sensitive: boolean;
   redact_patterns: string;
+  /** true = an allowance-approved STRIP (live sensitive=true → manifest sensitive=false). Logged specially. */
+  intentionalStrip: boolean;
+}
+
+/** Result of b10FieldUpdates: the updates to APPLY, plus the strips REFUSED because the source_key is not
+ *  in REDACTION_STRIP_ALLOWANCE. The caller logs `blockedStrips` (meta-lesson B: surface, don't swallow) —
+ *  the refused checks are LEFT sensitive=true. */
+export interface B10FieldUpdateResult {
+  updates: B10Update[];
+  blockedStrips: string[];
 }
 
 /**
  * Which EXISTING managed checks need their sensitive/redact_patterns corrected to match the manifest.
  * Only diverging checks are returned (a matching check is left untouched). NEW checks (no live row) are
  * NOT created here — apply is off; this only fixes the safety field on checks that already exist.
+ * ★ A redaction STRIP (sensitive true→false) is REFUSED unless allow-listed (REDACTION_STRIP_ALLOWANCE):
+ *   refused strips are returned in `blockedStrips` and NOT applied; a non-strip change (false→true, or a
+ *   pattern edit while staying sensitive) always applies.
  */
-export function b10FieldUpdates(monitors: Monitor[], managed: ManagedCheck[]): B10Update[] {
+export function b10FieldUpdates(monitors: Monitor[], managed: ManagedCheck[]): B10FieldUpdateResult {
   const byKey = new Map(managed.map((c) => [c.source_key, c]));
   const updates: B10Update[] = [];
+  const blockedStrips: string[] = [];
   for (const m of monitors) {
     const existing = byKey.get(m.id);
     if (!existing) continue;
     const wantSensitive = m.sensitive ?? false;
     const wantPatternsJson = JSON.stringify(m.redact_patterns ?? null);
     const livePatternsJson = JSON.stringify(existing.redact_patterns ?? null);
-    if (existing.sensitive !== wantSensitive || livePatternsJson !== wantPatternsJson) {
-      updates.push({ source_key: m.id, sensitive: wantSensitive, redact_patterns: wantPatternsJson });
+    if (existing.sensitive === wantSensitive && livePatternsJson === wantPatternsJson) continue; // already in sync
+    const strip = isRedactionStrip(wantSensitive, existing.sensitive);
+    if (strip && !REDACTION_STRIP_ALLOWANCE.has(m.id)) {
+      // ★ refuse to auto-strip redaction. Leave the check sensitive=true; the caller surfaces it.
+      blockedStrips.push(m.id);
+      continue;
     }
+    updates.push({
+      source_key: m.id,
+      sensitive: wantSensitive,
+      redact_patterns: wantPatternsJson,
+      intentionalStrip: strip,
+    });
   }
-  return updates;
+  return { updates, blockedStrips };
 }
 
 // ---------------------------------------------------------------------------
@@ -569,8 +623,12 @@ export function computeApplyPlan(
       });
     } else if (d.drift_type === 'redaction_mismatch') {
       const f = (d.detail.fields as Record<string, { git?: unknown; live?: unknown }>) ?? {};
-      const isStrip = f.sensitive?.git === false && f.sensitive?.live === true;
-      if (isStrip) {
+      // Same strip definition the write path (b10FieldUpdates) uses. ★ An ALLOWANCE-approved strip is NOT
+      // blocked — it's an intentional pullback the write path applies, so it falls through to 'auto'.
+      const isBlockedStrip =
+        isRedactionStrip(f.sensitive?.git === true, f.sensitive?.live === true) &&
+        !REDACTION_STRIP_ALLOWANCE.has(d.source_key);
+      if (isBlockedStrip) {
         rows.push({
           source_key: d.source_key,
           drift_type: 'redaction_mismatch',
