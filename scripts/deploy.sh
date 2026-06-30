@@ -190,12 +190,21 @@ target_ci_conclusion() {
 # ★ Guard intact: returns 0 ONLY when the TARGET's own images exist — never a predating image — so
 # DB-ahead-of-code stays impossible; a CI failure/timeout still refuses.
 wait_for_target_image() {
-  local target="$1" tries=0 max="${CI_WAIT_TRIES:-40}" nap="${CI_WAIT_SLEEP:-30}" built concl verdict
+  local target="$1" tries=0 max="${CI_WAIT_TRIES:-40}" nap="${CI_WAIT_SLEEP:-30}" built concl verdict rtags mtags
   c_yellow "Waiting up to $(( max * nap / 60 ))m for CI to build ${target:0:12} (runner+migrate); --no-wait to skip…" >&2
   while (( tries < max )); do
     built=0
-    if printf '%s\n' "$(repo_sha_tags "${RUNNER_REPO}")"  | grep -qxF "${target}" \
-    && printf '%s\n' "$(repo_sha_tags "${MIGRATE_REPO}")" | grep -qxF "${target}"; then built=1; fi
+    # ★ Membership test via captured vars + here-strings — NOT `printf "$(…)" | grep -qxF`. With the pipe,
+    # `grep -q` short-circuits on the match and closes the read end while `printf` is still writing the
+    # (long) tag list → printf takes SIGPIPE/EPIPE: the "printf: write error: Broken pipe" noise (twice,
+    # one per repo). ★ And under `set -o pipefail` (line 41) it's worse than cosmetic — the matched
+    # pipeline's status becomes printf's 141, not grep's 0, so the `if` reads FALSE and `built` stays 0
+    # on that poll EVEN THOUGH the image exists (a missed detection; retries usually recover it, as the
+    # #155 deploy did). A here-string has no dangling writer to break. Logic is identical: built=1 iff the
+    # target's SHA is an exact line in BOTH the runner and migrate tag lists — now read deterministically.
+    rtags="$(repo_sha_tags "${RUNNER_REPO}")"
+    mtags="$(repo_sha_tags "${MIGRATE_REPO}")"
+    if grep -qxF "${target}" <<<"${rtags}" && grep -qxF "${target}" <<<"${mtags}"; then built=1; fi
     concl="$(target_ci_conclusion "${target}")"
     verdict="$(ci_wait_verdict "${built}" "${concl}")"
     case "${verdict}" in
