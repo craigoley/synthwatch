@@ -52,6 +52,12 @@ import {
 } from './metrics.js';
 import { isExpectationError } from './errors.js';
 import { runWithRetry, effectiveRetries } from './retry.js';
+import {
+  INVOCATION_ID,
+  installGlobalErrorHandlers,
+  recordFatal,
+  setErrorContext,
+} from './runnerErrors.js';
 
 // A run's terminal outcome. `status` is the real taxonomy, not a boolean:
 //   pass / fail / error come from execution; `warn` is derived later in runOne
@@ -114,6 +120,8 @@ async function getBrowser(): Promise<Browser> {
 }
 
 async function main(): Promise<void> {
+  // Stamp the per-invocation correlation id on stdout so an ACA log line + a runner_errors row reconcile.
+  console.log(`[runner] invocation ${INVOCATION_ID} (location=${LOCATION})`);
   // Opt-in OTLP trace export (no-op unless OTEL_EXPORTER_OTLP_ENDPOINT is set).
   initOtel();
 
@@ -325,6 +333,8 @@ async function runOne(check: Check): Promise<void> {
     [check.id, LOCATION],
   );
   const runId = rows[0].id;
+  // Best-effort context for the global handler: a fatal during this run is attributed to (check, run).
+  setErrorContext(check.id, runId);
 
   const errorOutcome = (msg: string): Outcome => ({
     status: 'error',
@@ -871,10 +881,17 @@ async function executeBrowser(
   };
 }
 
+// ★ Global exception visibility (meta-lesson A): catch-all uncaught/unhandled-rejection handlers that
+// PERSIST the real exception + correlation id to the queryable runner_errors table before exiting — they
+// preserve Node's crash-on-uncaught semantics exactly (exit 1), they only make the failure visible.
+installGlobalErrorHandlers();
+
 main()
   .then(() => 0)
-  .catch((err) => {
-    console.error('[runner] fatal:', err);
+  .catch(async (err) => {
+    // Was: console.error → ACA stdout only (uncapturable, #139). Now ALSO persisted (queryable) with the
+    // invocation correlation id. Same fatal outcome (exit 1) — visibility added, control flow unchanged.
+    await recordFatal('main', err);
     return 1;
   })
   .then(async (code) => {
