@@ -216,6 +216,36 @@ expect_mismatch "absent job -> flagged" "synthwatch-reconcile-job" \
   $'synthwatch-reconcile-job\t'
 
 # ===========================================================================
+# E2. CRY-WOLF fix (#147) — VERIFY image compare is SHA-prefix-aware: a short EXPECTED tag vs the
+#     job's FULL tag of the SAME commit is NOT a false FAIL, but a genuinely different sha STILL fails.
+# ===========================================================================
+FULL_SHA='9e97f142df3929562b11370d3e6f9089429c2055'  # the actual #147 job tag
+SHORT_SHA='9e97f142df39'                              # its 12-char prefix (what the expected carried)
+OTHER_SHA='024035d01688c21394f6cebd776097ded66cf942'
+
+eq_case() { # name, want('' = same image / job = flagged), expected-runner-img, job-line
+  local name="$1" want="$2" exp="$3" line="$4" got
+  got="$(printf '%s' "${line}" | image_mismatches "${exp}" "reg.io/synthwatch-migrate:${exp##*:}")"
+  if [[ "${got}" == "${want}" ]]; then green "PASS  ${name} (${got:-same-image})"; else
+    red "FAIL  ${name} — want '${want}', got '${got}'"; FAILS=$((FAILS + 1)); fi
+}
+# ★ the #147 false-FAIL: expected the SHORT prefix, job is on the FULL tag -> SAME image -> no mismatch.
+eq_case "short-expected vs full job tag -> same image (no cry-wolf)" "" \
+  "reg.io/synthwatch-runner:${SHORT_SHA}" $'synthwatch-runner-job\treg.io/synthwatch-runner:'"${FULL_SHA}"
+# reverse direction: expected FULL, job on the short prefix -> still the same image.
+eq_case "full-expected vs short job tag -> same image" "" \
+  "reg.io/synthwatch-runner:${FULL_SHA}" $'synthwatch-runner-job\treg.io/synthwatch-runner:'"${SHORT_SHA}"
+# ★ STILL catches a REAL mismatch: a genuinely DIFFERENT sha is flagged (prefix logic isn't permissive).
+eq_case "genuinely different sha STILL flagged" "synthwatch-runner-job" \
+  "reg.io/synthwatch-runner:${SHORT_SHA}" $'synthwatch-runner-job\treg.io/synthwatch-runner:'"${OTHER_SHA}"
+# a different host/repo at the same sha is a real mismatch (host/repo must match exactly).
+eq_case "different registry/repo STILL flagged" "synthwatch-runner-job" \
+  "reg.io/synthwatch-runner:${SHORT_SHA}" $'synthwatch-runner-job\tOTHER.io/synthwatch-runner:'"${FULL_SHA}"
+# a too-short / non-hex prefix is NOT a confident match -> flagged (don't trivially pass garbage tags).
+eq_case "non-hex tag mismatch STILL flagged" "synthwatch-runner-job" \
+  "reg.io/synthwatch-runner:${SHORT_SHA}" $'synthwatch-runner-job\treg.io/synthwatch-runner:latest'
+
+# ===========================================================================
 # F. BUG 3 — migration detection over the deploy's git-diff range (migrations_in_diff).
 # ===========================================================================
 expect_migs() {

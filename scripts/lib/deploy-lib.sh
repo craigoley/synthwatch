@@ -117,13 +117,32 @@ migrations_in_diff() {
 }
 
 # ---------------------------------------------------------------------------
+# image_eq — are two image refs the SAME image? Exact match, OR (for SHA tags) one tag is a SHA-prefix
+# of the other. The deploy's expected image is `repo:${SHA}`, but a job's ACTUAL tag may be the FULL
+# 40-char SHA while the expected is a SHORT 12-char prefix (or vice-versa) — the SAME image. An exact
+# `==` FALSE-FAILs that (the #147 cry-wolf: expected 9e97f142df39, actual 9e97f142df39…2055). The
+# host/repo MUST still match exactly, and the shorter tag must be a >=7-char HEX prefix (git short-sha
+# minimum) of the longer — so a genuinely DIFFERENT sha, a different repo, or a non-sha tag is NEVER a
+# false match (it still FAILs, catching a real stale/wrong image).
+image_eq() {
+  local a="$1" b="$2"
+  [[ "${a}" == "${b}" ]] && return 0                 # exact (the common full==full case)
+  local arepo="${a%:*}" atag="${a##*:}" brepo="${b%:*}" btag="${b##*:}"
+  [[ "${arepo}" == "${brepo}" ]] || return 1         # different host/repo → real mismatch
+  local short long
+  if (( ${#atag} <= ${#btag} )); then short="${atag}"; long="${btag}"; else short="${btag}"; long="${atag}"; fi
+  # same image only if the shorter tag is a >=7-char hex SHA-prefix of the longer one.
+  [[ "${short}" =~ ^[0-9a-f]{7,}$ && "${long}" == "${short}"* ]]
+}
+
 # image_mismatches — BUG 2 verify. A correct deploy puts EVERY job on the intended image:
 # the migrate job on the migrate image, every other job on the runner image. Reads a
 # "<job>\t<actual-image>" line per job on stdin; given the expected runner image as $1 and
 # migrate image as $2, echoes the name of each job whose actual image != expected (and of any
 # job whose actual image is empty — an absent/unreadable job is a failure). Empty output =>
-# all jobs are on the intended image. This is what would have caught today's split (the
-# migrate job stuck on the old SHA while the runner job rolled).
+# all jobs are on the intended image. This is what would have caught today's split (the migrate
+# job stuck on the old SHA while the runner job rolled). The compare is SHA-prefix-aware (image_eq)
+# so a short-expected-vs-full-actual tag of the SAME commit is not a false FAIL (the #147 cry-wolf).
 image_mismatches() {
   local runner_img="$1" migrate_img="$2" job actual exp
   while IFS=$'\t' read -r job actual || [[ -n "${job}" ]]; do
@@ -132,7 +151,7 @@ image_mismatches() {
       *migrate*) exp="${migrate_img}" ;;
       *)         exp="${runner_img}" ;;
     esac
-    [[ "${actual}" == "${exp}" ]] || echo "${job}"
+    image_eq "${actual}" "${exp}" || echo "${job}"
   done
 }
 
