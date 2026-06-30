@@ -13,7 +13,7 @@
 // 'error'; all steps pass => 'pass'.
 import type { Check, ChainStep } from './db.js';
 import { pool } from './db.js';
-import { sensitiveErrorMessage } from './redact.js';
+import { makeRedactor, IDENTITY_REDACTOR } from './redact.js';
 import { buildAuthHeader } from './httpCheck.js';
 import {
   evaluateAssertions,
@@ -126,6 +126,9 @@ const MAX_CHAIN_MS = 180_000;
 export async function runMultistepChain(check: Check, runId: number): Promise<MultistepResult> {
   const chainStart = Date.now();
   const chainDeadline = chainStart + MAX_CHAIN_MS;
+  // B10: a sensitive monitor's per-step message is SCRUBBED (values gone, diagnostic kept), not blanket-
+  // replaced. Non-sensitive → identity (unchanged).
+  const redact = check.sensitive ? makeRedactor(check.redact_patterns) : IDENTITY_REDACTOR;
   const steps = check.steps ?? [];
   if (steps.length === 0) {
     return { verdict: 'error', durationMs: 0, failedStep: null, error: 'multistep check has no steps' };
@@ -148,9 +151,9 @@ export async function runMultistepChain(check: Check, runId: number): Promise<Mu
       status: 'fail' | 'error',
       message: string,
     ): Promise<MultistepResult> => {
-      // B10: a sensitive monitor persists a GENERIC per-step message (a chain error can echo a
-      // response body / a session-token URL). The run-level `error` is re-genericised in runOne too.
-      const persisted = check.sensitive ? sensitiveErrorMessage(status, null) : message;
+      // B10: SCRUB sensitive values from the per-step message (a chain error can echo a response body /
+      // a session-token URL) while KEEPING the diagnostic text. The run-level `error` is scrubbed in runOne.
+      const persisted = redact(message);
       await recordStep(runId, i, name, status, Date.now() - stepStart, persisted);
       return { verdict: status, durationMs: Date.now() - chainStart, failedStep: name, error: message };
     };

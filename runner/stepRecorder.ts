@@ -17,7 +17,7 @@
 import type { Page } from 'playwright';
 import { pool } from './db.js';
 import { expect, isExpectationError } from './errors.js';
-import { sensitiveErrorMessage } from './redact.js';
+import { type Redactor, IDENTITY_REDACTOR } from './redact.js';
 
 /**
  * What a flow author receives. `page` is the live Playwright Page (in scope, so
@@ -93,10 +93,11 @@ export class StepRecorder {
     private readonly sink: StepSink = poolSink,
     /** Sink that marks a step 'running' on start. Defaults to the run_steps INSERT; tests pass a no-op. */
     private readonly markRunningSink: RunningSink = poolRunningSink,
-    /** B10: a sensitive (cart/auth) monitor — genericise the PERSISTED per-step error_message so a
-     *  Playwright error echoing DOM text / a session-token URL never lands in run_steps (which the RCA
-     *  AI also reads via the funnel). The thrown error is unchanged (flow control / classification). */
-    private readonly sensitive: boolean = false,
+    /** B10: the monitor's redactor — SCRUBS sensitive VALUES out of the PERSISTED per-step error_message so a
+     *  Playwright error echoing a Bearer/JWT/token never lands in run_steps (which the RCA AI also reads via
+     *  the funnel) while KEEPING the diagnostic text. IDENTITY_REDACTOR (non-sensitive) → unchanged. The
+     *  thrown error is unchanged (flow control / classification). */
+    private readonly redact: Redactor = IDENTITY_REDACTOR,
   ) {}
 
   /**
@@ -124,9 +125,10 @@ export class StepRecorder {
       // A thrown ExpectationError is a clean assertion miss ('fail'); anything
       // else (Playwright timeout, navigation crash) is an exception ('error').
       const status = isExpectationError(err) ? 'fail' : 'error';
-      // B10: a sensitive monitor persists a GENERIC per-step message (the raw error can echo DOM
-      // text / a session-token URL). The step NAME (author-controlled) is kept; the detail is dropped.
-      const persisted = this.sensitive ? sensitiveErrorMessage(status, null) : message;
+      // B10: SCRUB sensitive values from the per-step message (the raw error can echo a Bearer/JWT/token)
+      // while KEEPING the diagnostic text; the step NAME (author-controlled) is kept too. Non-sensitive →
+      // identity (unchanged).
+      const persisted = this.redact(message);
       await this.record(index, name, status, Date.now() - start, persisted);
       this.failedStep = name;
       throw err;
