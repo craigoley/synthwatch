@@ -222,3 +222,47 @@ git_drift_state() {
   if git merge-base --is-ancestor "${local_head}" "${origin_head}" 2>/dev/null; then echo "behind"; return; fi
   echo "diverged"
 }
+
+# ---------------------------------------------------------------------------
+# ci_wait_verdict — FIX 3 (CI-timing race). When the newest DEPLOYABLE image predates the target
+# (the DB-ahead-of-code halt), the deploy can WAIT for CI to finish building the target instead of
+# erroring out. This PURE function decides each poll tick from two facts the loop supplies:
+#   $1 target_built — "1" if the TARGET sha's image is present in BOTH the runner+migrate repos.
+#   $2 ci_conclusion — the target's CI (deploy.yml) run conclusion/status, "" if unknown/absent.
+# Echoes:
+#   proceed — the target's images exist (CI finished the build) → deploy the target. The guard is
+#             intact: we proceed ONLY once the target's OWN image is built, never a predating one.
+#   refuse  — CI ended in a NON-success terminal state → the image will never appear → REFUSE now
+#             (don't wait out the timeout). Preserves the "no auto-deploy past a real CI failure" rule.
+#   wait    — anything else (in_progress / queued / success-but-image-not-yet-pushed / unknown) →
+#             keep polling. A "success" with no image yet still WAITs (registry push lag), so we only
+#             ever proceed on a real, present image.
+# ★ Only target_built=1 yields proceed — a CI failure or a timeout (the loop's fallback) still
+# refuses, so DB-ahead-of-code can never be auto-shipped.
+ci_wait_verdict() {
+  local target_built="$1" ci_conclusion="${2:-}"
+  [[ "${target_built}" == "1" ]] && { echo "proceed"; return; }
+  case "${ci_conclusion}" in
+    failure|cancelled|timed_out|startup_failure|action_required|stale) echo "refuse" ;;
+    *)                                                                  echo "wait" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# retry_nonempty — FIX 1 (verify mid-reconciliation false-empty). Runs the command "$@"; if its
+# stdout is blank, retries up to VERIFY_READ_TRIES (default 8) with VERIFY_READ_SLEEP (default 5s)
+# between, then echoes the last stdout. The post-deploy VERIFY reads (job env value/secretRef/image)
+# can transiently read empty while a just-rolled job revision is still reconciling — `2>/dev/null ||
+# true` then swallows that into "" and the check FALSE-FAILs (the ACS-secretRef cry-wolf). ★ A
+# GENUINELY-absent/wiped value stays empty across ALL retries, so the caller's check still FLUNKS —
+# the guard keeps its teeth; only the transient is absorbed. A present value returns on the 1st try.
+# Lives here (not deploy.sh) so the unit test drives the EXACT shipped logic.
+retry_nonempty() {
+  local out='' i
+  for (( i = 1; i <= ${VERIFY_READ_TRIES:-8}; i++ )); do
+    out="$("$@" 2>/dev/null || true)"
+    [[ -n "${out//[$' \t\r\n']/}" ]] && break
+    (( i < ${VERIFY_READ_TRIES:-8} )) && sleep "${VERIFY_READ_SLEEP:-5}"
+  done
+  printf '%s' "${out}"
+}

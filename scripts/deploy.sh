@@ -31,6 +31,8 @@
 #                                     #   what-if DROP halt NOR a stale-runner-image halt (HEAD's runner
 #                                     #   code has no built image). For the latter, use --sha.
 #   scripts/deploy.sh --sha <sha>     # override the image SHA (skip the HEAD/registry check)
+#   scripts/deploy.sh --no-wait       # on a stale-image halt (CI mid-build), refuse immediately instead
+#                                     #   of WAITING for CI to finish building the target (the default).
 #   scripts/deploy.sh --post-reconcile # after deploy+verify: trigger the reconcile job, WAIT,
 #                                     #   then print spec_catalog + reconcile_drift (no manual sleep).
 #   scripts/deploy.sh --help
@@ -75,6 +77,11 @@ readonly TEMPLATE="${ROOT}/infra/main.bicep"
 WHATIF_ONLY=0
 POST_RECONCILE=0
 SHA_OVERRIDE=''
+# ★ FIX 3: when the newest deployable image PREDATES the target (CI mid-build), WAIT for CI to
+# finish building the target then proceed, instead of erroring out + making the user re-run.
+# Default ON; --no-wait restores the old immediate-refuse behavior. A CI FAILURE or a timeout
+# still refuses (DB-ahead-of-code is never auto-shipped).
+WAIT_FOR_CI=1
 # The deploy TARGET commit — derived from origin/main (the CI-built, deployable truth), NOT local HEAD.
 # Set by sync_target_to_origin(); read by pick_sha(). Empty under --sha (override skips the sync).
 TARGET_HEAD=''
@@ -102,7 +109,7 @@ c_bold()  { printf '\033[1m%s\033[0m\n' "$*"; }
 fail() { c_red "ERROR: $*" >&2; exit 1; }
 
 usage() {
-  sed -n '3,30p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '3,40p' "$0" | sed 's/^# \{0,1\}//'
   exit 0
 }
 
@@ -117,6 +124,7 @@ while [[ $# -gt 0 ]]; do
     # image is overridden only with --sha — so there is nothing left for --yes to auto-proceed.
     --yes|-y) shift ;;
     --post-reconcile) POST_RECONCILE=1; shift ;;
+    --no-wait) WAIT_FOR_CI=0; shift ;;   # ★ FIX 3: don't wait for CI — refuse immediately on a stale-image halt
     --sha) [[ $# -ge 2 ]] || fail "--sha needs a value"; SHA_OVERRIDE="$2"; shift 2 ;;
     --help|-h) usage ;;
     *) fail "unknown arg: $1 (try --help)" ;;
@@ -164,6 +172,41 @@ mismatch_verdict() {
 repo_sha_tags() {
   az acr repository show-tags -n "${ACR}" --repository "$1" --orderby time_desc -o tsv 2>/dev/null \
     | grep -E '^[0-9a-f]{40}$' || true
+}
+
+# ★ FIX 3 helpers — wait for CI to build the TARGET sha instead of erroring out on the stale-image halt.
+# target_ci_conclusion <sha> -> the deploy.yml (image-build) run's conclusion (or status if still running)
+# for that exact commit; '' if gh is absent / not authed / no run found (→ ci_wait_verdict keeps waiting).
+target_ci_conclusion() {
+  command -v gh >/dev/null 2>&1 || { echo ''; return; }
+  gh run list --workflow deploy.yml --limit 30 --json headSha,status,conclusion \
+    -q '[.[] | select(.headSha=="'"$1"'")][0] | (.conclusion // .status) // ""' 2>/dev/null || true
+}
+
+# wait_for_target_image <target_sha> -> 0 once the target's runner+migrate images are BOTH built
+# (proceed), 1 if CI failed or the wait timed out (refuse → the caller falls back to the halt error).
+# Polls the registry (the authoritative "image exists" signal) + gh (to refuse fast on a real CI
+# failure rather than waiting out the timeout). The decision each tick is the pure ci_wait_verdict.
+# ★ Guard intact: returns 0 ONLY when the TARGET's own images exist — never a predating image — so
+# DB-ahead-of-code stays impossible; a CI failure/timeout still refuses.
+wait_for_target_image() {
+  local target="$1" tries=0 max="${CI_WAIT_TRIES:-40}" nap="${CI_WAIT_SLEEP:-30}" built concl verdict
+  c_yellow "Waiting up to $(( max * nap / 60 ))m for CI to build ${target:0:12} (runner+migrate); --no-wait to skip…" >&2
+  while (( tries < max )); do
+    built=0
+    if printf '%s\n' "$(repo_sha_tags "${RUNNER_REPO}")"  | grep -qxF "${target}" \
+    && printf '%s\n' "$(repo_sha_tags "${MIGRATE_REPO}")" | grep -qxF "${target}"; then built=1; fi
+    concl="$(target_ci_conclusion "${target}")"
+    verdict="$(ci_wait_verdict "${built}" "${concl}")"
+    case "${verdict}" in
+      proceed) c_green "  CI finished — ${target:0:12} is built in both repos; proceeding." >&2; return 0 ;;
+      refuse)  c_red   "  CI build for ${target:0:12} ended '${concl}' (no image will appear) — refusing." >&2; return 1 ;;
+    esac
+    (( tries % 4 == 0 )) && c_yellow "  …still building (${concl:-no run yet}); waited $(( tries * nap ))s." >&2
+    sleep "${nap}"; tries=$(( tries + 1 ))
+  done
+  c_red "  timed out after $(( max * nap / 60 ))m waiting for CI to build ${target:0:12}." >&2
+  return 1
 }
 
 pick_sha() {
@@ -224,11 +267,18 @@ pick_sha() {
           c_yellow "      (--what-if-only: PREVIEWING against ${newest:0:12} — NOT what a real deploy would ship.)" >&2
           ;;
         halt)
-          # ★ REFUSE — never silently ship a runner image that predates HEAD's runner code. Deploying
-          # ${newest} would apply HEAD's DB migrations WITHOUT the matching runner code (the
-          # DB-ahead-of-code half-state that paged ft=1 monitors with no retry absorption). This is a
-          # HALT, not a prompt: --yes does NOT bypass it (like a what-if drop). Escape hatch: --sha.
-          if [[ "${runner_newest}" == "${head}" ]]; then
+          # ★ NEVER silently ship a runner image that predates HEAD's runner code — deploying ${newest}
+          # would apply HEAD's DB migrations WITHOUT the matching runner code (the DB-ahead-of-code
+          # half-state that paged ft=1 monitors with no retry absorption).
+          # ★ FIX 3: instead of erroring out + making the user re-run, WAIT for CI to finish building the
+          # TARGET, then proceed with the now-built target. The guard is intact: we proceed ONLY once the
+          # target's OWN images exist (wait_for_target_image returns 0); a CI FAILURE or a timeout still
+          # falls through to the refusal below. --no-wait skips the wait (old immediate-refuse behavior).
+          if [[ "${WAIT_FOR_CI}" -eq 1 ]] && wait_for_target_image "${head}"; then
+            newest="${head}"   # CI built the target — deploy it (a fully-built runner+migrate pair).
+            c_green "      Deploying the now-built target ${newest:0:12}." >&2
+          # This is a HALT, not a prompt: --yes does NOT bypass it (like a what-if drop). Escape hatch: --sha.
+          elif [[ "${runner_newest}" == "${head}" ]]; then
             fail "refusing to deploy STALE runner code: HEAD's runner image ${head:0:12} IS built, but its ${MIGRATE_REPO} pair isn't pushed yet (CI mid-build), so the newest COMPLETE pair is the OLDER ${newest:0:12} — deploying it would apply HEAD's migrations without the matching runner code. Wait for CI to finish building ${head:0:12} (runner AND migrate), then re-run; or --sha <sha> to deploy a specific fully-built pair."
           else
             fail "refusing to deploy STALE runner code: the newest deployable image ${newest:0:12} PREDATES HEAD's runner code ${head:0:12} (CI may still be building ${head:0:12}, or its build failed) — deploying it would apply HEAD's DB migrations without the matching runner code (DB-ahead-of-code). Wait for CI, or --sha <sha> to deploy a specific fully-built pair."
@@ -262,11 +312,15 @@ sync_target_to_origin() {
     same)
       c_green "Local main == origin/main (${origin_head:0:12}) — deploying that." >&2 ;;
     behind)
-      c_yellow "NOTE: local main is BEHIND origin/main — deploying origin/main ${origin_head:0:12}." >&2
-      c_yellow "      (Your checkout is stale; 'git pull' to catch up — not required, the deploy targets origin.)" >&2 ;;
+      # ★ FIX 4: BENIGN — local is a strict ANCESTOR of origin/main (fast-forwardable), the normal
+      # squash-merge aftermath (your branch merged; local main just hasn't pulled). Nothing is wrong
+      # and nothing diverged, so this is a calm green NOTE, not an alarming yellow WARN (which is
+      # reserved for the 'diverged' case below — local commits that are NOT on origin).
+      c_green "NOTE: local main is behind origin/main (benign, fast-forwardable) — deploying origin/main ${origin_head:0:12}." >&2
+      c_green "      ('git pull' to catch up — not required; the deploy always targets origin.)" >&2 ;;
     diverged)
       # local has commit(s) NOT on origin (e.g. an orphan never pushed). DO NOT reset — IGNORE them.
-      c_yellow "WARN: local main has commit(s) NOT on origin/main — IGNORING them; deploying origin/main ${origin_head:0:12}:" >&2
+      c_yellow "WARN: local main has commit(s) NOT on origin/main (diverged) — IGNORING them; deploying origin/main ${origin_head:0:12}:" >&2
       git log --oneline origin/main..HEAD 2>/dev/null | sed 's/^/        local-only (untouched): /' >&2 || true
       c_yellow "      (Push + let CI build a local commit to deploy it, or use --sha. Your tree is left as-is.)" >&2 ;;
   esac
@@ -383,18 +437,37 @@ flunk() { c_red   "  FAIL  $*"; VERIFY_FAILS=$((VERIFY_FAILS + 1)); }
 # check <ok-bool> <message> : pass if first arg is "1", else flunk. Avoids the A&&B||C trap.
 check() { if [[ "$1" == "1" ]]; then pass "$2"; else flunk "$2"; fi; }
 
-job_env_value() {  # job, env-name -> value (empty if absent)
+# ★ FIX 1 — the post-deploy VERIFY false-empty read (the ACS secretRef cry-wolf: live ref was
+# 'acs-email-conn' but VERIFY read ''). ROOT CAUSE: verify runs right after the deploy while the
+# just-rolled job revision is still RECONCILING, and `az ... 2>/dev/null || true` swallows the
+# transient empty/error read into "" — which the check then FAILs. The az path + parse are correct
+# (proven: the same query reads 'acs-email-conn' once reconciliation settles). FIX: retry an EMPTY
+# read a few times before trusting it. ★ A GENUINELY-missing/wiped value stays empty across all
+# retries → the caller still FLUNKS, so the guard keeps its teeth; only the mid-reconciliation
+# transient is absorbed. A present value returns on the FIRST try (no latency pre-deploy / normally).
+readonly VERIFY_READ_TRIES="${VERIFY_READ_TRIES:-8}"   # 8 × 5s ≈ 40s of headroom on an empty read
+readonly VERIFY_READ_SLEEP="${VERIFY_READ_SLEEP:-5}"
+# retry_nonempty lives in scripts/lib/deploy-lib.sh (already sourced) so the unit test drives it.
+
+# shellcheck disable=SC2329  # invoked indirectly via retry_nonempty "$@"
+_job_env_value() {  # job, env-name -> value (empty if absent)
   az containerapp job show -n "$1" -g "${RG}" \
     --query "properties.template.containers[0].env[?name=='$2'].value | [0]" -o tsv 2>/dev/null || true
 }
-job_env_secretref() {  # job, env-name -> secretRef (empty if absent)
+# shellcheck disable=SC2329  # invoked indirectly via retry_nonempty "$@"
+_job_env_secretref() {  # job, env-name -> secretRef (empty if absent)
   az containerapp job show -n "$1" -g "${RG}" \
     --query "properties.template.containers[0].env[?name=='$2'].secretRef | [0]" -o tsv 2>/dev/null || true
 }
-job_image() {  # job -> image
+# shellcheck disable=SC2329  # invoked indirectly via retry_nonempty "$@"
+_job_image() {  # job -> image
   az containerapp job show -n "$1" -g "${RG}" \
     --query "properties.template.containers[0].image" -o tsv 2>/dev/null || true
 }
+# Verify-facing wrappers: retry the raw read on a transient empty (mid-reconciliation).
+job_env_value()     { retry_nonempty _job_env_value "$@"; }
+job_env_secretref() { retry_nonempty _job_env_secretref "$@"; }
+job_image()         { retry_nonempty _job_image "$@"; }
 
 verify() {
   c_bold "Verifying what landed…"
