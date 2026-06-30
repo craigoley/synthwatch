@@ -23,15 +23,37 @@ interface OpenIncident {
  * perf_budget_* columns non-inert: a breach downgrades an otherwise-passing run
  * to 'warn' (see index.ts).
  */
-export function perfBudgetBreach(check: Check, m: RunMetrics): string | null {
+// ★ Per-location LATENCY tolerance for perf budgets. A geographically distant vantage has legitimately
+// higher round-trip latency (physics) — without headroom a 3rd, more-distant region would red on NORMAL
+// latency. Applies ONLY to latency metrics (LCP); page weight (transferBytes) is region-independent and
+// is NEVER scaled. Primary/central regions = 1.0 (no change); the distant westus2 carries headroom. An
+// unknown location falls back to 1.0 (never tightens a budget).
+export const LOCATION_LATENCY_TOLERANCE: Record<string, number> = {
+  default: 1.0, // primary region (eastus2), label 'default'
+  eastus2: 1.0,
+  centralus: 1.0,
+  westus2: 1.3, // ~cross-continent RTT headroom so normal west-coast latency isn't a false breach
+};
+
+export function latencyToleranceFor(location: string): number {
+  return LOCATION_LATENCY_TOLERANCE[location] ?? 1.0;
+}
+
+export function perfBudgetBreach(check: Check, m: RunMetrics, location = 'default'): string | null {
   const breaches: string[] = [];
-  if (
-    check.perf_budget_lcp_ms != null &&
-    m.lcpMs != null &&
-    m.lcpMs > check.perf_budget_lcp_ms
-  ) {
-    breaches.push(`LCP ${m.lcpMs}ms > budget ${check.perf_budget_lcp_ms}ms`);
+  // LCP is latency-bound → scale the budget by this vantage's tolerance (the distant region gets headroom).
+  const lcpTolerance = latencyToleranceFor(location);
+  const lcpBudget =
+    check.perf_budget_lcp_ms != null ? Math.round(check.perf_budget_lcp_ms * lcpTolerance) : null;
+  if (lcpBudget != null && m.lcpMs != null && m.lcpMs > lcpBudget) {
+    breaches.push(
+      `LCP ${m.lcpMs}ms > budget ${lcpBudget}ms` +
+        (lcpTolerance !== 1.0
+          ? ` (${check.perf_budget_lcp_ms}ms ×${lcpTolerance} ${location} latency tolerance)`
+          : ''),
+    );
   }
+  // Page weight is region-independent — compared against the raw budget, no location scaling.
   if (
     check.perf_budget_transfer_bytes != null &&
     m.transferBytes != null &&
@@ -287,14 +309,21 @@ interface Verdict {
  * be in the failing set, so counting it toward N would SILENTLY BLOCK paging whenever a
  * selected region goes quiet, even when every region that IS reporting is down. That is
  * a monitoring-self-failure; basing N on reporting locations fixes it.
- *   - NULL override (the default) => N = all REPORTING locations (N-of-N over what we
- *     can actually see — the conservative "1 of N = network, N of N = real" default).
+ *   - NULL override (the default) => N = a MAJORITY of REPORTING locations, floor(n/2)+1.
+ *     This is the 2-of-3 QUORUM: a lone regional blip (1 of 3) is suppressed, ≥2 still
+ *     pages. By reporting count: 1→1, 2→2, 3→2, 4→3, 5→3. ★ Note 1→1 and 2→2 are IDENTICAL
+ *     to the old N-of-N default, so the live 2-region fleet is unchanged until a 3rd region
+ *     reports — at which point a real outage (≥2 regions) still pages but a single-region
+ *     blip no longer does. (Was N-of-N: required ALL reporting to fail — so 3 regions needed
+ *     3-of-3, missing real outages where one region happened to stay up.)
  *   - explicit INT => that absolute threshold, CAPPED at the reporting count (so an
  *     override larger than the reporting set can't reintroduce the block-forever trap).
  * Single reporting location => N=1 => exactly the pre-multi-location behaviour.
  */
 export function effectiveN(reporting: number, minFailLocations: number | null): number {
-  return minFailLocations == null ? reporting : Math.min(minFailLocations, reporting);
+  return minFailLocations == null
+    ? Math.floor(reporting / 2) + 1 // majority quorum (2-of-3)
+    : Math.min(minFailLocations, reporting);
 }
 
 /**

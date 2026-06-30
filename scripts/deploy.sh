@@ -56,6 +56,7 @@ readonly API_HEALTH_URL='https://synthwatch-api.azurewebsites.net/api/checks'
 # Jobs that reuse the RUNNER image (their deployed image == the intended SHA after a deploy).
 readonly RUNNER_JOB='synthwatch-runner-job'
 readonly CENTRALUS_RUNNER_JOB='synthwatch-runner-job-centralus'
+readonly WESTUS2_RUNNER_JOB='synthwatch-runner-job-westus2'   # 3rd region (2-of-3 quorum)
 readonly NARRATIVE_JOB='synthwatch-narrative-job'
 readonly ROLLUP_JOB='synthwatch-rollup-job'
 readonly RECONCILE_JOB='synthwatch-reconcile-job'
@@ -63,7 +64,7 @@ readonly RECONCILE_JOB='synthwatch-reconcile-job'
 readonly MIGRATE_JOB='synthwatch-migrate-job'
 # Every job that should be on the runner image after a deploy (verify checks each — BUG 2).
 readonly RUNNER_IMAGE_JOBS=(
-  "${RUNNER_JOB}" "${CENTRALUS_RUNNER_JOB}" "${NARRATIVE_JOB}" "${ROLLUP_JOB}" "${RECONCILE_JOB}"
+  "${RUNNER_JOB}" "${CENTRALUS_RUNNER_JOB}" "${WESTUS2_RUNNER_JOB}" "${NARRATIVE_JOB}" "${ROLLUP_JOB}" "${RECONCILE_JOB}"
 )
 
 # Repo root, so the script works from any cwd.

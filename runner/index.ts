@@ -399,7 +399,9 @@ async function runOne(check: Check): Promise<void> {
   let status: TerminalStatus = outcome.status;
   let errorMessage = outcome.error;
   if (status === 'pass' && outcome.metrics) {
-    const breach = perfBudgetBreach(check, outcome.metrics);
+    // ★ Location-aware: a distant vantage (e.g. westus2) gets latency headroom so normal cross-continent
+    // RTT isn't a false perf breach. Page weight is region-independent (not scaled). See perfBudgetBreach.
+    const breach = perfBudgetBreach(check, outcome.metrics, LOCATION);
     if (breach) {
       status = 'warn';
       errorMessage = breach; // record WHY it warned

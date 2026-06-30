@@ -106,6 +106,24 @@ param centralusEnvName string = 'synthwatch-env-centralus'
 @description('centralus Container Apps Job name.')
 param centralusJobName string = 'synthwatch-runner-job-centralus'
 
+// --- Third region: westus2 (2-of-3 quorum) ----------------------------------
+// A 3rd, geographically DISTINCT vantage (east → central → west) so the incident
+// quorum becomes 2-of-3: a single regional blip (1 of 3) is suppressed, ≥2 still
+// pages (see evaluate.ts effectiveN — the value is killing east-vs-central ambiguity).
+// Same image/identity/DB-secret/ACR as the others — NO new MI, NO new Postgres grant,
+// NO new ACR grant (the shared user-assigned identity pulls cross-region). Only the
+// region + SYNTHWATCH_LOCATION=westus2 differ. The runner's perf budgets are
+// latency-tolerant for westus2 (physics headroom) so normal west-coast RTT isn't a
+// false breach (evaluate.ts LOCATION_LATENCY_TOLERANCE).
+@description('Third runner region (2-of-3 quorum; geographically distinct from eastus2/centralus).')
+param westus2Location string = 'westus2'
+
+@description('Container Apps managed environment for the westus2 runner.')
+param westus2EnvName string = 'synthwatch-env-westus2'
+
+@description('westus2 Container Apps Job name.')
+param westus2JobName string = 'synthwatch-runner-job-westus2'
+
 @description('One-off Container Apps Job that applies DB migrations (started by CD).')
 param migrateJobName string = 'synthwatch-migrate-job'
 
@@ -668,6 +686,142 @@ resource centralusJob 'Microsoft.App/jobs@2024-03-01' = {
             {
               // ACS email transport (secret) — from the bicep-owned secret above, so a
               // redeploy PRESERVES it instead of wiping it (ends the recurring defect).
+              name: 'ACS_EMAIL_CONNECTION_STRING'
+              secretRef: 'acs-email-conn'
+            }
+          ]
+        }
+      ]
+    }
+  }
+  dependsOn: [
+    acrPull
+  ]
+}
+
+// ---------------------------------------------------------------------------
+// Third region (westus2): its own regional managed environment + runner job — the
+// 2-of-3 quorum vantage. Logs to the SAME Log Analytics workspace. Identical to the
+// other jobs except region + SYNTHWATCH_LOCATION=westus2. No new MI/ACR/Postgres grant
+// (shared identity, same DB secret, region-agnostic firewall rule).
+// ---------------------------------------------------------------------------
+resource westus2Environment 'Microsoft.App/managedEnvironments@2024-03-01' = {
+  name: westus2EnvName
+  location: westus2Location
+  properties: {
+    appLogsConfiguration: {
+      destination: 'log-analytics'
+      logAnalyticsConfiguration: {
+        customerId: logAnalytics.properties.customerId
+        sharedKey: logAnalytics.listKeys().primarySharedKey
+      }
+    }
+  }
+}
+
+resource westus2Job 'Microsoft.App/jobs@2024-03-01' = {
+  name: westus2JobName
+  location: westus2Location
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${identity.id}': {}
+    }
+  }
+  properties: {
+    environmentId: westus2Environment.id
+    configuration: {
+      triggerType: 'Schedule'
+      replicaTimeout: 240
+      replicaRetryLimit: 0
+      scheduleTriggerConfig: {
+        cronExpression: '*/5 * * * *'
+        parallelism: 1
+        replicaCompletionCount: 1
+      }
+      registries: [
+        {
+          server: acr.properties.loginServer
+          identity: identity.id
+        }
+      ]
+      secrets: [
+        {
+          // Same admin creds + Postgres FQDN as the others — reachable cross-region
+          // via the AllowAllAzureServices firewall rule.
+          name: 'database-url'
+          value: 'postgresql://${postgresAdminLogin}:${postgresAdminPassword}@${postgres.properties.fullyQualifiedDomainName}:5432/synthwatch?sslmode=require'
+        }
+        {
+          name: 'storage-conn'
+          value: 'DefaultEndpointsProtocol=https;AccountName=${storage.name};AccountKey=${storage.listKeys().keys[0].value};EndpointSuffix=${environment().suffixes.storage}'
+        }
+        {
+          // ACS email transport secret. Bicep-owned so a deploy can't wipe it.
+          name: 'acs-email-conn'
+          value: acsEmailConnectionString
+        }
+      ]
+    }
+    template: {
+      containers: [
+        {
+          name: 'runner'
+          image: runnerImage
+          resources: {
+            cpu: json('1.0')
+            memory: '2Gi'
+          }
+          env: [
+            {
+              name: 'DATABASE_URL'
+              secretRef: 'database-url'
+            }
+            {
+              name: 'AZURE_STORAGE_CONNECTION_STRING'
+              secretRef: 'storage-conn'
+            }
+            {
+              name: 'AZURE_STORAGE_CONTAINER'
+              value: artifactContainerName
+            }
+            {
+              // The vantage label for this region — claims/runs as 'westus2' (the 3rd quorum vote).
+              name: 'SYNTHWATCH_LOCATION'
+              value: westus2Location
+            }
+            {
+              // RCA via Azure OpenAI (MI auth). Identical to the other jobs — every region
+              // opens incidents, so every region needs RCA. Declared so a redeploy preserves it.
+              name: 'AZURE_OPENAI_ENDPOINT'
+              value: aoaiEndpoint
+            }
+            {
+              name: 'AZURE_OPENAI_DEPLOYMENT'
+              value: aoaiDeployment
+            }
+            {
+              name: 'AZURE_OPENAI_API_VERSION'
+              value: aoaiApiVersion
+            }
+            {
+              name: 'RCA_MAX_TOKENS'
+              value: rcaMaxTokens
+            }
+            {
+              // Pin the user-assigned MI for the runner's in-process DefaultAzureCredential
+              // (rca.ts AAD token). DERIVED from the MI resource; declared so a deploy can't wipe it.
+              name: 'AZURE_CLIENT_ID'
+              value: identity.properties.clientId
+            }
+            {
+              // Email sender — non-secret transport property, template-owned (see the eastus2 job).
+              name: 'ALERT_EMAIL_FROM'
+              value: alertEmailFrom
+            }
+            {
+              // ACS email transport (secret) — from the bicep-owned secret above, so a
+              // redeploy PRESERVES it instead of wiping it.
               name: 'ACS_EMAIL_CONNECTION_STRING'
               secretRef: 'acs-email-conn'
             }
