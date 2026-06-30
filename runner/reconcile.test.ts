@@ -363,14 +363,45 @@ test('★ FULL git-authoritative apply stays OFF: b10FieldUpdates IGNORES name/t
   );
 });
 
-test('computeDrift DETECTS a sensitive/redact_patterns divergence (read-only audit)', () => {
+test('★ a B10 divergence is its OWN redaction_mismatch drift (NOT generic changed)', () => {
   const rows = computeDrift(
     [monitor({ sensitive: true, redact_patterns: ['x'] })],
     [managed({ sensitive: false, redact_patterns: null })],
     runnable(SPEC),
   );
+  // ONLY a redaction_mismatch row — no 'changed' (the non-B10 git fields all match here).
+  assert.deepEqual(
+    rows.filter((r) => r.drift_type === 'changed' || r.drift_type === 'redaction_mismatch').map((r) => r.drift_type),
+    ['redaction_mismatch'],
+  );
+  const mismatch = rows.find((r) => r.drift_type === 'redaction_mismatch');
+  const fields = (mismatch!.detail as { fields: Record<string, { git: unknown; live: unknown }> }).fields;
+  assert.deepEqual(fields.sensitive, { git: true, live: false });
+  assert.ok('redact_patterns' in fields, 'redact_patterns divergence surfaced too');
+});
+
+test('★ a monitor that drifts on BOTH name and redaction yields TWO rows (changed + redaction_mismatch)', () => {
+  const rows = computeDrift(
+    [monitor({ name: 'New name', sensitive: true, redact_patterns: ['x'] })],
+    [managed({ name: 'Old name', sensitive: false })],
+    runnable(SPEC),
+  );
+  const types = rows
+    .filter((r) => r.drift_type === 'changed' || r.drift_type === 'redaction_mismatch')
+    .map((r) => r.drift_type)
+    .sort();
+  assert.deepEqual(types, ['changed', 'redaction_mismatch']);
+  // 'changed' carries ONLY the non-B10 field (name) — B10 is split out into its own row.
   const changed = rows.find((r) => r.drift_type === 'changed');
-  assert.ok(changed, 'a B10 divergence shows as changed drift');
-  const fields = (changed!.detail as { fields: Record<string, unknown> }).fields;
-  assert.ok('sensitive' in fields && 'redact_patterns' in fields, 'both B10 fields surfaced in the drift');
+  const cf = (changed!.detail as { fields: Record<string, unknown> }).fields;
+  assert.deepEqual(Object.keys(cf), ['name']);
+});
+
+test('back-compat: a NON-B10 changed drift (name only) is unchanged — no redaction_mismatch row', () => {
+  const rows = computeDrift([monitor({ name: 'New name' })], [managed({ name: 'Old name' })], runnable(SPEC));
+  assert.deepEqual(
+    rows.map((r) => r.drift_type),
+    ['changed'],
+  );
+  assert.equal(rows.find((r) => r.drift_type === 'redaction_mismatch'), undefined);
 });
