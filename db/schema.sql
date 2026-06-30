@@ -873,4 +873,21 @@ $$;
 COMMENT ON FUNCTION slo_status(bigint, timestamptz, timestamptz) IS
     'Per-check SLO over [p_from, p_to): target, error-budget (run-weighted), consumed, remaining, burn_rate=(down/total)/(1-target). Zero rows if no slo_target.';
 
+-- ---------------------------------------------------------------------------
+-- runner_errors (0050): a QUERYABLE sink for the runner's top-level/uncaught exceptions. The global
+-- handler (runnerErrors.ts) writes one row per fatal with a per-invocation correlation id, so a silent
+-- failure is a one-grep diagnosis instead of an invisible ACA-stdout fact. Visibility-only.
+-- ---------------------------------------------------------------------------
+CREATE TABLE runner_errors (
+    id            bigserial   PRIMARY KEY,
+    invocation_id text        NOT NULL,
+    occurred_at   timestamptz NOT NULL DEFAULT now(),
+    phase         text        NOT NULL,
+    check_id      bigint,
+    run_id        bigint,
+    message       text        NOT NULL,
+    stack         text
+);
+CREATE INDEX runner_errors_occurred_at_idx ON runner_errors (occurred_at DESC);
+
 COMMIT;
