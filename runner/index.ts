@@ -191,6 +191,22 @@ async function reapStaleRunning(): Promise<void> {
   if (rowCount && rowCount > 0) {
     console.log(`[runner] reaped ${rowCount} stale running run(s) -> error (older than ${STALE_RUNNING})`);
   }
+
+  // ★ B4: the same claim-then-act strand exists on test_send_requests — drainTestSends claims 'sending'
+  // and a crash before finish() leaves it stuck forever (the reaper previously covered ONLY runs). Sweep
+  // stale 'sending' -> 'failed' so a dropped test-send is visible + not leaked. ('failed' is a valid
+  // status per the test_send_requests CHECK: pending|sending|delivered|failed.)
+  const { rowCount: tsReaped } = await pool.query(
+    `UPDATE test_send_requests
+        SET status = 'failed', completed_at = now(),
+            detail = COALESCE(detail, 'runner did not finalize (stale sending)')
+      WHERE status = 'sending'
+        AND requested_at < now() - make_interval(mins => $1::int)`,
+    [30],
+  );
+  if (tsReaped && tsReaped > 0) {
+    console.log(`[runner] reaped ${tsReaped} stale 'sending' test-send(s) -> failed`);
+  }
 }
 
 /**
@@ -301,8 +317,21 @@ async function drainRunRequests(): Promise<number> {
     const check = await forceClaim(check_id);
     if (!check) continue;
     console.log(`[run-now] force-running check ${check.id} "${check.name}" (on-demand)`);
-    await runOne(check);
-    ran++;
+    // ★ B5: per-iteration try/catch — a throw on ONE on-demand run must NOT abort the remaining drains.
+    // Previously a runOne throw propagated out of the loop (caught only at the main-level .catch), dropping
+    // every still-pending request this tick. The request was claimed 'done' atomically above (the race-
+    // winner; run_requests.status is pending|done only, per its CHECK — no migration for an 'error' state),
+    // so a failed run stays consumed and the check re-runs on its normal cron cadence; the failure is
+    // logged here rather than silently aborting the siblings.
+    try {
+      await runOne(check);
+      ran++;
+    } catch (err) {
+      console.warn(
+        `[run-now] check ${check_id} on-demand run threw (drain continues; check re-runs on cron):`,
+        err,
+      );
+    }
   }
   return ran;
 }
@@ -342,6 +371,32 @@ async function runOne(check: Check): Promise<void> {
   // Best-effort context for the global handler: a fatal during this run is attributed to (check, run).
   setErrorContext(check.id, runId);
 
+  // ★ B2: finalize-on-throw. runOneInner does the work + writes the terminal status; this wrapper
+  // guarantees a throw BEFORE that write doesn't strand the row in 'running' ~30 min until the reaper.
+  const state = { finalized: false };
+  try {
+    await runOneInner(check, runId, state);
+  } finally {
+    // No double-write: state.finalized + `WHERE status='running'` make this a NO-OP once the terminal
+    // write ran. Best-effort + own-catch — a finally that throws would hide the original error.
+    if (!state.finalized) {
+      await pool
+        .query(
+          `UPDATE runs SET status = 'error', finished_at = now(),
+                  error_message = COALESCE(error_message, 'runner threw before finalizing the run')
+            WHERE id = $1 AND status = 'running'`,
+          [runId],
+        )
+        .catch((e) => console.warn(`[runner] run ${runId} B2 finalize fallback failed (non-fatal):`, e));
+    }
+  }
+}
+
+async function runOneInner(
+  check: Check,
+  runId: number,
+  state: { finalized: boolean },
+): Promise<void> {
   const errorOutcome = (msg: string): Outcome => ({
     status: 'error',
     httpStatus: null,
@@ -529,6 +584,7 @@ async function runOne(check: Check): Promise<void> {
       retryCount,
     ],
   );
+  state.finalized = true; // ★ B2: terminal status persisted — the finally fallback is now a no-op.
 
   const run: RunRecord = {
     id: runId,

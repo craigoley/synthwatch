@@ -166,34 +166,40 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
       }>(
         `UPDATE incidents
             SET status = 'resolved', resolved_at = now(), resolved_run_id = $2
-          WHERE id = $1
+          WHERE id = $1 AND status = 'open'
         RETURNING opened_at, resolved_at, rca`,
         [open.id, run.id],
       );
       const resolvedInc = resolvedRows[0];
-      if (await inMaintenanceWindow(check.id)) {
-        console.log(
-          `[runner] check ${check.id} "${check.name}" recovered — recovery alert suppressed (maintenance window)`,
-        );
-      } else {
-        await dispatchAlerts(
-          {
-            checkId: check.id,
-            checkName: check.name,
-            severity: check.severity,
-            status: 'resolved',
-            summary: `Check "${check.name}" recovered.`,
-            runId: run.id,
-            incident: {
-              incidentId: open.id,
-              targetUrl: check.target_url,
-              openedAt: resolvedInc?.opened_at?.toISOString() ?? null,
-              resolvedAt: resolvedInc?.resolved_at?.toISOString() ?? null,
-              rca: resolvedInc?.rca ?? null,
+      // ★ RESOLVE-RACE: page ONLY if THIS region's UPDATE actually flipped open->resolved (a row
+      // returned). With 3 regions two can recover in the SAME tick and both reach here; the `AND status =
+      // 'open'` above makes the loser match 0 rows -> resolvedInc undefined -> no second "recovered" page
+      // (mirrors the open path's `ON CONFLICT ... DO NOTHING`). A lone resolver still pages exactly once.
+      if (resolvedInc) {
+        if (await inMaintenanceWindow(check.id)) {
+          console.log(
+            `[runner] check ${check.id} "${check.name}" recovered — recovery alert suppressed (maintenance window)`,
+          );
+        } else {
+          await dispatchAlerts(
+            {
+              checkId: check.id,
+              checkName: check.name,
+              severity: check.severity,
+              status: 'resolved',
+              summary: `Check "${check.name}" recovered.`,
+              runId: run.id,
+              incident: {
+                incidentId: open.id,
+                targetUrl: check.target_url,
+                openedAt: resolvedInc.opened_at?.toISOString() ?? null,
+                resolvedAt: resolvedInc.resolved_at?.toISOString() ?? null,
+                rca: resolvedInc.rca ?? null,
+              },
             },
-          },
-          await resolveChannels(check.id, check.severity),
-        );
+            await resolveChannels(check.id, check.severity),
+          );
+        }
       }
     }
 
