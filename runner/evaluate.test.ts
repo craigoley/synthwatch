@@ -6,7 +6,7 @@
 // breach / successful capture) is unchanged — no false positives.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { perfBudgetVerdict, hasPerfBudget, perfBudgetBreach } from './evaluate.js';
+import { perfBudgetVerdict, hasPerfBudget, perfBudgetBreach, budgetedMetricCaptureFailed } from './evaluate.js';
 import { EMPTY_METRICS, type RunMetrics } from './metrics.js';
 import type { Check } from './db.js';
 
@@ -74,4 +74,56 @@ test('perfBudgetBreach: null on within-budget, message on over-budget, null on n
   assert.equal(perfBudgetBreach(check({ perf_budget_lcp_ms: 2500 }), metrics({ lcpMs: 1000 })), null);
   assert.match(perfBudgetBreach(check({ perf_budget_lcp_ms: 2500 }), metrics({ lcpMs: 9999 })) ?? '', /LCP 9999/);
   assert.equal(perfBudgetBreach(check(), metrics({ lcpMs: 9999 })), null);
+});
+
+// ─── B1 SILENT-NULL sibling (the second "green that lies") ───────────────────────────────────────────
+// collect() never throws; it returns null metrics + a `captureFailed` set naming fields whose section
+// FAILED. budgetedMetricCaptureFailed draws the line: a budgeted metric that FAILED to capture is
+// not-evaluable (→error via metricsCaptureFailed), but a budgeted metric that's null-but-CAPTURED
+// (legitimately absent) still passes. Mirrors how runOne→executeBrowser feeds perfBudgetVerdict.
+const failed = (...fields: (keyof RunMetrics)[]) => new Set<keyof RunMetrics>(fields);
+
+test('budgetedMetricCaptureFailed: a budgeted metric whose capture FAILED → true', () => {
+  assert.equal(budgetedMetricCaptureFailed(check({ perf_budget_lcp_ms: 2000 }), failed('lcpMs')), true);
+  assert.equal(
+    budgetedMetricCaptureFailed(check({ perf_budget_transfer_bytes: 1_000_000 }), failed('transferBytes')),
+    true,
+  );
+});
+
+test('★ budgetedMetricCaptureFailed: budgeted metric null but CAPTURED (legitimately absent) → false (the line)', () => {
+  // lcp genuinely absent (no LCP on the page): the timings section SUCCEEDED, so 'lcpMs' is NOT in the set.
+  assert.equal(budgetedMetricCaptureFailed(check({ perf_budget_lcp_ms: 2000 }), failed()), false);
+});
+
+test('budgetedMetricCaptureFailed: per-metric — a transfer-capture failure on an LCP-only budget → false', () => {
+  // only transfer failed, but the check budgets only LCP → not a false error.
+  assert.equal(budgetedMetricCaptureFailed(check({ perf_budget_lcp_ms: 2000 }), failed('transferBytes')), false);
+});
+
+test('budgetedMetricCaptureFailed: no budget at all → false (nothing to evaluate)', () => {
+  assert.equal(budgetedMetricCaptureFailed(check(), failed('lcpMs', 'transferBytes')), false);
+});
+
+// End-to-end through the actual verdict (executeBrowser sets metricsCaptureFailed from the helper):
+test('★ B1 silent-null: budgeted LCP capture FAILED (null, no throw) → ERROR, not a blind PASS', () => {
+  const c = check({ perf_budget_lcp_ms: 2000 });
+  const captureFailed = budgetedMetricCaptureFailed(c, failed('lcpMs')); // true
+  const v = perfBudgetVerdict(c, 'pass', metrics({ lcpMs: null }), captureFailed, 'default');
+  assert.equal(v.status, 'error');
+  assert.notEqual(v.status, 'pass');
+  assert.match(v.message ?? '', /capture failed/i);
+});
+
+test('★ B1 silent-null: budgeted LCP LEGITIMATELY ABSENT (null, captured) → still PASS (no false error)', () => {
+  const c = check({ perf_budget_lcp_ms: 2000 });
+  const captureFailed = budgetedMetricCaptureFailed(c, failed()); // false — captured, just absent
+  const v = perfBudgetVerdict(c, 'pass', metrics({ lcpMs: null }), captureFailed, 'default');
+  assert.equal(v.status, 'pass');
+});
+
+test('B1 silent-null: a healthy captured LCP within budget → PASS; over budget → WARN (#146 path intact)', () => {
+  const c = check({ perf_budget_lcp_ms: 2000 });
+  assert.equal(perfBudgetVerdict(c, 'pass', metrics({ lcpMs: 1200 }), false, 'default').status, 'pass');
+  assert.equal(perfBudgetVerdict(c, 'pass', metrics({ lcpMs: 4000 }), false, 'default').status, 'warn');
 });

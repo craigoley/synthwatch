@@ -59,10 +59,29 @@ const EMPTY_METRICS: RunMetrics = {
   recalcStyleCount: null,
 };
 
+/** The result of collect(): the metrics PLUS the set of fields whose CAPTURE FAILED — i.e. their
+ *  collection SECTION threw and the value is null because we couldn't read it, NOT because it's
+ *  legitimately absent. ★ B1 silent-null: a budgeted metric in `captureFailed` is not-evaluable (must
+ *  not pass green); a budgeted metric that's null but NOT in the set was captured-and-genuinely-absent
+ *  (a page with no LCP) and still passes. collect() itself never throws — this set is how a silent
+ *  capture failure becomes visible to the verdict. */
+export interface MetricsResult {
+  metrics: RunMetrics;
+  captureFailed: Set<keyof RunMetrics>;
+}
+
 /** A live capture session; call collect() once, after the flow finishes. */
 export interface MetricsCapture {
-  collect(): Promise<RunMetrics>;
+  collect(): Promise<MetricsResult>;
 }
+
+// The fields each collect() SECTION is responsible for — added to `captureFailed` when that section's
+// read throws (so null-because-failed is distinguishable from null-because-absent).
+const TIMINGS_FIELDS: (keyof RunMetrics)[] = [
+  'ttfbMs', 'domContentLoadedMs', 'loadEventMs', 'fcpMs', 'lcpMs', 'cls', 'inpMs', 'domNodeCount',
+];
+const WEIGHT_FIELDS: (keyof RunMetrics)[] = ['transferBytes', 'resourceCount'];
+const CDP_FIELDS: (keyof RunMetrics)[] = ['jsHeapBytes', 'cpuTimeMs', 'layoutCount', 'recalcStyleCount'];
 
 // Installed before navigation so the observers are live from the first document.
 // Each Core Web Vital accumulates into a window global we read at collect time:
@@ -186,8 +205,10 @@ export async function startMetricsCapture(
   }
 
   return {
-    async collect(): Promise<RunMetrics> {
+    async collect(): Promise<MetricsResult> {
       const metrics: RunMetrics = { ...EMPTY_METRICS };
+      // Fields whose collection SECTION threw (null-because-failed, not null-because-absent). ★ B1.
+      const captureFailed = new Set<keyof RunMetrics>();
 
       // Let LCP finalize before reading, so it isn't understated as == fcp. LCP
       // only grows as larger elements paint; on a JS-hydrated SPA the largest
@@ -263,7 +284,9 @@ export async function startMetricsCapture(
         metrics.inpMs = nz(raw.inp);
         metrics.domNodeCount = raw.domNodeCount > 0 ? raw.domNodeCount : null;
       } catch {
-        /* page already navigated away / closed — leave timing fields null */
+        // ★ The timings evaluate THREW → these fields are null because we couldn't READ them (not because
+        // they're absent). Mark them failed so a budgeted metric here (lcpMs) is treated as not-evaluable.
+        for (const f of TIMINGS_FIELDS) captureFailed.add(f);
       }
 
       // Page weight: let finished responses report their sizes, bounded so a
@@ -273,7 +296,8 @@ export async function startMetricsCapture(
         metrics.transferBytes = transferBytes;
         metrics.resourceCount = resourceCount;
       } catch {
-        /* leave weight fields at whatever was gathered */
+        // ★ Weight gather threw → transferBytes (a budgeted metric) is null-because-failed, not absent.
+        for (const f of WEIGHT_FIELDS) captureFailed.add(f);
       }
 
       // CDP counters.
@@ -294,11 +318,12 @@ export async function startMetricsCapture(
             metrics.recalcStyleCount = Math.round(recalc);
           }
         } catch {
-          /* getMetrics failed — leave CDP fields null */
+          // CDP getMetrics failed → these (non-budgeted) fields are null-because-failed.
+          for (const f of CDP_FIELDS) captureFailed.add(f);
         }
       }
 
-      return metrics;
+      return { metrics, captureFailed };
     },
   };
 }
