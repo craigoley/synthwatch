@@ -71,7 +71,31 @@ export function tracePersistPlan(sensitive: boolean, status: TerminalStatus): Tr
   return { failureTrace: down, successBaseline: up, failureScreenshot: down, baselineScreenshot: status === 'pass' };
 }
 
-/** Generic error_message for a sensitive monitor — keeps only the safe status + static step name. */
+/** Generic error_message for a sensitive monitor — the fallback when scrubbing leaves nothing readable.
+ *  Keeps only the safe status + static step name. */
 export function sensitiveErrorMessage(status: TerminalStatus, failedStep: string | null): string {
   return `${status}${failedStep ? ` at step "${failedStep}"` : ''} — error details redacted (sensitive monitor)`;
+}
+
+/**
+ * Scrub sensitive VALUES out of a sensitive monitor's real error/diagnostic message while KEEPING the
+ * diagnostic text, instead of blanket-replacing it. Reuses the monitor's own redactor (builtin token
+ * denylist + declared redact_patterns — the SAME scrubber proven on trace_signals), so a Bearer / JWT /
+ * GUID / token becomes <redacted> but "TimeoutError: locator '.cuisine-tile' not found" stays readable.
+ * Falls back to the generic placeholder ONLY if scrubbing leaves nothing readable (e.g. the message was
+ * entirely a token) — and even then status + failedStep are carried, so there's always SOME signal.
+ */
+export function scrubError(
+  redact: Redactor,
+  status: TerminalStatus,
+  failedStep: string | null,
+  raw: string | null,
+): string {
+  const scrubbed = redact(raw ?? '').trim();
+  // Fall back ONLY when no DIAGNOSTIC text survived — i.e. the message was empty, or scrubbing left nothing
+  // but redaction markers (the error was entirely a secret). Strip the markers and check for any remaining
+  // alphanumeric; if none, the scrubbed string carries no signal, so use the placeholder (which still carries
+  // status + failedStep). Otherwise keep the readable, scrubbed diagnostic.
+  const hasDiagnostic = /[A-Za-z0-9]/.test(scrubbed.replace(/<redacted[^>]*>/g, ''));
+  return hasDiagnostic ? scrubbed : sensitiveErrorMessage(status, failedStep);
 }
