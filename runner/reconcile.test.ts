@@ -12,6 +12,7 @@ import {
   buildApplyUpsert,
   isResolvableSpec,
   b10FieldUpdates,
+  isRedactionStrip,
   computeApplyPlan,
   fetchManifest,
   GIT_AUTHORITATIVE_COLUMNS,
@@ -336,14 +337,16 @@ test('fetchManifest honors an explicit override URL (direct fetch — tests/fork
 
 // --- ★ SCOPED B10-only sync (the leak fix) — writes ONLY sensitive + redact_patterns ----------
 test('★ b10FieldUpdates: a sensitive monitor whose live check defaulted to false → corrects it', () => {
-  const ups = b10FieldUpdates(
+  const { updates, blockedStrips } = b10FieldUpdates(
     [monitor({ sensitive: true, redact_patterns: ['eyJ[A-Za-z0-9_-]+', '[Bb]earer\\s+\\S+'] })],
     [managed({ sensitive: false, redact_patterns: null })], // the leak: manifest says sensitive, DB defaulted false
   );
-  assert.equal(ups.length, 1);
-  assert.equal(ups[0].source_key, 'wegmans-search-product');
-  assert.equal(ups[0].sensitive, true);
-  assert.equal(ups[0].redact_patterns, JSON.stringify(['eyJ[A-Za-z0-9_-]+', '[Bb]earer\\s+\\S+']));
+  assert.equal(updates.length, 1);
+  assert.equal(blockedStrips.length, 0);
+  assert.equal(updates[0].source_key, 'wegmans-search-product');
+  assert.equal(updates[0].sensitive, true);
+  assert.equal(updates[0].intentionalStrip, false); // false→true is NOT a strip
+  assert.equal(updates[0].redact_patterns, JSON.stringify(['eyJ[A-Za-z0-9_-]+', '[Bb]earer\\s+\\S+']));
 });
 
 test('b10FieldUpdates: a check ALREADY matching the manifest → NO update (untouched)', () => {
@@ -352,15 +355,18 @@ test('b10FieldUpdates: a check ALREADY matching the manifest → NO update (unto
       [monitor({ sensitive: true, redact_patterns: ['x'] })],
       [managed({ sensitive: true, redact_patterns: ['x'] })],
     ),
-    [],
+    { updates: [], blockedStrips: [] },
   );
   // a non-sensitive monitor + non-sensitive check (the default fleet) → also untouched.
-  assert.deepEqual(b10FieldUpdates([monitor()], [managed()]), []);
+  assert.deepEqual(b10FieldUpdates([monitor()], [managed()]), { updates: [], blockedStrips: [] });
 });
 
-test('★ b10FieldUpdates writes ONLY source_key + the 2 B10 columns (no other field)', () => {
-  const u = b10FieldUpdates([monitor({ sensitive: true, redact_patterns: ['x'] })], [managed({ sensitive: false })])[0];
-  assert.deepEqual(Object.keys(u).sort(), ['redact_patterns', 'sensitive', 'source_key']);
+test('★ b10FieldUpdates write carries source_key + the 2 B10 columns (+ the strip flag, not written)', () => {
+  // The DB UPDATE in reconcileMain uses ONLY source_key + sensitive + redact_patterns; intentionalStrip is
+  // log-only metadata, never a column.
+  const u = b10FieldUpdates([monitor({ sensitive: true, redact_patterns: ['x'] })], [managed({ sensitive: false })])
+    .updates[0];
+  assert.deepEqual(Object.keys(u).sort(), ['intentionalStrip', 'redact_patterns', 'sensitive', 'source_key']);
 });
 
 test('★ FULL git-authoritative apply stays OFF: b10FieldUpdates IGNORES name/target/etc.', () => {
@@ -371,8 +377,73 @@ test('★ FULL git-authoritative apply stays OFF: b10FieldUpdates IGNORES name/t
       [monitor({ name: 'NEW name', target: 'https://changed.example', sensitive: false })],
       [managed({ name: 'OLD name', target_url: 'https://old.example', sensitive: false })],
     ),
-    [],
+    { updates: [], blockedStrips: [] },
   );
+});
+
+// --- ★ B10 WRITE-PATH STRIP GUARD (the fix) -----------------------------------------------------------
+test('isRedactionStrip: ONLY live-true→want-false is a strip', () => {
+  assert.equal(isRedactionStrip(false, true), true); // sensitive true→false = strip
+  assert.equal(isRedactionStrip(true, false), false); // false→true (enabling) = NOT a strip
+  assert.equal(isRedactionStrip(true, true), false); // stays sensitive (e.g. pattern edit) = NOT a strip
+  assert.equal(isRedactionStrip(false, false), false); // stays non-sensitive = NOT a strip
+});
+
+test('★ STRIP without allowance → REFUSED (not applied, surfaced in blockedStrips, check stays sensitive)', () => {
+  // wegmans-search-product is NOT in REDACTION_STRIP_ALLOWANCE.
+  const { updates, blockedStrips } = b10FieldUpdates(
+    [monitor({ id: 'wegmans-search-product', sensitive: false, redact_patterns: undefined })],
+    [managed({ source_key: 'wegmans-search-product', sensitive: true, redact_patterns: ['eyJ\\S+'] })],
+  );
+  assert.deepEqual(updates, [], 'the strip is NOT applied — the check is left sensitive=true');
+  assert.deepEqual(blockedStrips, ['wegmans-search-product'], 'and is surfaced for logging');
+});
+
+test('★ STRIP with allowance → APPLIED as an intentional strip', () => {
+  // meals2go-browse-menu IS in REDACTION_STRIP_ALLOWANCE.
+  const { updates, blockedStrips } = b10FieldUpdates(
+    [monitor({ id: 'meals2go-browse-menu', sensitive: false, redact_patterns: undefined })],
+    [managed({ source_key: 'meals2go-browse-menu', sensitive: true, redact_patterns: ['eyJ\\S+'] })],
+  );
+  assert.equal(blockedStrips.length, 0);
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0].sensitive, false);
+  assert.equal(updates[0].intentionalStrip, true);
+  assert.equal(updates[0].redact_patterns, JSON.stringify(null)); // patterns cleared with the strip
+});
+
+test('★ NON-strip changes apply regardless of the allowance (false→true; pattern-only edit)', () => {
+  // false→true on a NON-allow-listed monitor still applies (enabling redaction is never blocked).
+  const enable = b10FieldUpdates(
+    [monitor({ id: 'wegmans-search-product', sensitive: true, redact_patterns: ['x'] })],
+    [managed({ source_key: 'wegmans-search-product', sensitive: false })],
+  );
+  assert.equal(enable.updates.length, 1);
+  assert.equal(enable.updates[0].sensitive, true);
+  assert.equal(enable.updates[0].intentionalStrip, false);
+  assert.equal(enable.blockedStrips.length, 0);
+  // pattern-only edit while STAYING sensitive → applies (not a strip).
+  const patternEdit = b10FieldUpdates(
+    [monitor({ id: 'wegmans-search-product', sensitive: true, redact_patterns: ['NEW'] })],
+    [managed({ source_key: 'wegmans-search-product', sensitive: true, redact_patterns: ['OLD'] })],
+  );
+  assert.equal(patternEdit.updates.length, 1);
+  assert.equal(patternEdit.updates[0].redact_patterns, JSON.stringify(['NEW']));
+  assert.equal(patternEdit.blockedStrips.length, 0);
+});
+
+test('★ plan path agrees with the write path: strip-not-allowed → blocked; strip-allowed → not blocked', () => {
+  const stripDrift = (sourceKey: string) => ({
+    source_key: sourceKey,
+    drift_type: 'redaction_mismatch' as const,
+    detail: { fields: { sensitive: { git: false, live: true } } },
+  });
+  // not allow-listed → the plan marks it blocked.
+  const blockedPlan = computeApplyPlan([], [stripDrift('wegmans-search-product')], ['eastus2']);
+  assert.equal(blockedPlan.find((r) => r.source_key === 'wegmans-search-product')?.status, 'blocked');
+  // allow-listed → NOT blocked (auto — the write path applies it intentionally).
+  const allowedPlan = computeApplyPlan([], [stripDrift('meals2go-browse-menu')], ['eastus2']);
+  assert.notEqual(allowedPlan.find((r) => r.source_key === 'meals2go-browse-menu')?.status, 'blocked');
 });
 
 test('★ a B10 divergence is its OWN redaction_mismatch drift (NOT generic changed)', () => {
