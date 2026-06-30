@@ -381,7 +381,10 @@ export function buildApplyUpsert(monitor: Monitor): {
   const text =
     `INSERT INTO checks (${insertColumns.join(', ')})\n` +
     `VALUES (${placeholders})\n` +
-    `ON CONFLICT (source_key) DO UPDATE SET ${setClause}`;
+    // ★ checks has a PARTIAL unique index (checks_source_key_uniq WHERE source_key IS NOT NULL) — a bare
+    // ON CONFLICT (source_key) can't infer it ("no unique constraint matching"). The WHERE predicate MUST
+    // match the partial index for the upsert (and Phase-1 idempotent re-apply) to work.
+    `ON CONFLICT (source_key) WHERE source_key IS NOT NULL DO UPDATE SET ${setClause}`;
 
   return { text, values, insertColumns, updateColumns };
 }
