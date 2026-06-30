@@ -43,7 +43,7 @@ import { makeRedactor, IDENTITY_REDACTOR, tracePersistPlan, sensitiveErrorMessag
 import os from 'node:os';
 import path from 'node:path';
 import { unlink } from 'node:fs/promises';
-import { evaluate, maybeBurnAlert, perfBudgetBreach, hasOpenIncident } from './evaluate.js';
+import { evaluate, maybeBurnAlert, perfBudgetVerdict, hasOpenIncident } from './evaluate.js';
 import {
   startMetricsCapture,
   writeRunMetrics,
@@ -66,6 +66,10 @@ interface Outcome {
   // Browser runs only: the captured Tier-1 metrics (for the perf-budget -> warn
   // comparison). null for HTTP runs (no browser, no metrics).
   metrics: RunMetrics | null;
+  // ★ B1: true when metric capture THREW (caught below → metrics fell back to EMPTY_METRICS). Lets the
+  // verdict distinguish "blind, capture failed" from "captured, metric legitimately absent" — a
+  // perf-budgeted run that couldn't capture must NOT pass (else the green lies).
+  metricsCaptureFailed: boolean;
   // SSL runs only: signed days relative to cert notAfter (+ until / - past
   // expiry). null for non-ssl runs and ssl runs with no cert obtained.
   certDaysRemaining: number | null;
@@ -330,6 +334,7 @@ async function runOne(check: Check): Promise<void> {
     failedStep: null,
     screenshot: null,
     metrics: null,
+    metricsCaptureFailed: false,
     certDaysRemaining: null,
     tracePath: null,
     baselineScreenshot: null,
@@ -393,19 +398,22 @@ async function runOne(check: Check): Promise<void> {
     },
   );
 
-  // Derive 'warn': a run that otherwise PASSED but breached a perf budget is
-  // degraded-but-available. Only browser runs have metrics to compare. This is
-  // what makes the perf_budget_* columns non-inert.
+  // Perf-budget verdict on an otherwise-PASSED browser run (perfBudgetVerdict is pure + unit-tested):
+  //   • a real breach (metric over budget)           → 'warn'  (degraded-but-available; non-inert budgets)
+  //   • ★ B1 — a budget IS configured but metric capture FAILED → 'error'. The run was blind to a budget
+  //     it was meant to enforce; a green that couldn't be measured is a green that lies, so it must NOT
+  //     pass. (A check with no budget, or a successful capture, is unaffected.)
   let status: TerminalStatus = outcome.status;
   let errorMessage = outcome.error;
-  if (status === 'pass' && outcome.metrics) {
-    // ★ Location-aware: a distant vantage (e.g. westus2) gets latency headroom so normal cross-continent
-    // RTT isn't a false perf breach. Page weight is region-independent (not scaled). See perfBudgetBreach.
-    const breach = perfBudgetBreach(check, outcome.metrics, LOCATION);
-    if (breach) {
-      status = 'warn';
-      errorMessage = breach; // record WHY it warned
+  // ★ Location-aware (3rd-region quorum PR): pass LOCATION so a distant vantage (westus2) gets latency
+  // headroom — normal cross-continent RTT isn't a false breach. Page weight stays region-independent.
+  const perf = perfBudgetVerdict(check, status, outcome.metrics, outcome.metricsCaptureFailed, LOCATION);
+  if (perf.status !== status) {
+    if (perf.status === 'error') {
+      console.warn(`[runner] run ${runId} check ${check.id}: ${perf.message}`);
     }
+    status = perf.status;
+    errorMessage = perf.message; // record WHY it warned/errored
   }
 
   // ★ B10: a SENSITIVE monitor (cart/auth) redacts everything trace-derived. Build its redactor once
@@ -592,6 +600,7 @@ async function executeHttp(check: Check): Promise<Outcome> {
     failedStep: null,
     screenshot: null,
     metrics: null,
+    metricsCaptureFailed: false,
     certDaysRemaining: null,
     tracePath: null,
     baselineScreenshot: null,
@@ -610,6 +619,7 @@ async function executeMultistep(check: Check, runId: number): Promise<Outcome> {
     failedStep: r.failedStep,
     screenshot: null,
     metrics: null,
+    metricsCaptureFailed: false,
     certDaysRemaining: null,
     tracePath: null,
     baselineScreenshot: null,
@@ -633,6 +643,7 @@ async function executeNet(check: Check): Promise<Outcome> {
     failedStep: null,
     screenshot: null,
     metrics: null,
+    metricsCaptureFailed: false,
     certDaysRemaining: null,
     tracePath: null,
     baselineScreenshot: null,
@@ -651,6 +662,7 @@ async function executeSsl(check: Check): Promise<Outcome> {
     failedStep: null,
     screenshot: null,
     metrics: null,
+    metricsCaptureFailed: false,
     certDaysRemaining: r.daysRemaining,
     tracePath: null,
     baselineScreenshot: null,
@@ -665,7 +677,7 @@ function infraErrorOutcome(msg: string): Outcome {
   return {
     status: 'infra_error', httpStatus: null, durationMs: 0,
     error: msg, failedStep: null,
-    screenshot: null, metrics: null, certDaysRemaining: null, tracePath: null,
+    screenshot: null, metrics: null, metricsCaptureFailed: false, certDaysRemaining: null, tracePath: null,
     baselineScreenshot: null,
   };
 }
@@ -675,7 +687,7 @@ function errorOutcomeStandalone(msg: string): Outcome {
   return {
     status: 'error', httpStatus: null, durationMs: 0,
     error: msg, failedStep: null,
-    screenshot: null, metrics: null, certDaysRemaining: null, tracePath: null,
+    screenshot: null, metrics: null, metricsCaptureFailed: false, certDaysRemaining: null, tracePath: null,
     baselineScreenshot: null,
   };
 }
@@ -771,6 +783,7 @@ async function executeBrowser(
   let failedStep: string | null = null;
   let screenshot: Buffer | null = null;
   let metrics: RunMetrics;
+  let metricsCaptureFailed = false;
   let tracePath: string | null = null;
   let failed = false;
   let baselineScreenshot: Buffer | null = null;
@@ -824,15 +837,18 @@ async function executeBrowser(
       }
     }
 
-    // Persist one run_metrics row (any outcome) before tearing down the context.
-    // Telemetry must never affect the verdict — swallow everything and fall back
-    // to an all-null row if capture or the write itself throws.
+    // Persist one run_metrics row (any outcome) before tearing down the context. Fall back to an
+    // all-null row if capture or the write itself throws — BUT ★ B1: record that capture FAILED. A
+    // metric VALUE never decides the verdict, but the ABSENCE of metrics on a perf-budgeted check does:
+    // a run that couldn't capture the metrics it's meant to evaluate must not pass as healthy (the
+    // verdict consumes metricsCaptureFailed below). Was: "swallow everything" → the inverted-signal bug.
     try {
       metrics = await capture.collect();
       await writeRunMetrics(runId, metrics);
     } catch (err) {
       console.warn(`[metrics] run ${runId} telemetry capture failed:`, err);
       metrics = EMPTY_METRICS;
+      metricsCaptureFailed = true;
       await writeRunMetrics(runId, EMPTY_METRICS).catch((e) =>
         console.warn(`[metrics] run ${runId} telemetry write failed:`, e),
       );
@@ -848,6 +864,7 @@ async function executeBrowser(
     failedStep,
     screenshot,
     metrics,
+    metricsCaptureFailed,
     certDaysRemaining: null,
     tracePath,
     baselineScreenshot,

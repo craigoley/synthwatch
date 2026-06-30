@@ -7,7 +7,7 @@
 // resolve on the first UP run. Because each check is claimed by exactly one
 // replica per tick (see index.ts) there is no cross-replica race — the DB's
 // partial unique index (one_open_incident_per_check) is a belt-and-braces backstop.
-import { pool, type Check, type RunRecord } from './db.js';
+import { pool, type Check, type RunRecord, type TerminalStatus } from './db.js';
 import type { RunMetrics } from './metrics.js';
 import { dispatchAlerts, resolveChannels } from './alerts.js';
 import { rcaEnabled, runRca } from './rca.js';
@@ -64,6 +64,45 @@ export function perfBudgetBreach(check: Check, m: RunMetrics, location = 'defaul
     );
   }
   return breaches.length > 0 ? `perf budget breached: ${breaches.join('; ')}` : null;
+}
+
+/** True if this check configures ANY perf budget — i.e. metrics are EXPECTED and must be evaluable. A
+ *  check with no budget legitimately needs no metrics; distinguishing it from "has a budget but couldn't
+ *  evaluate it" is the crux of the B1 inverted-signal fix. */
+export function hasPerfBudget(check: Check): boolean {
+  return check.perf_budget_lcp_ms != null || check.perf_budget_transfer_bytes != null;
+}
+
+/**
+ * The perf-budget verdict adjustment for an otherwise-PASSING run (pure; runOne in index.ts delegates
+ * here). Decides the final status:
+ *   • ★ B1 — metricsCaptureFailed AND a budget IS configured → 'error'. The run was BLIND to a budget it
+ *     was supposed to enforce; absence of the signal ≠ the signal is good (a blind run is worse than a
+ *     failing one), so it must NOT record a healthy pass. This OUTRANKS a breach-warn.
+ *   • a real breach (metric present + over budget) → 'warn' (degraded-but-available; unchanged).
+ *   • otherwise (no budget configured, or within budget, or capture succeeded) → unchanged 'pass'.
+ * A non-'pass' base status or null metrics (HTTP runs — no metrics expected) → returned unchanged, so a
+ * legitimately metric-less run is never falsely failed.
+ */
+export function perfBudgetVerdict(
+  check: Check,
+  baseStatus: TerminalStatus,
+  metrics: RunMetrics | null,
+  metricsCaptureFailed: boolean,
+  location = 'default',
+): { status: TerminalStatus; message: string | null } {
+  if (baseStatus !== 'pass' || !metrics) return { status: baseStatus, message: null };
+  if (metricsCaptureFailed && hasPerfBudget(check)) {
+    return {
+      status: 'error',
+      message:
+        'perf budget configured but metric capture failed — run could not be evaluated; recording error, not a blind pass',
+    };
+  }
+  // location-aware: a distant vantage's LCP budget carries latency headroom (see perfBudgetBreach).
+  const breach = perfBudgetBreach(check, metrics, location);
+  if (breach) return { status: 'warn', message: breach };
+  return { status: 'pass', message: null };
 }
 
 // Channel routing now lives in the DB (channels + alert_routes), resolved by
