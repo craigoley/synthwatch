@@ -11,11 +11,14 @@ import {
   fetchManifest,
   computeDrift,
   b10FieldUpdates,
+  computeApplyPlan,
   manifestUrl,
   type Monitor,
   type ManagedCheck,
   type DriftRow,
+  type ApplyPlanRow,
 } from './reconcile.js';
+import { activeLocations } from './locations.js';
 import { probeSpecsFromPool, type SpecProbe } from './specfetch/specCache.js';
 
 /** Read the Git-managed checks (source_key set). Unmanaged rows are intentionally excluded. */
@@ -45,6 +48,44 @@ async function persistDrift(rows: DriftRow[]): Promise<void> {
          VALUES ($1, $2, $3::jsonb, now())`,
         [r.source_key, r.drift_type, JSON.stringify(r.detail)],
       );
+    }
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Persist the dry-run apply plan (Phase 0). UPSERT on (source_key, drift_type) so a re-compute updates the
+ * plan in place — and, in Phase 1, an approve/reject state on that row survives the re-run; plus DELETE any
+ * plan whose drift resolved (no longer in the set). Idempotent. This is the ONLY write Phase 0 adds, and it
+ * touches ONLY reconcile_apply_plan — never checks/check_locations.
+ */
+async function persistApplyPlan(plans: ApplyPlanRow[]): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    if (plans.length === 0) {
+      await client.query('DELETE FROM reconcile_apply_plan');
+    } else {
+      // Drop plans whose (source_key, drift_type) is no longer a current drift.
+      const keys = plans.map((p) => `${p.source_key} ${p.drift_type}`);
+      await client.query(
+        `DELETE FROM reconcile_apply_plan WHERE (source_key || ' ' || drift_type) <> ALL($1::text[])`,
+        [keys],
+      );
+      for (const p of plans) {
+        await client.query(
+          `INSERT INTO reconcile_apply_plan (source_key, drift_type, status, plan, computed_at)
+           VALUES ($1, $2, $3, $4::jsonb, now())
+           ON CONFLICT (source_key, drift_type)
+             DO UPDATE SET status = EXCLUDED.status, plan = EXCLUDED.plan, computed_at = now()`,
+          [p.source_key, p.drift_type, p.status, JSON.stringify(p.plan)],
+        );
+      }
     }
     await client.query('COMMIT');
   } catch (err) {
@@ -117,6 +158,23 @@ async function main(): Promise<void> {
 
   const drift = computeDrift(manifest.monitors, managed, specRunnable);
   await persistDrift(drift);
+
+  // ★ RECONCILE-APPLY PHASE 0 (DRY-RUN): compute the apply PLAN per drift + persist it to
+  // reconcile_apply_plan. ★★ NOTHING is applied to checks/check_locations — buildApplyUpsert /
+  // assignDefaultLocations are NOT executed (computeApplyPlan only RENDERS their SQL). The ONLY new write
+  // is the plan record. Never-throw: a plan-compute failure must not break the detect path that works.
+  try {
+    const plans = computeApplyPlan(manifest.monitors, drift, await activeLocations());
+    await persistApplyPlan(plans);
+    const blocked = plans.filter((p) => p.status === 'blocked').length;
+    console.log(
+      `[reconcile] apply-plan (DRY-RUN): computed ${plans.length} plan(s)` +
+        (blocked > 0 ? `, ${blocked} BLOCKED (redaction-strip)` : '') +
+        ' — NOTHING applied to checks/check_locations',
+    );
+  } catch (err) {
+    console.warn('[reconcile] apply-plan compute failed (non-fatal; detect path unaffected):', err);
+  }
 
   // ★ SCOPED B10 SYNC — the ONLY thing reconcile writes to `checks`. The full git-authoritative apply
   // (buildApplyUpsert) stays GATED OFF; this corrects ONLY the sensitive/redact_patterns SAFETY control

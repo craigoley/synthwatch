@@ -531,6 +531,21 @@ CREATE TABLE reconcile_drift (
     PRIMARY KEY (source_key, drift_type)
 );
 
+-- reconcile_apply_plan (0051): the DRY-RUN apply plan (reconcile-apply Phase 0). Per drift row, the exact
+-- statement(s) apply WOULD run, persisted read-only — NOTHING is applied to checks/check_locations. Separate
+-- from reconcile_drift (which is full-reloaded each run) so the plan + its future approve/reject state survive.
+CREATE TABLE reconcile_apply_plan (
+    id          bigserial   PRIMARY KEY,
+    source_key  text        NOT NULL,
+    drift_type  text        NOT NULL
+                            CHECK (drift_type IN ('new', 'changed', 'missing', 'orphan', 'redaction_mismatch')),
+    status      text        NOT NULL DEFAULT 'pending'
+                            CHECK (status IN ('pending', 'auto', 'blocked', 'noop', 'approved', 'rejected', 'applied')),
+    plan        jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    computed_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (source_key, drift_type)
+);
+
 -- ---------------------------------------------------------------------------
 -- spec_cache: durable runtime-spec cache (mirrors 0034_spec_cache.sql, Phase 6b Option C).
 -- The runner cold-starts every 5 min, so the spec cache lives in Postgres. Per due check the runner

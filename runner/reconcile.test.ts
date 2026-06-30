@@ -11,6 +11,7 @@ import {
   computeDrift,
   buildApplyUpsert,
   b10FieldUpdates,
+  computeApplyPlan,
   fetchManifest,
   GIT_AUTHORITATIVE_COLUMNS,
   SEED_ONLY_COLUMNS,
@@ -404,4 +405,66 @@ test('back-compat: a NON-B10 changed drift (name only) is unchanged — no redac
     ['changed'],
   );
   assert.equal(rows.find((r) => r.drift_type === 'redaction_mismatch'), undefined);
+});
+
+// ─── RECONCILE-APPLY PHASE 0: computeApplyPlan (DRY-RUN — renders statements, executes nothing) ───────
+const REGIONS = ['eastus2', 'centralus', 'westus2'];
+
+test('★ apply-plan: a NEW drift → materialize-DISABLED (enabled=false), sensitive INLINE, status pending', () => {
+  const m = monitor({ sensitive: true, redact_patterns: ['eyJ.+'] });
+  const plans = computeApplyPlan([m], [{ source_key: m.id, drift_type: 'new', detail: {} }], REGIONS);
+  assert.equal(plans.length, 1);
+  const p = plans[0];
+  assert.equal(p.status, 'pending');
+  assert.match(p.plan.summary, /MATERIALIZE/);
+  assert.match(p.plan.summary, /enabled=FALSE/);
+  assert.match(p.plan.summary, /sensitive=true/);
+  // the materialize statement is the buildApplyUpsert INSERT, with sensitive inline + enabled forced false.
+  const matStmt = p.plan.statements.find((s) => s.purpose.includes('materialize'))!;
+  assert.match(matStmt.text, /INSERT INTO checks/);
+  assert.match(matStmt.text, /sensitive/);
+  // insert column order: source_key,name,kind,target_url,flow_name,sensitive,redact_patterns,interval,enabled
+  assert.equal(matStmt.values![5], true, 'sensitive=true inline in the INSERT values');
+  assert.equal(matStmt.values![8], false, '★ enabled FORCED false (materialize-disabled)');
+  // and the location-assignment statement carries the active regions.
+  const locStmt = p.plan.statements.find((s) => s.purpose.includes('locations'))!;
+  assert.deepEqual(locStmt.regions, REGIONS);
+});
+
+test('apply-plan: a CHANGED drift → git-auth UPDATE listing the differing fields, status pending', () => {
+  const m = monitor({ name: 'New name' });
+  const plan = computeApplyPlan([m], [{ source_key: m.id, drift_type: 'changed', detail: { fields: { name: { git: 'New name', live: 'Old' } } } }], REGIONS)[0];
+  assert.equal(plan.status, 'pending');
+  assert.match(plan.plan.summary, /UPDATE git-authoritative field\(s\) \[name\]/);
+  assert.match(plan.plan.statements[0].text, /ON CONFLICT \(source_key\) DO UPDATE/);
+});
+
+test('apply-plan: a redaction_mismatch (manifest WANTS sensitive) → status "auto" (already #144), not pending', () => {
+  const m = monitor({ sensitive: true });
+  const plan = computeApplyPlan([m], [{ source_key: m.id, drift_type: 'redaction_mismatch', detail: { fields: { sensitive: { git: true, live: false } } } }], REGIONS)[0];
+  assert.equal(plan.status, 'auto');
+  assert.match(plan.plan.summary, /AUTO-APPLIED/);
+  assert.equal(plan.plan.statements.length, 0, 'auto items propose no human-approval statement');
+});
+
+test('★ apply-plan: a redaction_mismatch STRIP (sensitive true→false) → status BLOCKED with reason', () => {
+  const m = monitor({ sensitive: false }); // manifest dropped sensitive...
+  const plan = computeApplyPlan([m], [{ source_key: m.id, drift_type: 'redaction_mismatch', detail: { fields: { sensitive: { git: false, live: true } } } }], REGIONS)[0];
+  assert.equal(plan.status, 'blocked', '★ reconcile may NEVER strip redaction');
+  assert.match(plan.plan.summary, /BLOCKED|STRIP/);
+  assert.match(plan.plan.blockedReason ?? '', /cannot strip redaction/i);
+});
+
+test('apply-plan: a MISSING drift → soft-disable (enabled=false), never delete, status pending', () => {
+  const plan = computeApplyPlan([], [{ source_key: 'gone', drift_type: 'missing', detail: { name: 'x' } }], REGIONS)[0];
+  assert.equal(plan.status, 'pending');
+  assert.match(plan.plan.summary, /SOFT-DISABLE/);
+  assert.match(plan.plan.statements[0].text, /SET enabled = false/);
+  assert.doesNotMatch(plan.plan.statements[0].text, /DELETE/);
+});
+
+test('apply-plan: an ORPHAN drift → noop (no apply, spec not runnable)', () => {
+  const plan = computeApplyPlan([], [{ source_key: 'x', drift_type: 'orphan', detail: { reason: 'not fetchable: 404' } }], REGIONS)[0];
+  assert.equal(plan.status, 'noop');
+  assert.equal(plan.plan.statements.length, 0);
 });
