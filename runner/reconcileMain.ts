@@ -82,7 +82,17 @@ async function persistApplyPlan(plans: ApplyPlanRow[]): Promise<void> {
           `INSERT INTO reconcile_apply_plan (source_key, drift_type, status, plan, computed_at)
            VALUES ($1, $2, $3, $4::jsonb, now())
            ON CONFLICT (source_key, drift_type)
-             DO UPDATE SET status = EXCLUDED.status, plan = EXCLUDED.plan, computed_at = now()`,
+             DO UPDATE SET
+               -- ★ Phase 1: PRESERVE a human/apply decision across a re-compute — only re-set the
+               -- auto-computed disposition (pending/auto/blocked/noop). Without this, the next reconcile
+               -- tick would reset an 'approved'/'applied' plan back to 'pending' and lose the decision.
+               status = CASE
+                 WHEN reconcile_apply_plan.status IN ('approved', 'rejected', 'applied')
+                   THEN reconcile_apply_plan.status
+                 ELSE EXCLUDED.status
+               END,
+               plan = EXCLUDED.plan,
+               computed_at = now()`,
           [p.source_key, p.drift_type, p.status, JSON.stringify(p.plan)],
         );
       }

@@ -543,6 +543,10 @@ CREATE TABLE reconcile_apply_plan (
                             CHECK (status IN ('pending', 'auto', 'blocked', 'noop', 'approved', 'rejected', 'applied')),
     plan        jsonb       NOT NULL DEFAULT '{}'::jsonb,
     computed_at timestamptz NOT NULL DEFAULT now(),
+    -- Phase 1 (0052): who decided + when applied (the at-a-glance audit columns; the audit_log has the rest).
+    decided_at  timestamptz,
+    decided_by  text,
+    applied_at  timestamptz,
     UNIQUE (source_key, drift_type)
 );
 

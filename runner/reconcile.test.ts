@@ -224,7 +224,7 @@ test('apply upsert NEVER writes dashboard-owned columns', () => {
 
 test('apply upsert conflict-targets source_key and seeds the right values', () => {
   const { text, values } = buildApplyUpsert(monitor({ suggestedIntervalSeconds: undefined }));
-  assert.match(text, /ON CONFLICT \(source_key\) DO UPDATE/);
+  assert.match(text, /ON CONFLICT \(source_key\) WHERE source_key IS NOT NULL DO UPDATE/);
   // values order = [source_key, name, kind, target_url, flow_name, sensitive, redact_patterns, interval, enabled]
   assert.deepEqual(values, [
     'wegmans-search-product',
@@ -436,7 +436,7 @@ test('apply-plan: a CHANGED drift → git-auth UPDATE listing the differing fiel
   const plan = computeApplyPlan([m], [{ source_key: m.id, drift_type: 'changed', detail: { fields: { name: { git: 'New name', live: 'Old' } } } }], REGIONS)[0];
   assert.equal(plan.status, 'pending');
   assert.match(plan.plan.summary, /UPDATE git-authoritative field\(s\) \[name\]/);
-  assert.match(plan.plan.statements[0].text, /ON CONFLICT \(source_key\) DO UPDATE/);
+  assert.match(plan.plan.statements[0].text, /ON CONFLICT \(source_key\) WHERE source_key IS NOT NULL DO UPDATE/);
 });
 
 test('apply-plan: a redaction_mismatch (manifest WANTS sensitive) → status "auto" (already #144), not pending', () => {
