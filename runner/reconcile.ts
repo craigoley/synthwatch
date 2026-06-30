@@ -113,6 +113,21 @@ export function specPathForSourceKey(monitors: Monitor[], sourceKey: string): st
   return monitor.script;
 }
 
+/**
+ * Non-throwing predicate: does this script resolve to a valid runtime spec_path? Reuses the runtime
+ * fetch guard (assertValidSpecPath) — one source of truth for "what the runner can fetch + compile",
+ * not a second regex. Used by computeApplyPlan to fail-closed (status 'blocked') instead of throwing
+ * mid-plan when a browser monitor's script isn't a resolvable spec.
+ */
+export function isResolvableSpec(script: string): boolean {
+  try {
+    assertValidSpecPath(script);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Validate a parsed manifest against the schema invariants; throw on the first violation. */
 export function validateManifest(raw: unknown): Manifest {
   if (typeof raw !== 'object' || raw === null) {
@@ -360,8 +375,17 @@ export function buildApplyUpsert(monitor: Monitor): {
   updateColumns: string[];
 } {
   const flow = flowNameFor(monitor);
-  // INSERT column order: identity, then Git-authoritative, then seed-only.
-  const insertColumns = ['source_key', ...GIT_AUTHORITATIVE_COLUMNS, ...SEED_ONLY_COLUMNS];
+  // ★ spec_path is the REAL runtime resolution path for a browser check: the runner fetches +
+  // compiles this Git spec (executeBrowser's spec_path branch). flow_name is only a fallback to a
+  // baked-in dist/checks/<name>.js, which a manifest monitor never has — so a materialize that omits
+  // spec_path produces a check that can ONLY fail ("Cannot find module .../<flow_name>.js"). The
+  // manifest `script` IS the spec path (validated at parse time; re-asserted here, same guard as
+  // specPathForSourceKey). spec_path is appended LAST so `enabled` keeps index 8 (computeApplyPlan
+  // forces it false by that index).
+  assertValidSpecPath(monitor.script);
+  const specPath = monitor.script;
+  // INSERT column order: identity, Git-authoritative, seed-only, then spec_path.
+  const insertColumns = ['source_key', ...GIT_AUTHORITATIVE_COLUMNS, ...SEED_ONLY_COLUMNS, 'spec_path'];
   const values: unknown[] = [
     monitor.id, // source_key
     monitor.name,
@@ -372,10 +396,13 @@ export function buildApplyUpsert(monitor: Monitor): {
     JSON.stringify(monitor.redact_patterns ?? null), // redact_patterns (jsonb; assignment-cast from text)
     monitor.suggestedIntervalSeconds ?? DEFAULT_INTERVAL_SECONDS,
     monitor.enabledByDefault ?? false,
+    specPath, // spec_path (index 9) — re-synced on conflict so an existing NULL row self-heals on re-apply.
   ];
   const placeholders = insertColumns.map((_, i) => `$${i + 1}`).join(', ');
-  // ON CONFLICT updates the Git-authoritative columns ONLY (seed-only + dashboard-owned excluded).
-  const updateColumns = [...GIT_AUTHORITATIVE_COLUMNS];
+  // ON CONFLICT updates the Git-authoritative columns + spec_path (seed-only + dashboard-owned excluded).
+  // spec_path is Git-derived (the manifest script), so re-syncing it on conflict is correct and lets a
+  // re-apply repair a check materialized before this fix (spec_path NULL → the manifest's spec path).
+  const updateColumns = [...GIT_AUTHORITATIVE_COLUMNS, 'spec_path'];
   const setClause = updateColumns.map((c) => `${c} = EXCLUDED.${c}`).join(', ');
 
   const text =
@@ -480,6 +507,28 @@ export function computeApplyPlan(
     const m = byId.get(d.source_key);
     if (d.drift_type === 'new') {
       if (!m) continue;
+      // ★ FAIL-CLOSED spec-resolution gate (BEFORE buildApplyUpsert, which throws on a bad script): a browser
+      // check resolves at runtime ONLY via its spec_path (the Git spec the runner fetches + compiles).
+      // flow_name is a fallback to a baked-in dist/checks/<name>.js, which a manifest monitor never has — so
+      // materializing a browser check whose script isn't a resolvable spec produces a check that can ONLY fail
+      // ("Cannot find module"). Refuse it (status 'blocked') rather than ship a broken check or crash the whole
+      // plan on the throw. This is the gate the recipe-search incident needed: no unresolvable browser
+      // materialize ever reaches 'pending'/apply.
+      if (m.kind === 'browser' && !isResolvableSpec(m.script)) {
+        rows.push({
+          source_key: d.source_key,
+          drift_type: 'new',
+          status: 'blocked',
+          plan: {
+            disposition: 'blocked',
+            summary: 'BLOCKED: would materialize a browser check whose spec_path cannot resolve in the runner.',
+            statements: [],
+            blockedReason:
+              `browser check spec is not resolvable (script=${JSON.stringify(m.script)}); materializing it would create a check that can only fail with "Cannot find module".`,
+          },
+        });
+        continue;
+      }
       const upsert = buildApplyUpsert(m);
       // ★ materialize-DISABLED: force `enabled` (the last insert column) to false regardless of the
       // manifest's enabledByDefault — activate only after a verified-clean run (the B10 close-out pattern).
