@@ -55,7 +55,10 @@ export interface ManagedCheck {
   redact_patterns: string[] | null;
 }
 
-export type DriftType = 'new' | 'changed' | 'missing' | 'orphan';
+// 'redaction_mismatch' (0049): a sensitive/redact_patterns divergence — kept SEPARATE from generic
+// 'changed' so the B10 leak shape ("manifest declares sensitive, live check doesn't") is distinctly
+// queryable on /reconcile/drift. #144's scoped sync auto-corrects it; this row is the audit trail.
+export type DriftType = 'new' | 'changed' | 'missing' | 'orphan' | 'redaction_mismatch';
 
 export interface DriftRow {
   source_key: string;
@@ -289,16 +292,25 @@ export function computeDrift(
       diff.target_url = { git: m.target, live: existing.target_url };
     }
     if (existing.flow_name !== flow) diff.flow_name = { git: flow, live: existing.flow_name };
-    // B10 detection (read-only): surface a sensitive/redact_patterns divergence in reconcile_drift so
-    // the leak is auditable. (The scoped sync below is what actually corrects it — see b10FieldUpdates.)
-    if ((m.sensitive ?? false) !== existing.sensitive) {
-      diff.sensitive = { git: m.sensitive ?? false, live: existing.sensitive };
-    }
-    if (JSON.stringify(m.redact_patterns ?? null) !== JSON.stringify(existing.redact_patterns ?? null)) {
-      diff.redact_patterns = { git: m.redact_patterns ?? null, live: existing.redact_patterns ?? null };
-    }
     if (Object.keys(diff).length > 0) {
       rows.push({ source_key: m.id, drift_type: 'changed', detail: { fields: diff } });
+    }
+
+    // REDACTION_MISMATCH (B10) — a sensitive/redact_patterns divergence is its OWN drift_type, not part
+    // of generic 'changed', so "manifest declares sensitive but the live check doesn't" (the leak shape)
+    // is distinctly queryable/renderable on /reconcile/drift. #144's b10FieldUpdates auto-corrects it on
+    // the same run; this row documents what was corrected. Same detail shape as 'changed' (per-field
+    // git/live), so the endpoint + dashboard render it with the existing diff view. A monitor can yield
+    // BOTH a 'changed' (name/etc.) and a 'redaction_mismatch' row — the PK is (source_key, drift_type).
+    const redactionDiff: Record<string, { git: unknown; live: unknown }> = {};
+    if ((m.sensitive ?? false) !== existing.sensitive) {
+      redactionDiff.sensitive = { git: m.sensitive ?? false, live: existing.sensitive };
+    }
+    if (JSON.stringify(m.redact_patterns ?? null) !== JSON.stringify(existing.redact_patterns ?? null)) {
+      redactionDiff.redact_patterns = { git: m.redact_patterns ?? null, live: existing.redact_patterns ?? null };
+    }
+    if (Object.keys(redactionDiff).length > 0) {
+      rows.push({ source_key: m.id, drift_type: 'redaction_mismatch', detail: { fields: redactionDiff } });
     }
   }
 

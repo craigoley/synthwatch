@@ -525,7 +525,7 @@ CREATE TABLE flow_manifest (
 CREATE TABLE reconcile_drift (
     source_key  text        NOT NULL,
     drift_type  text        NOT NULL
-                            CHECK (drift_type IN ('new', 'changed', 'missing', 'orphan')),
+                            CHECK (drift_type IN ('new', 'changed', 'missing', 'orphan', 'redaction_mismatch')),
     detail      jsonb       NOT NULL DEFAULT '{}'::jsonb,
     detected_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (source_key, drift_type)
