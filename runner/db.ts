@@ -50,6 +50,16 @@ export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
 });
 
+// ★ POOL-ERROR: pg emits an 'error' on the Pool when an IDLE backend connection drops (server restart,
+// network blip, an Azure Postgres failover) BETWEEN queries. With NO listener, Node treats it as an
+// unhandled 'error' event -> uncaughtException -> the whole tick dies (now visible via #149's handler,
+// but it still kills the tick over a transient idle-conn blip). Logging it makes it non-fatal: pg discards
+// the dead client and the next query checks out a fresh one. (No recordFatal: that writes to the DB, which
+// is the thing that just blipped, and would create a db.ts <-> runnerErrors.ts import cycle.)
+pool.on('error', (err) => {
+  console.error('[db] idle client error (non-fatal; next query gets a fresh connection):', err.message);
+});
+
 /** The full run-status taxonomy (mirrors the runs.status CHECK constraint).
  *
  * 'infra_error' (Phase 6b Option C): the runner could NOT obtain the spec to run a browser
