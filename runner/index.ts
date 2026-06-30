@@ -405,7 +405,9 @@ async function runOne(check: Check): Promise<void> {
   //     pass. (A check with no budget, or a successful capture, is unaffected.)
   let status: TerminalStatus = outcome.status;
   let errorMessage = outcome.error;
-  const perf = perfBudgetVerdict(check, status, outcome.metrics, outcome.metricsCaptureFailed);
+  // ★ Location-aware (3rd-region quorum PR): pass LOCATION so a distant vantage (westus2) gets latency
+  // headroom — normal cross-continent RTT isn't a false breach. Page weight stays region-independent.
+  const perf = perfBudgetVerdict(check, status, outcome.metrics, outcome.metricsCaptureFailed, LOCATION);
   if (perf.status !== status) {
     if (perf.status === 'error') {
       console.warn(`[runner] run ${runId} check ${check.id}: ${perf.message}`);
