@@ -74,6 +74,25 @@ export function hasPerfBudget(check: Check): boolean {
 }
 
 /**
+ * ★ B1 silent-null: did a metric the check has a BUDGET for fail to CAPTURE? `captureFailed` (from
+ * metrics.collect()) holds fields whose collection section threw → null-because-failed. A budgeted metric
+ * in that set is not-evaluable, exactly like the #146 throw path, so the run must NOT pass green.
+ * Crucially, a budgeted metric that is null but NOT in the set was captured-and-legitimately-absent (a
+ * page that genuinely fires no LCP) → returns false → still passes. This is the line that must not be
+ * crossed. Per-budgeted-metric (not a blanket "any capture failed"), so a transfer-capture failure on an
+ * LCP-only-budgeted check is not a false error.
+ */
+export function budgetedMetricCaptureFailed(
+  check: Check,
+  captureFailed: ReadonlySet<keyof RunMetrics>,
+): boolean {
+  return (
+    (check.perf_budget_lcp_ms != null && captureFailed.has('lcpMs')) ||
+    (check.perf_budget_transfer_bytes != null && captureFailed.has('transferBytes'))
+  );
+}
+
+/**
  * The perf-budget verdict adjustment for an otherwise-PASSING run (pure; runOne in index.ts delegates
  * here). Decides the final status:
  *   • ★ B1 — metricsCaptureFailed AND a budget IS configured → 'error'. The run was BLIND to a budget it

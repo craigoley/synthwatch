@@ -43,7 +43,13 @@ import { makeRedactor, IDENTITY_REDACTOR, tracePersistPlan, sensitiveErrorMessag
 import os from 'node:os';
 import path from 'node:path';
 import { unlink } from 'node:fs/promises';
-import { evaluate, maybeBurnAlert, perfBudgetVerdict, hasOpenIncident } from './evaluate.js';
+import {
+  evaluate,
+  maybeBurnAlert,
+  perfBudgetVerdict,
+  budgetedMetricCaptureFailed,
+  hasOpenIncident,
+} from './evaluate.js';
 import {
   startMetricsCapture,
   writeRunMetrics,
@@ -853,8 +859,20 @@ async function executeBrowser(
     // a run that couldn't capture the metrics it's meant to evaluate must not pass as healthy (the
     // verdict consumes metricsCaptureFailed below). Was: "swallow everything" → the inverted-signal bug.
     try {
-      metrics = await capture.collect();
+      const result = await capture.collect();
+      metrics = result.metrics;
       await writeRunMetrics(runId, metrics);
+      // ★ B1 silent-null: collect() does NOT throw, so the catch below only covers the rare hard-throw
+      // path (#146). A budgeted metric whose capture SECTION failed (returned null without throwing) is
+      // ALSO not-evaluable — treat it like the throw path so the run can't pass green while blind. A
+      // budgeted metric that's null but was captured (legitimately absent, e.g. no LCP) is NOT flagged.
+      if (budgetedMetricCaptureFailed(check, result.captureFailed)) {
+        metricsCaptureFailed = true;
+        console.warn(
+          `[metrics] run ${runId} check ${check.id}: a perf-budgeted metric failed to capture ` +
+            `(silent null, no throw) — recording not-evaluable, not a blind pass`,
+        );
+      }
     } catch (err) {
       console.warn(`[metrics] run ${runId} telemetry capture failed:`, err);
       metrics = EMPTY_METRICS;
