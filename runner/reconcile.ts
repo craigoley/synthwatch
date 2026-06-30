@@ -422,3 +422,149 @@ export function b10FieldUpdates(monitors: Monitor[], managed: ManagedCheck[]): B
   }
   return updates;
 }
+
+// ---------------------------------------------------------------------------
+// RECONCILE-APPLY PHASE 0 — DRY-RUN PLAN. For each drift row, compute the EXACT statement(s) apply WOULD
+// run, WITHOUT executing them. Pure (buildApplyUpsert builds text+values without touching the DB;
+// activeLocations is passed in). NOTHING here writes to checks/check_locations — reconcileMain persists
+// the returned plans to reconcile_apply_plan only. This is the precondition for the Phase 1 approval gate.
+// ---------------------------------------------------------------------------
+
+/** A planned SQL statement apply WOULD run (rendered, not executed). */
+export interface PlanStatement {
+  purpose: string;
+  text: string;
+  values?: unknown[];
+  regions?: string[]; // for the location-assignment statement
+}
+
+export type PlanDisposition = 'pending' | 'auto' | 'blocked' | 'noop';
+
+/** The dry-run plan for one drift row (mirrors a reconcile_apply_plan row). */
+export interface ApplyPlanRow {
+  source_key: string;
+  drift_type: DriftType;
+  status: PlanDisposition;
+  plan: {
+    summary: string;
+    disposition: PlanDisposition;
+    statements: PlanStatement[];
+    blockedReason?: string;
+  };
+}
+
+/**
+ * Compute the apply plan per drift row — the dry-run. Decisions baked in (per the approved design):
+ *   new                → MATERIALIZE, enabled FORCED false (materialize-disabled), sensitive INLINE in the
+ *                        INSERT (no non-sensitive window) + assign the active locations. status 'pending'.
+ *   changed            → git-authoritative ON CONFLICT UPDATE of the differing field(s). status 'pending'.
+ *   missing            → SOFT-DISABLE (enabled=false), never hard-delete. status 'pending'.
+ *   orphan             → no apply (spec not runnable). status 'noop'.
+ *   redaction_mismatch → already AUTO-applied (#144); status 'auto' (informational). ★ EXCEPT a STRIP
+ *                        (manifest sensitive=false while live sensitive=true) → status 'blocked':
+ *                        reconcile may NEVER remove redaction (the fail-safe).
+ * Pure + never executes — buildApplyUpsert only renders SQL text+values here.
+ */
+export function computeApplyPlan(
+  monitors: Monitor[],
+  drift: DriftRow[],
+  activeLocations: string[],
+): ApplyPlanRow[] {
+  const byId = new Map(monitors.map((m) => [m.id, m]));
+  const rows: ApplyPlanRow[] = [];
+
+  for (const d of drift) {
+    const m = byId.get(d.source_key);
+    if (d.drift_type === 'new') {
+      if (!m) continue;
+      const upsert = buildApplyUpsert(m);
+      // ★ materialize-DISABLED: force `enabled` (the last insert column) to false regardless of the
+      // manifest's enabledByDefault — activate only after a verified-clean run (the B10 close-out pattern).
+      const values = [...upsert.values];
+      const enabledIdx = upsert.insertColumns.indexOf('enabled');
+      if (enabledIdx >= 0) values[enabledIdx] = false;
+      const sensitive = m.sensitive ?? false;
+      rows.push({
+        source_key: d.source_key,
+        drift_type: 'new',
+        status: 'pending',
+        plan: {
+          disposition: 'pending',
+          summary: `would MATERIALIZE check (sensitive=${sensitive} inline, enabled=FALSE) + assign locations [${activeLocations.join(', ')}]`,
+          statements: [
+            { purpose: 'materialize check (sensitive inline; enabled forced FALSE)', text: upsert.text, values },
+            {
+              purpose: 'assign default locations (after the check exists)',
+              text: 'INSERT INTO check_locations (check_id, location) SELECT <new check id>, name FROM locations WHERE enabled ON CONFLICT (check_id, location) DO NOTHING',
+              regions: activeLocations,
+            },
+          ],
+        },
+      });
+    } else if (d.drift_type === 'changed') {
+      if (!m) continue;
+      const fields = Object.keys((d.detail.fields as Record<string, unknown>) ?? {});
+      const upsert = buildApplyUpsert(m); // its ON CONFLICT UPDATE is exactly the changed-field sync
+      rows.push({
+        source_key: d.source_key,
+        drift_type: 'changed',
+        status: 'pending',
+        plan: {
+          disposition: 'pending',
+          summary: `would UPDATE git-authoritative field(s) [${fields.join(', ')}] to match the manifest (ON CONFLICT)`,
+          statements: [{ purpose: 'git-auth field sync (ON CONFLICT DO UPDATE)', text: upsert.text, values: upsert.values }],
+        },
+      });
+    } else if (d.drift_type === 'redaction_mismatch') {
+      const f = (d.detail.fields as Record<string, { git?: unknown; live?: unknown }>) ?? {};
+      const isStrip = f.sensitive?.git === false && f.sensitive?.live === true;
+      if (isStrip) {
+        rows.push({
+          source_key: d.source_key,
+          drift_type: 'redaction_mismatch',
+          status: 'blocked',
+          plan: {
+            disposition: 'blocked',
+            summary: 'BLOCKED: would STRIP redaction (sensitive true→false). reconcile may never un-sensitive a check.',
+            statements: [],
+            blockedReason:
+              'reconcile cannot strip redaction (sensitive true→false) — the B10 fail-safe; only an explicit dashboard action may.',
+          },
+        });
+      } else {
+        rows.push({
+          source_key: d.source_key,
+          drift_type: 'redaction_mismatch',
+          status: 'auto',
+          plan: {
+            disposition: 'auto',
+            summary:
+              'already AUTO-APPLIED (#144 b10FieldUpdates corrects sensitive/redact_patterns each reconcile) — informational, no human approval needed.',
+            statements: [],
+          },
+        });
+      }
+    } else if (d.drift_type === 'missing') {
+      rows.push({
+        source_key: d.source_key,
+        drift_type: 'missing',
+        status: 'pending',
+        plan: {
+          disposition: 'pending',
+          summary: 'would SOFT-DISABLE (enabled=false); never hard-delete.',
+          statements: [{ purpose: 'soft-disable', text: 'UPDATE checks SET enabled = false WHERE source_key = $1', values: [d.source_key] }],
+        },
+      });
+    } else {
+      // orphan
+      const reason = (d.detail.reason as string) ?? 'spec not runnable';
+      rows.push({
+        source_key: d.source_key,
+        drift_type: 'orphan',
+        status: 'noop',
+        plan: { disposition: 'noop', summary: `no apply (${reason})`, statements: [] },
+      });
+    }
+  }
+  return rows;
+}
