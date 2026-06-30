@@ -260,7 +260,10 @@ CREATE TABLE runs (
     -- The location (vantage point) that produced this run, from the runner's
     -- SYNTHWATCH_LOCATION (mirrors 0014_multi_location.sql). DEFAULT 'default' so
     -- a single-region deploy uses one location and behaves exactly as before.
-    location       TEXT NOT NULL DEFAULT 'default'
+    location       TEXT NOT NULL DEFAULT 'default',
+    -- The PUBLIC egress IP the runner left from (static-egress-IP Phase 0; mirrors 0054_runs_egress_ip.sql).
+    -- Best-effort/fail-soft (NULL when the reflector was unreachable); NOT sensitive (our own infra IP).
+    egress_ip      TEXT
 );
 
 -- Hot path: "latest N runs for this check, newest first" (status pages, the
