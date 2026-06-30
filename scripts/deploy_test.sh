@@ -340,6 +340,49 @@ run_drift_tests() {
 }
 run_drift_tests
 
+# ===========================================================================
+# F. ★ FIX 3 — ci_wait_verdict (the pure per-tick decision of the CI-wait loop). Proves BOTH
+#    directions: it PROCEEDs only when the target is actually built, REFUSEs on a real CI failure
+#    (so DB-ahead-of-code is never auto-shipped), and otherwise WAITs.
+# ===========================================================================
+expect_eq "ci-wait proceeds when target built"          "proceed" "$(ci_wait_verdict 1 '')"
+expect_eq "ci-wait proceeds even if gh unknown + built" "proceed" "$(ci_wait_verdict 1 in_progress)"
+expect_eq "ci-wait waits while CI in_progress"          "wait"    "$(ci_wait_verdict 0 in_progress)"
+expect_eq "ci-wait waits when no run found yet"         "wait"    "$(ci_wait_verdict 0 '')"
+# ★ success-but-image-not-yet-pushed → keep waiting (only a PRESENT image proceeds, never a predating one).
+expect_eq "ci-wait waits on success w/o image yet"      "wait"    "$(ci_wait_verdict 0 success)"
+# ★ a REAL CI failure refuses NOW — the guard against auto-deploying past a failed build.
+expect_eq "ci-wait REFUSES on CI failure"               "refuse"  "$(ci_wait_verdict 0 failure)"
+expect_eq "ci-wait REFUSES on CI cancelled"             "refuse"  "$(ci_wait_verdict 0 cancelled)"
+expect_eq "ci-wait REFUSES on CI timed_out"             "refuse"  "$(ci_wait_verdict 0 timed_out)"
+
+# ===========================================================================
+# G. ★ FIX 1 — retry_nonempty (the verify mid-reconciliation false-empty fix). Proves BOTH directions:
+#    a transient empty that LATER returns a value is absorbed (PASS), but a value that stays empty
+#    across all retries is returned empty (so the caller's check still FLUNKS — guard kept).
+# ===========================================================================
+run_retry_tests() {
+  export VERIFY_READ_TRIES=4 VERIFY_READ_SLEEP=0
+  # shellcheck disable=SC2317,SC2329  # stub invoked indirectly; shellcheck can't see it
+  sleep() { :; }   # no real waiting in tests
+  # The reader runs in a command-substitution SUBSHELL each call, so the call counter must live in a
+  # FILE (a plain var wouldn't persist across the subshells). statef holds the call count.
+  local statef; statef="$(mktemp)"; printf '0' > "${statef}"
+  export STATEF="${statef}"
+  # (a) empty on tries 1-2, then 'acs-email-conn' on the 3rd — the mid-reconciliation transient → absorbed.
+  # shellcheck disable=SC2317,SC2329
+  _read_transient() { local n; n=$(< "${STATEF}"); n=$((n + 1)); printf '%s' "${n}" > "${STATEF}"; (( n >= 3 )) && printf 'acs-email-conn'; }
+  export -f _read_transient
+  expect_eq "retry absorbs a transient empty" "acs-email-conn" "$(retry_nonempty _read_transient)"
+  # (b) ALWAYS empty (a genuinely-missing/wiped ref) → stays empty → caller flunks (guard preserved).
+  # shellcheck disable=SC2317,SC2329
+  _read_missing() { printf ''; }
+  export -f _read_missing
+  expect_eq "retry leaves a genuinely-missing value empty" "" "$(retry_nonempty _read_missing)"
+  rm -f "${statef}"; unset -f sleep _read_transient _read_missing; unset STATEF VERIFY_READ_TRIES VERIFY_READ_SLEEP
+}
+run_retry_tests   # retry_nonempty is sourced from deploy-lib.sh (the EXACT shipped function)
+
 echo
 if [[ "${FAILS}" -eq 0 ]]; then
   green "ALL TESTS PASSED"

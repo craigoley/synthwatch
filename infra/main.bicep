@@ -146,6 +146,15 @@ param identityName string = 'synthwatch-runner-id'
 @description('objectId (principalId) of the synthwatch-runner-id MI — the Postgres Entra admin.')
 param aadAdminObjectId string = '5ca727ad-06a2-42a9-b31c-4e7b9382ab96'
 
+@description('''Re-assert the Postgres Entra admin child resource on deploy. DEFAULT FALSE: the wipe this
+re-assert guarded is now prevented at the SERVER authConfig (activeDirectoryAuth: Enabled + tenantId,
+below) — which an incremental deploy never removes — so re-asserting the admin is redundant and its
+child-resource PUT RACES the server reconciliation, throwing the benign-but-failure-reporting
+AadAuthOperationCannotBePerformedWhenServerIsNotAccessible (the deploy.sh "Failed-but-landed" cry-wolf).
+An incremental deploy does NOT delete the existing admin when this is false, so AAD auth is preserved.
+Set true only to (re)create the admin if it were ever actually lost.''')
+param reassertPostgresEntraAdmin bool = false
+
 @description('principalId of the synthwatch-api Function App MI — granted Container Apps Jobs Operator on the runner job so its on-demand "Run now" / test-send ARM jobs/start succeeds.')
 param apiManagedIdentityPrincipalId string = '67f2bd0c-1334-42a7-b521-3005064d7171'
 
@@ -248,11 +257,15 @@ resource postgres 'Microsoft.DBforPostgreSQL/flexibleServers@2024-08-01' = {
 }
 
 // Entra (AAD) admin for the Postgres server — the synthwatch-runner-id MANAGED
-// IDENTITY (a ServicePrincipal). Declared so a deploy re-asserts it (the bug above
-// wiped it). objectId/tenantId are DERIVED (the MI's own principalId + the
+// IDENTITY (a ServicePrincipal). objectId/tenantId are DERIVED (the MI's own principalId + the
 // subscription tenant), never hardcoded. Craig's personal user admin is intentionally
 // NOT in IaC — incremental deploys don't delete unlisted admins, so it's preserved.
-resource postgresEntraAdmin 'Microsoft.DBforPostgreSQL/flexibleServers/administrators@2024-08-01' = {
+// ★ GATED default-OFF (reassertPostgresEntraAdmin): the wipe this re-assert guarded is now
+// prevented at the server authConfig above; re-asserting races the server reconciliation and
+// reports a benign failure. Omitting the resource (incremental mode) does NOT remove the live
+// admin, so AAD auth stays intact. A REAL Entra/auth regression is still caught downstream by
+// deploy.sh VERIFY (Postgres `SELECT 1` via the MI token + the API health probe).
+resource postgresEntraAdmin 'Microsoft.DBforPostgreSQL/flexibleServers/administrators@2024-08-01' = if (reassertPostgresEntraAdmin) {
   parent: postgres
   name: aadAdminObjectId
   properties: {
