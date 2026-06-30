@@ -10,6 +10,7 @@ import {
   flowNameFor,
   computeDrift,
   buildApplyUpsert,
+  isResolvableSpec,
   b10FieldUpdates,
   computeApplyPlan,
   fetchManifest,
@@ -184,23 +185,32 @@ test('★ slice 6: ORPHAN when the spec will not compile', () => {
 
 // --- buildApplyUpsert (the GATED field-split apply — the crux) ---------------
 
-test('apply upsert INSERTs identity + Git-authoritative + seed-only columns', () => {
+test('apply upsert INSERTs identity + Git-authoritative + seed-only + spec_path columns', () => {
   const { insertColumns } = buildApplyUpsert(monitor());
   assert.deepEqual(insertColumns, [
     'source_key',
     ...GIT_AUTHORITATIVE_COLUMNS,
     ...SEED_ONLY_COLUMNS,
+    'spec_path', // ★ the real runtime resolution path for a browser check (appended last).
   ]);
 });
 
-test('apply upsert UPDATEs ONLY Git-authoritative columns (seed-only is insert-only)', () => {
+test('apply upsert UPDATEs Git-authoritative columns + spec_path (seed-only stays insert-only)', () => {
   const { updateColumns } = buildApplyUpsert(monitor());
-  // Git fields are overwritten...
-  assert.deepEqual(updateColumns, [...GIT_AUTHORITATIVE_COLUMNS]);
+  // Git fields + spec_path are overwritten (spec_path is Git-derived → re-synced; heals an existing NULL row).
+  assert.deepEqual(updateColumns, [...GIT_AUTHORITATIVE_COLUMNS, 'spec_path']);
   // ...seed fields are NOT in the UPDATE SET (insert-only — dashboard owns them after).
   for (const c of SEED_ONLY_COLUMNS) {
     assert.ok(!(updateColumns as string[]).includes(c), `seed-only column ${c} must not be updated`);
   }
+});
+
+test('★ apply upsert sets spec_path = the manifest script (INSERT + UPDATE) — the recipe-search fix', () => {
+  const { insertColumns, updateColumns, values, text } = buildApplyUpsert(monitor());
+  assert.ok(insertColumns.includes('spec_path'), 'spec_path inserted');
+  assert.ok((updateColumns as string[]).includes('spec_path'), 'spec_path re-synced on conflict');
+  assert.equal(values[insertColumns.indexOf('spec_path')], 'monitors/wegmans/search-product.spec.ts');
+  assert.match(text, /spec_path = EXCLUDED\.spec_path/);
 });
 
 test('apply upsert NEVER writes dashboard-owned columns', () => {
@@ -225,7 +235,7 @@ test('apply upsert NEVER writes dashboard-owned columns', () => {
 test('apply upsert conflict-targets source_key and seeds the right values', () => {
   const { text, values } = buildApplyUpsert(monitor({ suggestedIntervalSeconds: undefined }));
   assert.match(text, /ON CONFLICT \(source_key\) WHERE source_key IS NOT NULL DO UPDATE/);
-  // values order = [source_key, name, kind, target_url, flow_name, sensitive, redact_patterns, interval, enabled]
+  // values order = [source_key, name, kind, target_url, flow_name, sensitive, redact_patterns, interval, enabled, spec_path]
   assert.deepEqual(values, [
     'wegmans-search-product',
     'Wegmans: search → product page',
@@ -236,6 +246,7 @@ test('apply upsert conflict-targets source_key and seeds the right values', () =
     'null', // redact_patterns: JSON.stringify(null) — none declared
     300, // omitted suggestedIntervalSeconds -> column default 300
     false, // enabledByDefault false
+    'monitors/wegmans/search-product.spec.ts', // spec_path = the manifest script
   ]);
 });
 
@@ -423,12 +434,30 @@ test('★ apply-plan: a NEW drift → materialize-DISABLED (enabled=false), sens
   const matStmt = p.plan.statements.find((s) => s.purpose.includes('materialize'))!;
   assert.match(matStmt.text, /INSERT INTO checks/);
   assert.match(matStmt.text, /sensitive/);
-  // insert column order: source_key,name,kind,target_url,flow_name,sensitive,redact_patterns,interval,enabled
+  // insert column order: source_key,name,kind,target_url,flow_name,sensitive,redact_patterns,interval,enabled,spec_path
   assert.equal(matStmt.values![5], true, 'sensitive=true inline in the INSERT values');
   assert.equal(matStmt.values![8], false, '★ enabled FORCED false (materialize-disabled)');
+  // ★ spec_path (index 9) is materialized — without it the runner can only fail with "Cannot find module".
+  assert.equal(matStmt.values![9], 'monitors/wegmans/search-product.spec.ts', 'spec_path inline in the INSERT values');
   // and the location-assignment statement carries the active regions.
   const locStmt = p.plan.statements.find((s) => s.purpose.includes('locations'))!;
   assert.deepEqual(locStmt.regions, REGIONS);
+});
+
+test('★ GATE: a NEW browser monitor whose script is NOT a resolvable spec is BLOCKED (never materialized)', () => {
+  // A monitor that bypassed validateManifest (e.g. internal inconsistency) with a non-spec script —
+  // materializing it would create a check that can only fail. computeApplyPlan must fail-closed.
+  const m = monitor({ script: 'flows/not-a-spec.ts' as Monitor['script'] });
+  const plan = computeApplyPlan([m], [{ source_key: m.id, drift_type: 'new', detail: {} }], REGIONS)[0];
+  assert.equal(plan.status, 'blocked', 'unresolvable browser spec must NOT reach pending/apply');
+  assert.equal(plan.plan.statements.length, 0, 'no materialize statement is emitted');
+  assert.match(plan.plan.blockedReason ?? '', /not resolvable|Cannot find module/);
+});
+
+test('isResolvableSpec: true for a manifest spec path, false for a non-spec script', () => {
+  assert.equal(isResolvableSpec('monitors/wegmans/recipe-search.spec.ts'), true);
+  assert.equal(isResolvableSpec('flows/x.ts'), false);
+  assert.equal(isResolvableSpec('monitors/../etc/passwd.spec.ts'), false); // traversal guarded
 });
 
 test('apply-plan: a CHANGED drift → git-auth UPDATE listing the differing fields, status pending', () => {
