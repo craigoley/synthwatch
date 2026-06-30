@@ -40,6 +40,7 @@ import {
 } from './artifacts.js';
 import { extractTraceSignals } from './traceSignals.js';
 import { makeRedactor, IDENTITY_REDACTOR, tracePersistPlan, scrubError } from './redact.js';
+import { captureEgressIp } from './egress.js';
 import os from 'node:os';
 import path from 'node:path';
 import { unlink } from 'node:fs/promises';
@@ -128,6 +129,10 @@ async function getBrowser(): Promise<Browser> {
 async function main(): Promise<void> {
   // Stamp the per-invocation correlation id on stdout so an ACA log line + a runner_errors row reconcile.
   console.log(`[runner] invocation ${INVOCATION_ID} (location=${LOCATION})`);
+  // ★ Egress-IP capture (static-egress-IP Phase 0): WARM the per-process egress IP now so it overlaps with
+  // monitor work — by the time a run finalizes, the cached value is ready (the per-run stamp adds no latency).
+  // Fail-soft: this never throws (captureEgressIp swallows all errors → null). Telemetry, not a monitor.
+  void captureEgressIp();
   // Opt-in OTLP trace export (no-op unless OTEL_EXPORTER_OTLP_ENDPOINT is set).
   initOtel();
 
@@ -563,12 +568,17 @@ async function runOneInner(
     }
   }
 
+  // ★ Egress-IP (static-egress-IP Phase 0): the per-process public egress IP, captured once and warmed at
+  // startup, so this reads the cache with no added latency. Fail-soft → null if the reflector was
+  // unreachable. ★ NOT sensitive (our own infra's public IP) — stamped DIRECTLY, never through `redact`.
+  const egressIp = await captureEgressIp();
+
   await pool.query(
     `UPDATE runs
         SET status = $2, finished_at = now(), duration_ms = $3, http_status = $4,
             error_message = $5, failed_step = $6, screenshot_url = $7,
             cert_days_remaining = $8, trace_url = $9, trace_signals = $10::jsonb,
-            retry_count = $11
+            retry_count = $11, egress_ip = $12
       WHERE id = $1`,
     [
       runId,
@@ -583,6 +593,7 @@ async function runOneInner(
       traceSignalsJson,
       // attempts taken to reach this verdict: 1 = first try; >1 + status=pass = degrading-but-green.
       retryCount,
+      egressIp,
     ],
   );
   state.finalized = true; // ★ B2: terminal status persisted — the finally fallback is now a no-op.
