@@ -664,6 +664,18 @@ interface LocBurn {
   total: number;
 }
 
+// A pg Pool OR a checked-out PoolClient — both expose .query. Injecting it lets the differential red-test
+// run the TS threshold path on the SAME transaction (BEGIN/ROLLBACK) as slo_burn_status, so it compares
+// both over identical uncommitted fixtures without touching prod. Defaults to the shared pool in prod.
+type Queryable = Pick<typeof pool, 'query'>;
+
+/** The location-aware SLO burn STATE — the SAME shape slo_burn_status returns. `burn_state` is the paging
+ *  verdict (fast/slow/none); `reported_burn` is the max burn among at-floor locations of the firing window. */
+export interface BurnState {
+  burn_state: 'fast' | 'slow' | 'none';
+  reported_burn: number;
+}
+
 /**
  * Burn rate PER LOCATION over [now-window, now): (down/total)/(1-target) for each
  * location with runs in the window, maintenance-excluded (same anti-join as
@@ -673,12 +685,13 @@ interface LocBurn {
  * >= min_fail_locations regions to be burning before paging. `total` rides along so
  * the caller can apply a minimum sample-size floor. caller guards slo_target.
  */
-async function burnRatesByLocation(
+export async function burnRatesByLocation(
   checkId: number,
   windowInterval: string,
   target: number,
+  exec: Queryable = pool,
 ): Promise<LocBurn[]> {
-  const { rows } = await pool.query<{ total: string; down: string }>(
+  const { rows } = await exec.query<{ total: string; down: string }>(
     `SELECT count(*) FILTER (WHERE r.status IN ('pass','warn','fail','error')) AS total,
             count(*) FILTER (WHERE r.status IN ('fail','error'))                AS down
        FROM runs r
@@ -704,7 +717,7 @@ async function burnRatesByLocation(
  * a tight SLO must not bypass the failure_threshold debounce that the incident path
  * relies on. Defaults to the check's failure_threshold (the same debounce knob).
  */
-function burningLocations(rates: LocBurn[], threshold: number, floor: number): number {
+export function burningLocations(rates: LocBurn[], threshold: number, floor: number): number {
   return rates.filter((r) => r.total >= floor && r.burn >= threshold).length;
 }
 
@@ -715,9 +728,55 @@ function burningLocations(rates: LocBurn[], threshold: number, floor: number): n
  * else the alert overstates severity with a burn the gate didn't actually act on.
  * Returns 0 if no location meets the floor (callers only use this once a page fires).
  */
-function reportedBurn(rates: LocBurn[], floor: number): number {
+export function reportedBurn(rates: LocBurn[], floor: number): number {
   const atFloor = rates.filter((r) => r.total >= floor).map((r) => r.burn);
   return atFloor.length > 0 ? Math.max(...atFloor) : 0;
+}
+
+/**
+ * ★ The burn STATE decision, extracted VERBATIM from maybeBurnAlert's threshold composition (fast=1h,
+ * slow=6h∧30m, effectiveN per window, the failure_threshold floor). This is the SINGLE source of the TS
+ * paging logic: maybeBurnAlert consumes it, and the differential red-test asserts slo_burn_status
+ * reproduces it byte-for-byte. STATE ONLY — the dispatch suppressors (open incident / maintenance /
+ * debounce) are applied by maybeBurnAlert ON TOP, not here. `exec` lets the test run it in a rolled-back txn.
+ */
+export async function burnStateFromTs(check: Check, exec: Queryable = pool): Promise<BurnState> {
+  if (check.slo_target == null) return { burn_state: 'none', reported_burn: 0 };
+  const floor = check.failure_threshold;
+  const fastRates = await burnRatesByLocation(check.id, BURN_FAST_WINDOW, check.slo_target, exec);
+  const fastN = effectiveN(fastRates.length, check.min_fail_locations);
+  if (fastRates.length > 0 && burningLocations(fastRates, BURN_FAST_THRESHOLD, floor) >= fastN) {
+    return { burn_state: 'fast', reported_burn: reportedBurn(fastRates, floor) };
+  }
+  const slowLong = await burnRatesByLocation(check.id, BURN_SLOW_WINDOW, check.slo_target, exec);
+  const slowShort = await burnRatesByLocation(check.id, BURN_SLOW_SHORT_WINDOW, check.slo_target, exec);
+  const longN = effectiveN(slowLong.length, check.min_fail_locations);
+  const shortN = effectiveN(slowShort.length, check.min_fail_locations);
+  if (
+    slowLong.length > 0 &&
+    slowShort.length > 0 &&
+    burningLocations(slowLong, BURN_SLOW_THRESHOLD, floor) >= longN &&
+    burningLocations(slowShort, BURN_SLOW_THRESHOLD, floor) >= shortN
+  ) {
+    return { burn_state: 'slow', reported_burn: reportedBurn(slowLong, floor) };
+  }
+  return { burn_state: 'none', reported_burn: 0 };
+}
+
+/**
+ * The burn STATE from the SHARED SQL function slo_burn_status — the SAME rows the read path (/reports/slo
+ * pills) uses, so read and page can never diverge. The differential red-test proves this equals
+ * burnStateFromTs (retained as the frozen oracle) byte-for-byte. slo_burn_status always returns one row.
+ */
+export async function burnStateFromSql(checkId: number, exec: Queryable = pool): Promise<BurnState> {
+  const { rows } = await exec.query<{ burn_state: 'fast' | 'slow' | 'none'; reported_burn: string | number }>(
+    `SELECT burn_state, reported_burn FROM slo_burn_status($1)`,
+    [checkId],
+  );
+  const r = rows[0];
+  return r
+    ? { burn_state: r.burn_state, reported_burn: Number(r.reported_burn) }
+    : { burn_state: 'none', reported_burn: 0 };
 }
 
 /**
@@ -740,37 +799,22 @@ export async function maybeBurnAlert(check: Check): Promise<void> {
     let windowLabel: string;
     let burn: number;
 
-    // Page only when burn crosses threshold from >= N locations — the SAME effectiveN()
-    // as the incident verdict (so the two never diverge), over the burn-REPORTING
-    // locations (those with samples in the window) — AND each burning location has a
-    // real sample (>= failure_threshold runs) so one flaky region / a single failed run
-    // can't page. Single reporting location reduces to the old behaviour.
-    const floor = check.failure_threshold;
-    const fastRates = await burnRatesByLocation(check.id, BURN_FAST_WINDOW, check.slo_target);
-    const fastN = effectiveN(fastRates.length, check.min_fail_locations);
-    if (fastRates.length > 0 && burningLocations(fastRates, BURN_FAST_THRESHOLD, floor) >= fastN) {
+    // Page only when burn crosses threshold from >= N locations — the SAME effectiveN() as the incident
+    // verdict, over the burn-REPORTING locations, AND each burning location has a real sample (>=
+    // failure_threshold runs) so one flaky region / a single failed run can't page.
+    // ★ STEP 3: the burn STATE now comes from the SHARED SQL function slo_burn_status (read == page) — the
+    // SAME rows /reports/slo reads. Byte-identical to the old inline TS path: the differential red-test
+    // asserts slo_burn_status == burnStateFromTs (the retained frozen oracle). STATE ONLY — the dispatch
+    // suppressors (open incident / maintenance / debounce) are applied above + below, exactly as before.
+    const state = await burnStateFromSql(check.id);
+    if (state.burn_state === 'fast') {
       severity = 'critical'; label = 'fast burn'; windowLabel = '1h';
-      burn = reportedBurn(fastRates, floor);
+      burn = state.reported_burn;
+    } else if (state.burn_state === 'slow') {
+      severity = 'warning'; label = 'slow burn'; windowLabel = '6h';
+      burn = state.reported_burn;
     } else {
-      // Slow burn is multi-window: page only when BOTH the 6h AND the 30m window are
-      // burning from >= N locations. The short window decays quickly after recovery,
-      // so a one-off burst that already healed stops alerting instead of riding the
-      // still-elevated 6h window for hours.
-      const slowLong = await burnRatesByLocation(check.id, BURN_SLOW_WINDOW, check.slo_target);
-      const slowShort = await burnRatesByLocation(check.id, BURN_SLOW_SHORT_WINDOW, check.slo_target);
-      const longN = effectiveN(slowLong.length, check.min_fail_locations);
-      const shortN = effectiveN(slowShort.length, check.min_fail_locations);
-      if (
-        slowLong.length > 0 &&
-        slowShort.length > 0 &&
-        burningLocations(slowLong, BURN_SLOW_THRESHOLD, floor) >= longN &&
-        burningLocations(slowShort, BURN_SLOW_THRESHOLD, floor) >= shortN
-      ) {
-        severity = 'warning'; label = 'slow burn'; windowLabel = '6h';
-        burn = reportedBurn(slowLong, floor);
-      } else {
-        return; // budget burn within tolerance, not from enough locations, or recovered
-      }
+      return; // budget burn within tolerance, not from enough locations, or recovered
     }
 
     // Debounce: reuse the warn re-notify cadence so a sustained burn doesn't alert

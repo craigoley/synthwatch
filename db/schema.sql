@@ -895,6 +895,102 @@ $$;
 COMMENT ON FUNCTION slo_status(bigint, timestamptz, timestamptz) IS
     'Per-check SLO over [p_from, p_to): target, error-budget (run-weighted), consumed, remaining, burn_rate=(down/total)/(1-target). Zero rows if no slo_target.';
 
+-- slo_burn_status (0055): the SHARED, location-aware SLO burn STATE — reproduces the runner's
+-- maybeBurnAlert threshold decision EXACTLY (read == page). STATE ONLY (no dispatch suppressors). See
+-- 0055_slo_burn_status.sql for the full contract; the differential red-test proves it matches the TS
+-- byte-for-byte (incl. ::text::float8 to mirror node-pg's float4 parse).
+CREATE OR REPLACE FUNCTION slo_burn_status(p_check_id bigint)
+RETURNS TABLE (
+    check_id      bigint,
+    burn_state    text,
+    reported_burn double precision,
+    detail        jsonb
+)
+LANGUAGE sql
+STABLE
+AS $$
+WITH cfg AS (
+    SELECT c.slo_target::text::float8 AS target,
+           c.failure_threshold         AS floor,
+           c.min_fail_locations        AS minfail
+      FROM checks c
+     WHERE c.id = p_check_id
+),
+loc AS (
+    SELECT r.location,
+           count(*) FILTER (WHERE r.status IN ('pass','warn','fail','error'))                                              AS total_6h,
+           count(*) FILTER (WHERE r.status IN ('fail','error'))                                                            AS down_6h,
+           count(*) FILTER (WHERE r.status IN ('pass','warn','fail','error') AND r.started_at >= now() - interval '1 hour')  AS total_1h,
+           count(*) FILTER (WHERE r.status IN ('fail','error')                AND r.started_at >= now() - interval '1 hour')  AS down_1h,
+           count(*) FILTER (WHERE r.status IN ('pass','warn','fail','error') AND r.started_at >= now() - interval '30 minutes') AS total_30m,
+           count(*) FILTER (WHERE r.status IN ('fail','error')                AND r.started_at >= now() - interval '30 minutes') AS down_30m
+      FROM runs r
+      LEFT JOIN maintenance_windows mw
+             ON (mw.check_id = r.check_id OR mw.check_id IS NULL)
+            AND r.started_at >= mw.starts_at AND r.started_at < mw.ends_at
+     WHERE r.check_id = p_check_id
+       AND r.started_at >= now() - interval '6 hours' AND r.started_at < now()
+       AND mw.id IS NULL
+     GROUP BY r.location
+),
+rates AS (
+    SELECT l.location,
+           l.total_1h,  CASE WHEN l.total_1h  > 0 THEN (l.down_1h::float8  / l.total_1h)  / (1 - (SELECT target FROM cfg)) END AS burn_1h,
+           l.total_6h,  CASE WHEN l.total_6h  > 0 THEN (l.down_6h::float8  / l.total_6h)  / (1 - (SELECT target FROM cfg)) END AS burn_6h,
+           l.total_30m, CASE WHEN l.total_30m > 0 THEN (l.down_30m::float8 / l.total_30m) / (1 - (SELECT target FROM cfg)) END AS burn_30m
+      FROM loc l
+),
+agg AS (
+    SELECT
+        (SELECT floor   FROM cfg) AS floor,
+        (SELECT minfail FROM cfg) AS minfail,
+        count(*) FILTER (WHERE total_1h  > 0)  AS rep_1h,
+        count(*) FILTER (WHERE total_6h  > 0)  AS rep_6h,
+        count(*) FILTER (WHERE total_30m > 0)  AS rep_30m,
+        count(*) FILTER (WHERE total_1h  >= (SELECT floor FROM cfg) AND burn_1h  >= 14.4::float8) AS burn_n_1h,
+        count(*) FILTER (WHERE total_6h  >= (SELECT floor FROM cfg) AND burn_6h  >= 6::float8)    AS burn_n_6h,
+        count(*) FILTER (WHERE total_30m >= (SELECT floor FROM cfg) AND burn_30m >= 6::float8)    AS burn_n_30m,
+        max(burn_1h) FILTER (WHERE total_1h >= (SELECT floor FROM cfg)) AS rb_1h,
+        max(burn_6h) FILTER (WHERE total_6h >= (SELECT floor FROM cfg)) AS rb_6h
+      FROM rates
+),
+verdict AS (
+    SELECT
+        CASE
+            WHEN rep_1h > 0
+             AND burn_n_1h >= (CASE WHEN minfail IS NULL THEN rep_1h / 2 + 1 ELSE least(minfail, rep_1h) END)
+                THEN 'fast'
+            WHEN rep_6h > 0 AND rep_30m > 0
+             AND burn_n_6h  >= (CASE WHEN minfail IS NULL THEN rep_6h  / 2 + 1 ELSE least(minfail, rep_6h)  END)
+             AND burn_n_30m >= (CASE WHEN minfail IS NULL THEN rep_30m / 2 + 1 ELSE least(minfail, rep_30m) END)
+                THEN 'slow'
+            ELSE 'none'
+        END AS burn_state,
+        rb_1h, rb_6h
+      FROM agg
+)
+SELECT
+    p_check_id AS check_id,
+    CASE WHEN (SELECT target FROM cfg) IS NULL THEN 'none' ELSE v.burn_state END AS burn_state,
+    CASE
+        WHEN (SELECT target FROM cfg) IS NULL THEN 0::float8
+        WHEN v.burn_state = 'fast'            THEN coalesce(v.rb_1h, 0)
+        WHEN v.burn_state = 'slow'            THEN coalesce(v.rb_6h, 0)
+        ELSE 0::float8
+    END AS reported_burn,
+    coalesce(
+        (SELECT jsonb_agg(jsonb_build_object(
+                    'location', location,
+                    'burn_1h',  burn_1h,  'total_1h',  total_1h,
+                    'burn_6h',  burn_6h,  'total_6h',  total_6h,
+                    'burn_30m', burn_30m, 'total_30m', total_30m
+                ) ORDER BY location)
+           FROM rates),
+        '[]'::jsonb
+    ) AS detail
+  FROM verdict v;
+$$;
+
 -- ---------------------------------------------------------------------------
 -- runner_errors (0050): a QUERYABLE sink for the runner's top-level/uncaught exceptions. The global
 -- handler (runnerErrors.ts) writes one row per fatal with a per-invocation correlation id, so a silent
