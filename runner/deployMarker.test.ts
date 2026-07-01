@@ -70,3 +70,25 @@ test('sentry-release that is NOT hex (a tag/version) still records, is_sha=false
   assert.equal(m?.value, 'v2026.06.30-1');
   assert.equal(m?.is_sha, false);
 });
+
+// ── BROWSER-PATH INPUT PARITY: the same ladder, fed the browser path's two inputs (rendered DOM + captured
+// main-doc headers). No new matcher — these prove the EXISTING ladder handles the browser-shaped inputs. ──
+
+test('browser path: a rendered page.content() with a sentry-release baggage meta yields the SHA (headers undefined)', () => {
+  // The browser path may have no main-doc headers (SPA / capture miss) — the body rung must still fire.
+  const m = extractDeployMarker(undefined, baggageMeta(SHA));
+  assert.equal(m?.source, 'sentry-release');
+  assert.equal(m?.value, SHA);
+  assert.equal(m?.is_sha, true);
+});
+
+test('browser path: captured main-doc headers with an etag on an HTML document fire the etag rung', () => {
+  // meals2go's known marker (etag 93718211) arriving via the browser path's captured main-doc headers.
+  const m = extractDeployMarker(
+    { etag: '"93718211"', 'content-type': 'text/html; charset=utf-8' },
+    '<html>no body marker here</html>',
+  );
+  assert.equal(m?.source, 'etag');
+  assert.equal(m?.value, '93718211');
+  assert.equal(m?.is_sha, false);
+});
