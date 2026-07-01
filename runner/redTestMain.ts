@@ -14,6 +14,7 @@ import {
   runHttpRedTest,
   runBrowserRedTest,
   recordAttested,
+  persistRedTest,
   type RedTestResult,
   type Fault,
 } from './redTest.js';
@@ -68,12 +69,21 @@ async function main(): Promise<void> {
     }
   }
 
-  // PR 1: print only (PR 2 persists). One clear line the operator (and PR 2's INSERT) can read.
   console.log(
     `[red-test] check=${result.checkId} "${check.name}" method=${result.method} ` +
       `OUTCOME=${result.outcome.toUpperCase()} verdict=${result.verdict ?? '-'} fault="${result.fault}"`,
   );
   console.log(`           ${result.detail}`);
+
+  // ★ PR 2 — CAPTURE. Persist ONLY a confirmed red (the guardrail is in persistRedTest + the schema CHECK).
+  // An inconclusive/not-red result writes NOTHING → the scorecard's redTest.captured stays honestly false.
+  const persisted = await persistRedTest(result);
+  console.log(
+    persisted
+      ? `           ✔ recorded a red_tests row (check ${result.checkId}, method ${result.method}) — /reports/trust will flip redTest.captured=true.`
+      : `           ✗ NO row written (outcome=${result.outcome}) — captured stays false; only a CONFIRMED red is persisted.`,
+  );
+
   // Exit non-zero for a NON-red executed result so a CI/wrapper can tell a proven red-test from a gap.
   if (result.method === 'executed-red-fixture' && result.outcome !== 'red') process.exitCode = 2;
 }

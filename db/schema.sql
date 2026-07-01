@@ -1023,4 +1023,17 @@ CREATE TABLE deploys (
 );
 CREATE INDEX deploys_host_time_idx ON deploys (target_host, deployed_at DESC);
 
+-- red_tests (migration 0057) — §D1 red-test capture: one row per HARNESS-CONFIRMED red-test. outcome is
+-- CHECK-constrained to 'red' so an inconclusive/not-red run can never be persisted (the honesty guardrail at
+-- the schema). The API reads it (trust scorecard); the runner (owner) writes it.
+CREATE TABLE red_tests (
+    id         bigint      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    check_id   bigint      NOT NULL REFERENCES checks(id) ON DELETE CASCADE,
+    tested_at  timestamptz NOT NULL DEFAULT now(),
+    method     text        NOT NULL CHECK (method IN ('executed-red-fixture', 'attested-manual')),
+    outcome    text        NOT NULL CHECK (outcome IN ('red')),
+    detail     jsonb
+);
+CREATE INDEX red_tests_check_time_idx ON red_tests (check_id, tested_at DESC);
+
 COMMIT;
