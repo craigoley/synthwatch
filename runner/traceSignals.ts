@@ -222,12 +222,13 @@ export function extractNetwork(
     topThirdParties,
     // ★ The action(s) under test: every mutating request + the status the site returned, in first-seen order,
     // capped at 12 — mirrors C# TraceExtractor.ExtractNetwork's Mutations (Where(MutatingMethods).Take(12)).
-    // ★ The url goes through redact() exactly like the other persisted network urls (slim above): a no-op for
-    // non-sensitive monitors (→ byte-matches C#), and scrubbed for sensitive ones (no leaked URL in the signal).
+    // ★ The url is stored RAW — NOT redacted — to byte-match C# (MutationDto(r.Method, r.Url, r.Status): FromZip
+    // has no redactor, so it stores the raw url). This is a faithful-port parity requirement: redacting here
+    // (as #169 did) diverges from C# on a sensitive input — the exact drift the golden guard exists to prevent.
     mutations: reqs
       .filter((r) => MUTATING_METHODS.has(r.method.toUpperCase()))
       .slice(0, MUTATION_CAP)
-      .map((r) => ({ method: r.method, url: redact(r.url), status: r.status })),
+      .map((r) => ({ method: r.method, url: r.url, status: r.status })),
   };
 }
 

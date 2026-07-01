@@ -134,18 +134,19 @@ test('network mutations are capped at 12 in first-seen order (parity with C# Mut
   assert.equal(n.mutations[11].url, 'https://www.wegmans.com/api/x11'); // the 13th–15th dropped
 });
 
-// ★ Redaction: a mutation carries a URL → it MUST go through the same redact() the other persisted urls use.
-test('a sensitive monitor mutation url is REDACTED in the persisted signal (not leaked)', () => {
+// ★ PARITY: the mutation url is stored RAW to byte-match C# (MutationDto stores r.Url; FromZip has no redactor).
+// It must NOT be redacted even for a sensitive monitor — redacting here (as #169 did) diverges from C# on a
+// sensitive input. (The regular network urls in `slim` still redact — that's a separate, established choice.)
+test('the mutation url is stored RAW (not redacted), byte-matching C#, even under a redactor', () => {
   const ndjson =
     '{"type":"resource-snapshot","snapshot":{"_resourceType":"fetch","time":10,"timings":{"wait":5},"request":{"url":"https://www.wegmans.com/shop/cart?session=SECRET123&item=42","method":"POST"},"response":{"status":201,"_transferSize":100,"content":{"size":50}}}}';
-  const redacted = extractNetwork(ndjson, TARGET, makeRedactor(null));
-  assert.equal(redacted.mutations.length, 1);
-  assert.equal(redacted.mutations[0].url, 'https://www.wegmans.com/shop/cart?session=<redacted>&item=42');
-  assert.equal(redacted.mutations[0].method, 'POST'); // method + status untouched
-  assert.equal(redacted.mutations[0].status, 201);
-  // non-sensitive (identity redactor): url byte-for-byte unchanged → byte-matches C#'s raw url.
+  const RAW = 'https://www.wegmans.com/shop/cart?session=SECRET123&item=42';
+  // even with a real redactor (the sensitive path), the mutation url is UNCHANGED — parity with C#.
+  const withRedactor = extractNetwork(ndjson, TARGET, makeRedactor(null));
+  assert.equal(withRedactor.mutations[0].url, RAW);
+  // and identical without one (non-sensitive) — both paths agree with C#'s raw url.
   const plain = extractNetwork(ndjson, TARGET, IDENTITY_REDACTOR);
-  assert.equal(plain.mutations[0].url, 'https://www.wegmans.com/shop/cart?session=SECRET123&item=42');
+  assert.equal(plain.mutations[0].url, RAW);
 });
 
 test('extractTraceSignals parses a real zip (both streams) + derives targetHost from the URL', () => {
