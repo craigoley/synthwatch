@@ -27,6 +27,13 @@ export interface ThirdParty {
   count: number;
   kb: number;
 }
+// A MUTATING request (POST/PUT/PATCH/DELETE) + the status the site returned — "the action under test". Mirrors
+// the API's MutationDto (Dtos/TraceSignalsDto.cs): field order method/url/status, camelCase on the wire.
+export interface Mutation {
+  method: string;
+  url: string;
+  status: number;
+}
 export interface NetworkSummary {
   totalRequests: number;
   wireKb: number;
@@ -36,6 +43,7 @@ export interface NetworkSummary {
   largest: TraceRequest[];
   uncompressed: TraceRequest[];
   topThirdParties: ThirdParty[];
+  mutations: Mutation[];
 }
 export interface ConsoleMessage {
   level: string;
@@ -62,6 +70,7 @@ const EMPTY_NETWORK: NetworkSummary = {
   largest: [],
   uncompressed: [],
   topThirdParties: [],
+  mutations: [],
 };
 const EMPTY_CONSOLE: ConsoleSummary = { messages: [], droppedInfoLog: 0, droppedExtensionNoise: 0 };
 
@@ -72,6 +81,11 @@ const EXTENSION_NOISE =
 
 // Assets where missing compression is a real concern (a big image isn't "uncompressed", just large).
 const TEXT_TYPES = new Set(['script', 'stylesheet', 'document', 'fetch', 'xhr']);
+
+// ★ Methods whose request mutates state — "the action under test" for cart/auth/submit monitors. Matched
+// case-insensitively (uppercased before the lookup), matching C# MutatingMethods (StringComparer.OrdinalIgnoreCase).
+const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+const MUTATION_CAP = 12;
 
 const TOP_N = 5;
 const FAILED_CAP = 8;
@@ -122,6 +136,7 @@ interface Req {
   wire: number;
   enc: string;
   third: boolean;
+  method: string;
 }
 
 export function extractNetwork(
@@ -148,6 +163,7 @@ export function extractNetwork(
       wire: int(resp._transferSize),
       enc: header(resp, 'content-encoding'),
       third: !isSite(hostOf(url), targetHost),
+      method: str(req.method),
     });
   }
 
@@ -204,6 +220,14 @@ export function extractNetwork(
       .slice(0, TOP_N)
       .map(slim),
     topThirdParties,
+    // ★ The action(s) under test: every mutating request + the status the site returned, in first-seen order,
+    // capped at 12 — mirrors C# TraceExtractor.ExtractNetwork's Mutations (Where(MutatingMethods).Take(12)).
+    // ★ The url goes through redact() exactly like the other persisted network urls (slim above): a no-op for
+    // non-sensitive monitors (→ byte-matches C#), and scrubbed for sensitive ones (no leaked URL in the signal).
+    mutations: reqs
+      .filter((r) => MUTATING_METHODS.has(r.method.toUpperCase()))
+      .slice(0, MUTATION_CAP)
+      .map((r) => ({ method: r.method, url: redact(r.url), status: r.status })),
   };
 }
 
