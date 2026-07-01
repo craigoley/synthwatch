@@ -1,0 +1,54 @@
+name: Trace-signals parity
+
+# ──────────────────────────────────────────────────────────────────────────────────────────
+# The RUNNER half of the trace-signals cross-repo parity guard. traceSignals.ts (here) and the
+# API's TraceExtractor.cs are a hand-ported pair whose output MUST stay byte-identical (the
+# persisted runs.trace_signals JSON is read as the C# TraceSignalsDto shape). They already drifted
+# once (the `mutations` signal, reconciled in #169). The structural fix: a SHARED golden fixture
+# (runner/test-fixtures/trace-signals-golden/) that BOTH extractors are asserted against — this repo
+# here, and the API repo via a cross-repo checkout of THIS repo (mirroring pg-grant-coverage).
+#
+# This job runs the trace-signals test file (which includes the golden-parity assertion). A runner-
+# side divergence from the golden fails here; the API-side half runs in synthwatch-api's CI. Because
+# the runner has no general `npm test` gate, this narrowly gates the trace-signals extractor's tests.
+# ──────────────────────────────────────────────────────────────────────────────────────────
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trace-signals-parity-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  trace-signals-parity:
+    name: Trace-signals golden parity
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: runner
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: runner/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Runs the trace-signals extractor tests, including the ★ golden-parity assertion that
+      # extractTraceSignals(golden input) === test-fixtures/trace-signals-golden/expected.json.
+      - name: Assert the runner extractor matches the golden
+        run: npx tsx --test traceSignals.test.ts

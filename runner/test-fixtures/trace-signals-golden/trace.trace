@@ -1,0 +1,11 @@
+{"type":"console","messageType":"error","text":"component:SiteHeaderSearch:helpers Invalid discovery pages storage data","location":{"url":"https://www.wegmans.com/_next/static/chunks/x.js"}}
+{"type":"console","messageType":"warning","text":"[Meta Pixel] - Duplicate Pixel ID: 376538596548029.","location":{"url":"https://www.wegmans.com/"}}
+{"type":"console","messageType":"info","text":"[LaunchDarkly] client initialized","location":{"url":"https://www.wegmans.com/chunk.js"}}
+{"type":"console","messageType":"log","text":"[SignalR] Initial tab visibility: visible","location":{"url":"https://bot.emplifi.io/x"}}
+{"type":"console","messageType":"error","text":"Failed to load Grammarly-check.js","location":{"url":"chrome-extension://kbfnbcaeplbcioak/Grammarly-check.js"}}
+{"type":"console","messageType":"error","text":"Uncaught Error in recorder.contentScripts.inject","location":{"url":"chrome-extension://aaaa/recorder.js"}}
+{"type":"console","messageType":"warning","text":"Unchecked runtime.lastError: The message port closed before a response was received.","location":{"url":""}}
+{"type":"console","messageType":"error","text":"DEFAULT root logger initialized","location":{"url":""}}
+{"type":"console","messageType":"error","text":"AAA-init: extension boot","location":{"url":""}}
+{"type":"console","messageType":"error","text":"WebSocket connection to 'wss://realtime-c.astutebot.com/eventHub' failed","location":{"url":"https://realtime-c.astutebot.com/lib.js"}}
+{"type":"frame-snapshot"}
