@@ -14,6 +14,7 @@ import {
   type ResponseFacets,
 } from './assertions.js';
 import { noteDeployMarker } from './deploys.js';
+import { bypassHeaderFor } from './vercelBypass.js';
 
 export interface HttpResult {
   // 'pass'  = all assertions met.
@@ -82,6 +83,12 @@ export async function runHttpCheck(check: Check): Promise<HttpResult> {
       return { verdict: 'error', httpStatus: null, durationMs: Date.now() - start, error: auth.error };
     }
     if (auth.header) headers.set(auth.header[0], auth.header[1]);
+
+    // Vercel Deployment Protection: add the bypass token ONLY when target_url is a protected host AND the
+    // fleet secret is set (host-scoped + fail-soft — see vercelBypass.ts). A single fetch to target_url, so
+    // this is inherently scoped to the check's own host; non-protected checks + local runs are untouched.
+    const bypass = bypassHeaderFor(check.target_url);
+    if (bypass) headers.set(bypass[0], bypass[1]);
 
     const method = (check.method || 'GET').toUpperCase();
     const init: RequestInit = { method, redirect: 'follow', signal: controller.signal, headers };

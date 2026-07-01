@@ -42,7 +42,7 @@
 #   scripts/deploy.sh --help
 #
 # Requires: az (logged in), jq, git, curl; psql for the DB check (provided via ~/.synthwatch.env PATH).
-# Secrets (PG_PW, ACS_CONN) come from ~/.synthwatch.env and are passed INLINE to az — never logged.
+# Secrets (PG_PW, ACS_CONN, VERCEL_BYPASS_TOKEN) come from ~/.synthwatch.env and are passed INLINE to az — never logged.
 
 set -euo pipefail
 
@@ -144,11 +144,12 @@ done
 # ---------------------------------------------------------------------------
 # 1. Source env + FAIL FAST if a @secure value is missing (the wipe risk).
 # ---------------------------------------------------------------------------
-[[ -f "${ENV_FILE}" ]] || fail "${ENV_FILE} not found — needs PG_PW, ACS_CONN, DATABASE_URL."
+[[ -f "${ENV_FILE}" ]] || fail "${ENV_FILE} not found — needs PG_PW, ACS_CONN, VERCEL_BYPASS_TOKEN, DATABASE_URL."
 # shellcheck source=/dev/null
 source "${ENV_FILE}"
 : "${PG_PW:?PG_PW is unset — refusing to deploy (a missing @secure param WIPES the Postgres secret). Set it in ${ENV_FILE}.}"
 : "${ACS_CONN:?ACS_CONN is unset — refusing to deploy (a missing acsEmailConnectionString WIPES ACS email alerting). Set it in ${ENV_FILE}.}"
+: "${VERCEL_BYPASS_TOKEN:?VERCEL_BYPASS_TOKEN is unset — refusing to deploy (a missing vercelBypassToken WIPES the Vercel bypass secret → protected Wegmans checks would fail the deployment-protection gate). Set it in ${ENV_FILE}.}"
 
 command -v az >/dev/null || fail "az CLI not found"
 command -v jq >/dev/null || fail "jq not found"
@@ -413,6 +414,7 @@ run_whatif() {
     --parameters \
         postgresAdminPassword="${PG_PW}" \
         acsEmailConnectionString="${ACS_CONN}" \
+        vercelBypassToken="${VERCEL_BYPASS_TOKEN}" \
         runnerImage="${RUNNER_IMG}" \
         migrateImage="${MIGRATE_IMG}" \
     > "${WHATIF_JSON}" 2>/dev/null \
@@ -474,6 +476,7 @@ do_deploy() {
     --parameters \
         postgresAdminPassword="${PG_PW}" \
         acsEmailConnectionString="${ACS_CONN}" \
+        vercelBypassToken="${VERCEL_BYPASS_TOKEN}" \
         runnerImage="${RUNNER_IMG}" \
         migrateImage="${MIGRATE_IMG}" \
     -o none
