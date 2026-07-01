@@ -327,7 +327,7 @@ unset -f az psql sleep check_contains
 #    THIS repo). The deploy targets origin/main; this only classifies what to warn.
 # ===========================================================================
 run_drift_tests() {
-  local repo cwd A B
+  local repo cwd A B S L LREAL
   repo="$(mktemp -d)"; cwd="${PWD}"
   cd "${repo}"
   git init -q; git config user.email t@t; git config user.name t
@@ -336,6 +336,22 @@ run_drift_tests() {
   expect_eq "drift same (local == origin)"        "same"     "$(git_drift_state "${A}" "${A}")"
   expect_eq "drift behind (local A, origin B)"     "behind"   "$(git_drift_state "${A}" "${B}")"
   expect_eq "drift diverged (local B ahead of A)"  "diverged" "$(git_drift_state "${B}" "${A}")"
+
+  # ★ STALE (squash-merge leftover): an ORIGIN commit and a LOCAL commit that make the SAME change (equal
+  # patch-id) on divergent branches off A. The pre-squash local commit isn't an ancestor of origin, but its
+  # change IS already on origin as an equivalent patch → must classify 'stale' (benign), NOT 'diverged'.
+  git checkout -q -b origin_line "${A}"
+  printf 'X\n' > foo; git add foo; git commit -q -m 'squash on origin'; S="$(git rev-parse HEAD)"
+  git checkout -q -b local_dup "${A}"
+  printf 'X\n' > foo; git add foo; git commit -q -m 'pre-squash local dup'; L="$(git rev-parse HEAD)"
+  expect_eq "drift STALE (local dup already on origin as a squash)" "stale" "$(git_drift_state "${L}" "${S}")"
+
+  # ★ GENUINE diverged: a local commit with REAL content NOT on origin (a different change) → the loud
+  # warning is preserved (when the local work isn't subsumed, never downgrade to 'stale').
+  git checkout -q -b local_real "${A}"
+  printf 'Y\n' > bar; git add bar; git commit -q -m 'real unpushed work'; LREAL="$(git rev-parse HEAD)"
+  expect_eq "drift diverged (real content not on origin)" "diverged" "$(git_drift_state "${LREAL}" "${S}")"
+
   cd "${cwd}"; rm -rf "${repo}"
 }
 run_drift_tests

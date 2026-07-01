@@ -213,13 +213,23 @@ post_reconcile() {
 # TARGET is always origin/main (the CI-built, deployable truth); this only decides what to WARN.
 #   same     — local HEAD == origin/main.
 #   behind   — local is an ancestor of origin/main (fast-forwardable; a stale checkout).
-#   diverged — local has commit(s) NOT on origin/main (ahead or diverged — e.g. an orphan local commit
-#              never pushed/built; it has no image and must NOT be the deploy target).
+#   stale    — local has commit(s) NOT literally on origin/main, but EVERY one is already present on
+#              origin as an equivalent patch (a squash-merge leftover: your PR merged as a new squash
+#              SHA, so the pre-squash local commit isn't an ancestor, yet its CHANGES are on origin).
+#              Benign — nothing un-merged is at risk; the local commits are safe to discard.
+#   diverged — local has commit(s) whose changes are NOT on origin (GENUINE unpushed work — an orphan
+#              never pushed/built; it has no image and must NOT be the deploy target). The loud case.
+# Distinguishing stale from diverged: `git cherry <origin> <local>` marks each local-only commit '-'
+# (an equivalent patch exists upstream — squash-merged) or '+' (no equivalent — real new work). If there
+# is ≥1 local-only commit and NONE are '+', local is fully subsumed by origin → stale. Any '+' (or an
+# error / an unmatched multi-commit squash) stays diverged — when unsure, keep the louder warning.
 # Pure (just two SHAs + the repo's commit graph) so it's unit-testable. Returns the word on stdout.
 git_drift_state() {
-  local local_head="$1" origin_head="$2"
+  local local_head="$1" origin_head="$2" cherry
   if [[ "${local_head}" == "${origin_head}" ]]; then echo "same"; return; fi
   if git merge-base --is-ancestor "${local_head}" "${origin_head}" 2>/dev/null; then echo "behind"; return; fi
+  cherry="$(git cherry "${origin_head}" "${local_head}" 2>/dev/null)" || { echo "diverged"; return; }
+  if [[ -n "${cherry}" ]] && ! grep -q '^+' <<<"${cherry}"; then echo "stale"; return; fi
   echo "diverged"
 }
 
