@@ -73,6 +73,10 @@ param postgresAdminPassword string
 @secure()
 param acsEmailConnectionString string
 
+@description('Vercel Deployment Protection bypass token (VERCEL_BYPASS_TOKEN) — the fleet-wide token the runner injects to the protected Wegmans/Vercel hosts. Secret — supply out-of-band at deploy, like acsEmailConnectionString (deploy.sh requires it, so a redeploy never WIPES the secret). NEVER commit a value.')
+@secure()
+param vercelBypassToken string
+
 @description('Log Analytics workspace name (live stack uses the -e2 name).')
 param logAnalyticsName string = 'synthwatch-logs-e2'
 
@@ -480,6 +484,13 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
           name: 'acs-email-conn'
           value: acsEmailConnectionString
         }
+        {
+          // Vercel Deployment Protection bypass token — fleet-wide secret, surfaced as the VERCEL_BYPASS_TOKEN
+          // secretRef below. Bicep-owned so a redeploy preserves it; '' when unset → fail-soft (the runner
+          // injects it ONLY to PROTECTED_BYPASS_HOSTS). Craig supplies the real value out-of-band; NEVER committed.
+          name: 'vercel-bypass-token'
+          value: vercelBypassToken
+        }
       ]
     }
     template: {
@@ -554,6 +565,12 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
               // redeploy PRESERVES it instead of wiping it (ends the recurring defect).
               name: 'ACS_EMAIL_CONNECTION_STRING'
               secretRef: 'acs-email-conn'
+            }
+            {
+              // Vercel Deployment Protection bypass token — from the bicep-owned secret above (preserved across
+              // redeploys). The runner injects it ONLY to PROTECTED_BYPASS_HOSTS; unset/'' → fail-soft (no header).
+              name: 'VERCEL_BYPASS_TOKEN'
+              secretRef: 'vercel-bypass-token'
             }
             // STILL out-of-band (NOT owned here) — a redeploy will NOT restore them:
             // the webhook channel (ALERT_WEBHOOK_URL[/_AUTH_HEADER]) + DASHBOARD_URL + OTel
@@ -632,6 +649,13 @@ resource centralusJob 'Microsoft.App/jobs@2024-03-01' = {
           name: 'acs-email-conn'
           value: acsEmailConnectionString
         }
+        {
+          // Vercel Deployment Protection bypass token — fleet-wide secret, surfaced as the VERCEL_BYPASS_TOKEN
+          // secretRef below. Bicep-owned so a redeploy preserves it; '' when unset → fail-soft (the runner
+          // injects it ONLY to PROTECTED_BYPASS_HOSTS). Craig supplies the real value out-of-band; NEVER committed.
+          name: 'vercel-bypass-token'
+          value: vercelBypassToken
+        }
       ]
     }
     template: {
@@ -701,6 +725,12 @@ resource centralusJob 'Microsoft.App/jobs@2024-03-01' = {
               // redeploy PRESERVES it instead of wiping it (ends the recurring defect).
               name: 'ACS_EMAIL_CONNECTION_STRING'
               secretRef: 'acs-email-conn'
+            }
+            {
+              // Vercel Deployment Protection bypass token — from the bicep-owned secret above (preserved across
+              // redeploys). The runner injects it ONLY to PROTECTED_BYPASS_HOSTS; unset/'' → fail-soft (no header).
+              name: 'VERCEL_BYPASS_TOKEN'
+              secretRef: 'vercel-bypass-token'
             }
           ]
         }
@@ -774,6 +804,13 @@ resource westus2Job 'Microsoft.App/jobs@2024-03-01' = {
           name: 'acs-email-conn'
           value: acsEmailConnectionString
         }
+        {
+          // Vercel Deployment Protection bypass token — fleet-wide secret, surfaced as the VERCEL_BYPASS_TOKEN
+          // secretRef below. Bicep-owned so a redeploy preserves it; '' when unset → fail-soft (the runner
+          // injects it ONLY to PROTECTED_BYPASS_HOSTS). Craig supplies the real value out-of-band; NEVER committed.
+          name: 'vercel-bypass-token'
+          value: vercelBypassToken
+        }
       ]
     }
     template: {
@@ -837,6 +874,12 @@ resource westus2Job 'Microsoft.App/jobs@2024-03-01' = {
               // redeploy PRESERVES it instead of wiping it.
               name: 'ACS_EMAIL_CONNECTION_STRING'
               secretRef: 'acs-email-conn'
+            }
+            {
+              // Vercel Deployment Protection bypass token — from the bicep-owned secret above (preserved across
+              // redeploys). The runner injects it ONLY to PROTECTED_BYPASS_HOSTS; unset/'' → fail-soft (no header).
+              name: 'VERCEL_BYPASS_TOKEN'
+              secretRef: 'vercel-bypass-token'
             }
           ]
         }

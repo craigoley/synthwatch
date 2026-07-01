@@ -16,6 +16,7 @@ import { pool, type Check, type RunRecord, type TerminalStatus } from './db.js';
 import { runHttpCheck } from './httpCheck.js';
 import { noteDeployMarker } from './deploys.js';
 import { captureMainDocHeaders } from './browserMarker.js';
+import { browserHeaderAdditions } from './vercelBypass.js';
 import { runSslCheck } from './sslCheck.js';
 import { runDnsCheck, runTcpCheck, runPingCheck } from './netChecks.js';
 import { runMultistepChain } from './multistep.js';
@@ -845,6 +846,26 @@ async function executeBrowser(
   const start = Date.now();
   const b = await getBrowser();
   const context = await b.newContext();
+
+  // Per-request header injection (installed before any navigation). Two DISTINCT concerns, kept separate in
+  // vercelBypass.browserHeaderAdditions:
+  //   1. the monitor's non-secret request_headers → merged into EVERY request (the browser path previously
+  //      injected none — the HTTP path already did; this closes that gap);
+  //   2. the Vercel bypass token → added ONLY for a protected host (per-request host-match).
+  // ★ We do NOT use context.extraHTTPHeaders: that is context-wide and would spray the SECRET token to every
+  // third-party subresource (analytics/CDNs) the page loads — a leak. Per-request matching sends it only to the
+  // protected properties. route.continue() untouched when there's nothing to add (no interception overhead cost
+  // beyond the match).
+  const customHeaders = check.request_headers ?? {};
+  await context.route('**/*', async (route) => {
+    const additions = browserHeaderAdditions(route.request().url(), customHeaders);
+    if (additions === null) {
+      await route.continue();
+      return;
+    }
+    await route.continue({ headers: { ...route.request().headers(), ...additions } });
+  });
+
   const page = await context.newPage();
   page.setDefaultTimeout(check.timeout_ms);
 
