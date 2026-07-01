@@ -17,6 +17,8 @@ import {
   fetchManifest,
   GIT_AUTHORITATIVE_COLUMNS,
   SEED_ONLY_COLUMNS,
+  CHANGED_UPDATE_COLUMNS,
+  REDACTION_COLUMNS,
   type Monitor,
   type ManagedCheck,
   type SpecRunnability,
@@ -531,12 +533,56 @@ test('isResolvableSpec: true for a manifest spec path, false for a non-spec scri
   assert.equal(isResolvableSpec('monitors/../etc/passwd.spec.ts'), false); // traversal guarded
 });
 
-test('apply-plan: a CHANGED drift → git-auth UPDATE listing the differing fields, status pending', () => {
+test('apply-plan: a CHANGED drift → SCOPED git-auth UPDATE listing the differing fields, status pending', () => {
   const m = monitor({ name: 'New name' });
   const plan = computeApplyPlan([m], [{ source_key: m.id, drift_type: 'changed', detail: { fields: { name: { git: 'New name', live: 'Old' } } } }], REGIONS)[0];
   assert.equal(plan.status, 'pending');
   assert.match(plan.plan.summary, /UPDATE git-authoritative field\(s\) \[name\]/);
-  assert.match(plan.plan.statements[0].text, /ON CONFLICT \(source_key\) WHERE source_key IS NOT NULL DO UPDATE/);
+  const stmt = plan.plan.statements[0];
+  // a SCOPED UPDATE … WHERE source_key = $1 — NOT the full ON CONFLICT upsert (whose SET includes redaction).
+  assert.match(stmt.text, /^UPDATE checks SET /);
+  assert.match(stmt.text, /WHERE source_key = \$1$/);
+  assert.match(stmt.text, /\bname = \$/);
+  assert.doesNotMatch(stmt.text, /ON CONFLICT/);
+});
+
+// ★★ THE STRIP-SAFETY TEST — the reason this PR exists. A `changed` apply must be INCAPABLE of stripping
+// redaction. Assert the ABSENCE of sensitive/redact_patterns from the emitted SET (a test that only checks
+// "name updates" would pass even if the bypass existed).
+test('★★ STRIP-SAFETY: a CHANGED apply NEVER puts sensitive/redact_patterns in the SET (strip cannot flow through)', () => {
+  // Sensitive monitor with redaction; real drift is name + target_url. The changed drift NEVER carries a
+  // redaction field (that is a separate redaction_mismatch row) — model the real detail shape.
+  const m = monitor({ name: 'New name', target: 'https://new.example', sensitive: true, redact_patterns: ['member-\\d+'] });
+  const drift = {
+    source_key: m.id,
+    drift_type: 'changed' as const,
+    detail: { fields: { name: { git: 'New name', live: 'Old' }, target_url: { git: 'https://new.example', live: 'https://old.example' } } },
+  };
+  const stmt = computeApplyPlan([m], [drift], REGIONS)[0].plan.statements[0];
+  // the REAL drift is in the SET …
+  assert.match(stmt.text, /\bname = \$/);
+  assert.match(stmt.text, /\btarget_url = \$/);
+  // ★ … and redaction is provably ABSENT — executing this UPDATE leaves sensitive/redact_patterns byte-identical.
+  assert.doesNotMatch(stmt.text, /\bsensitive\b/, 'sensitive must NEVER be in a changed UPDATE SET');
+  assert.doesNotMatch(stmt.text, /\bredact_patterns\b/, 'redact_patterns must NEVER be in a changed UPDATE SET');
+  // precise proof of the emitted values: [source_key, name, target_url, spec_path] — no redaction value present.
+  assert.deepEqual(stmt.values, [m.id, 'New name', 'https://new.example', m.script]);
+});
+
+test('apply-plan: a CHANGED target_url drift (non-sensitive monitor) → SET updates target_url, still excludes redaction', () => {
+  const m = monitor({ target: 'https://new.example' });
+  const drift = { source_key: m.id, drift_type: 'changed' as const, detail: { fields: { target_url: { git: 'https://new.example', live: 'https://old.example' } } } };
+  const stmt = computeApplyPlan([m], [drift], REGIONS)[0].plan.statements[0];
+  assert.match(stmt.text, /\btarget_url = \$/);
+  assert.doesNotMatch(stmt.text, /\bsensitive\b/);
+  assert.doesNotMatch(stmt.text, /\bredact_patterns\b/);
+});
+
+test('CHANGED_UPDATE_COLUMNS is exactly GIT_AUTHORITATIVE_COLUMNS minus the redaction pair (single source of truth)', () => {
+  assert.deepEqual([...CHANGED_UPDATE_COLUMNS], ['name', 'kind', 'target_url', 'flow_name']);
+  for (const c of REDACTION_COLUMNS) assert.equal(CHANGED_UPDATE_COLUMNS.includes(c), false);
+  // every changed-updatable column IS git-authoritative (never a seed-only / dashboard-owned column)
+  for (const c of CHANGED_UPDATE_COLUMNS) assert.equal((GIT_AUTHORITATIVE_COLUMNS as readonly string[]).includes(c), true);
 });
 
 test('apply-plan: a redaction_mismatch (manifest WANTS sensitive) → status "auto" (already #144), not pending', () => {
