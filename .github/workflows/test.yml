@@ -1,0 +1,76 @@
+name: Test
+
+# ──────────────────────────────────────────────────────────────────────────────────────────
+# The runner's FULL unit + integration test suite (npm test = tsc && node --test dist/**/*.test.js).
+# The runner OWNS the schema + extraction logic + migrations — the most load-bearing repo — yet until now
+# its test suite did NOT gate its own merges (only the narrow trace-signals-parity job ran, and only the
+# trace-signals file). This job runs ALL 203 tests, including the 6 DATABASE_URL-gated integration files
+# (evaluate / reconcileApply / deploys / sloBurnStatus.differential / swallowedErrors / specfetch.infraError),
+# against a real Postgres seeded with db/schema.sql — so there are ZERO unguarded skips (a gate that skips 13
+# tests is 13 unguarded tests). A failure fails ci-gate, which holds the merge.
+#
+# db/schema.sql is a clean CREATE-only DDL (grants to "synthwatch-api" are applied via migrations/ops, not
+# here), so it loads into a fresh Postgres with no role setup. This subsumes the narrow trace-signals-parity
+# job (the full suite runs traceSignals.test too); the API-side cross-repo golden checkout lives in
+# synthwatch-api and is unaffected.
+# ──────────────────────────────────────────────────────────────────────────────────────────
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (Node + Postgres)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: runner
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: synthwatch_test
+        ports:
+          - 5432:5432
+        # Wait until the DB accepts connections before the steps run (no race with schema load).
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/synthwatch_test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: runner/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Seed the service DB with the full runner schema (tables + functions: sla_availability / slo_status /
+      # slo_burn_status). psql ships on ubuntu-latest. ON_ERROR_STOP so any DDL failure fails the job.
+      - name: Load the runner schema into Postgres
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f ../db/schema.sql
+
+      - name: Run the full suite (unit + DB integration — 0 skips)
+        run: npm test
