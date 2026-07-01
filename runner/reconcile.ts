@@ -359,6 +359,20 @@ export const GIT_AUTHORITATIVE_COLUMNS = [
 /** Git-seeds-then-dashboard-owns: written on INSERT only, never in the UPDATE SET. */
 export const SEED_ONLY_COLUMNS = ['interval_seconds', 'enabled'] as const;
 
+/** The redaction pair — a SAFETY control owned EXCLUSIVELY by the redaction_mismatch path (b10FieldUpdates,
+ *  the ONLY place REDACTION_STRIP_ALLOWANCE gates a sensitive true→false strip). It must NEVER appear in a
+ *  `changed` UPDATE SET, or a strip could flow through the unguarded changed path. */
+export const REDACTION_COLUMNS = ['sensitive', 'redact_patterns'] as const;
+
+/** ★ The columns a `changed` apply may sync: git-authoritative MINUS the redaction pair. Building the changed
+ *  UPDATE SET from THIS allow-list (single source of truth, in the runner) is what makes a redaction strip
+ *  structurally impossible on the changed path — there is no positional exclusion in the C# executor to desync
+ *  from a schema change; the API executes the emitted statement verbatim (plan-as-contract). Derived from
+ *  GIT_AUTHORITATIVE_COLUMNS so a NEW git-auth column is synced automatically, UNLESS it's a redaction column. */
+export const CHANGED_UPDATE_COLUMNS: readonly string[] = GIT_AUTHORITATIVE_COLUMNS.filter(
+  (c) => !(REDACTION_COLUMNS as readonly string[]).includes(c),
+);
+
 /**
  * Build the field-split apply upsert for one monitor. GATED — built + unit-tested here but
  * NOT invoked by reconcileMain this PR (detect-first). The returned column sets make the
@@ -414,6 +428,41 @@ export function buildApplyUpsert(monitor: Monitor): {
     `ON CONFLICT (source_key) WHERE source_key IS NOT NULL DO UPDATE SET ${setClause}`;
 
   return { text, values, insertColumns, updateColumns };
+}
+
+/**
+ * Build the SCOPED `changed` field-sync UPDATE for one monitor. Unlike buildApplyUpsert (whose ON CONFLICT SET
+ * includes the redaction pair and is used for `new` materialize), this NEVER touches sensitive/redact_patterns:
+ * the SET is built from CHANGED_UPDATE_COLUMNS ∩ the fields that actually drifted, so executing it verbatim
+ * cannot STRIP redaction. Redaction is the redaction_mismatch path's exclusive concern (b10FieldUpdates, where
+ * REDACTION_STRIP_ALLOWANCE lives). spec_path is always re-synced (Git-derived, non-redaction, self-heals NULL —
+ * mirrors buildApplyUpsert). `$1` is source_key (WHERE); SET placeholders start at `$2`. Pure — renders SQL only.
+ */
+export function buildChangedUpdate(
+  monitor: Monitor,
+  driftedFields: readonly string[],
+): { text: string; values: unknown[]; updateColumns: string[] } {
+  assertValidSpecPath(monitor.script);
+  // Manifest values for the NON-redaction git-authoritative columns (the manifest is the source of truth, same
+  // as buildApplyUpsert). The redaction columns are deliberately ABSENT from this map.
+  const columnValue: Record<string, unknown> = {
+    name: monitor.name,
+    kind: monitor.kind,
+    target_url: monitor.target ?? null,
+    flow_name: flowNameFor(monitor),
+  };
+  // SET only the columns that ACTUALLY drifted AND are on the changed allow-list (never sensitive/redact_patterns).
+  const cols = CHANGED_UPDATE_COLUMNS.filter((c) => driftedFields.includes(c));
+  for (const c of cols) {
+    // Fail-closed: if the allow-list ever gains a git-auth column without a value mapping here, throw rather
+    // than silently write a NULL (the same must-go-red discipline as the fail-closed spec gate).
+    if (!(c in columnValue)) throw new Error(`buildChangedUpdate: no manifest value mapping for git-auth column "${c}"`);
+  }
+  const setCols = [...cols, 'spec_path'];
+  const values: unknown[] = [monitor.id, ...cols.map((c) => columnValue[c]), monitor.script];
+  const setClause = setCols.map((c, i) => `${c} = $${i + 2}`).join(', ');
+  const text = `UPDATE checks SET ${setClause} WHERE source_key = $1`;
+  return { text, values, updateColumns: setCols };
 }
 
 // ---------------------------------------------------------------------------
@@ -610,15 +659,23 @@ export function computeApplyPlan(
     } else if (d.drift_type === 'changed') {
       if (!m) continue;
       const fields = Object.keys((d.detail.fields as Record<string, unknown>) ?? {});
-      const upsert = buildApplyUpsert(m); // its ON CONFLICT UPDATE is exactly the changed-field sync
+      // ★★ REDACTION-STRIP SAFETY (the reason this branch is NOT buildApplyUpsert): emit a SCOPED UPDATE whose
+      // SET is built from CHANGED_UPDATE_COLUMNS (git-authoritative MINUS the redaction pair). The full
+      // buildApplyUpsert's ON CONFLICT SET includes sensitive/redact_patterns, so executing it verbatim could
+      // STRIP redaction (sensitive true→false) — bypassing REDACTION_STRIP_ALLOWANCE, which lives ONLY on the
+      // redaction_mismatch write path (b10FieldUpdates). A `changed` apply must never touch redaction; those
+      // columns belong to the redaction_mismatch path. (The changed drift detail carries only non-redaction
+      // git-auth fields to begin with — this SCOPES the statement to exactly those, so the exclusion is enforced
+      // at emission, in ONE place, and the API executes the emitted text verbatim.)
+      const update = buildChangedUpdate(m, fields);
       rows.push({
         source_key: d.source_key,
         drift_type: 'changed',
         status: 'pending',
         plan: {
           disposition: 'pending',
-          summary: `would UPDATE git-authoritative field(s) [${fields.join(', ')}] to match the manifest (ON CONFLICT)`,
-          statements: [{ purpose: 'git-auth field sync (ON CONFLICT DO UPDATE)', text: upsert.text, values: upsert.values }],
+          summary: `would UPDATE git-authoritative field(s) [${fields.join(', ')}] to match the manifest (redaction excluded)`,
+          statements: [{ purpose: 'scoped git-auth field sync (redaction columns excluded)', text: update.text, values: update.values }],
         },
       });
     } else if (d.drift_type === 'redaction_mismatch') {
