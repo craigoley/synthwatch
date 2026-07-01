@@ -96,6 +96,56 @@ test('network summary: counts, top-N, third-party grouping (parity)', () => {
   assert.equal(n.topThirdParties.length, 1); // host-less blob: excluded
   assert.equal(n.topThirdParties[0].host, 'images.wegmans.com');
   assert.equal(n.topThirdParties[0].count, 2);
+
+  assert.deepEqual(n.mutations, []); // GET-only fixture → mutations is an EMPTY list (matches C# empty, not absent)
+});
+
+// ── mutations (POST/PUT/PATCH/DELETE) — parity with C# TraceExtractor.ExtractNetwork Mutations ──────────────
+// GET (document) + one of each mutating method + a trailing GET. Mutating methods captured in FIRST-SEEN order,
+// GETs excluded, shape {method,url,status}, matching MutationDto(Method,Url,Status).
+const MUTATION_NDJSON = [
+  '{"type":"resource-snapshot","snapshot":{"_resourceType":"document","time":10,"timings":{"wait":5},"request":{"url":"https://www.wegmans.com/","method":"GET"},"response":{"status":200,"_transferSize":100,"content":{"size":50}}}}',
+  '{"type":"resource-snapshot","snapshot":{"_resourceType":"fetch","time":20,"timings":{"wait":5},"request":{"url":"https://www.wegmans.com/api/cart","method":"POST"},"response":{"status":201,"_transferSize":100,"content":{"size":50}}}}',
+  '{"type":"resource-snapshot","snapshot":{"_resourceType":"fetch","time":30,"timings":{"wait":5},"request":{"url":"https://www.wegmans.com/api/cart/1","method":"PUT"},"response":{"status":200,"_transferSize":100,"content":{"size":50}}}}',
+  '{"type":"resource-snapshot","snapshot":{"_resourceType":"fetch","time":40,"timings":{"wait":5},"request":{"url":"https://www.wegmans.com/api/cart/1","method":"PATCH"},"response":{"status":200,"_transferSize":100,"content":{"size":50}}}}',
+  '{"type":"resource-snapshot","snapshot":{"_resourceType":"fetch","time":50,"timings":{"wait":5},"request":{"url":"https://www.wegmans.com/api/cart/1","method":"DELETE"},"response":{"status":204,"_transferSize":100,"content":{"size":50}}}}',
+  '{"type":"resource-snapshot","snapshot":{"_resourceType":"fetch","time":60,"timings":{"wait":5},"request":{"url":"https://www.wegmans.com/api/logo","method":"GET"},"response":{"status":200,"_transferSize":100,"content":{"size":50}}}}',
+].join('\n');
+
+test('network mutations: POST/PUT/PATCH/DELETE captured (method+url+status), GETs excluded, first-seen order (parity)', () => {
+  const n = extractNetwork(MUTATION_NDJSON, TARGET);
+  // exact shape + order: mirrors C# reqs.Where(MutatingMethods).Take(12).Select(new MutationDto(Method,Url,Status)).
+  assert.deepEqual(n.mutations, [
+    { method: 'POST', url: 'https://www.wegmans.com/api/cart', status: 201 },
+    { method: 'PUT', url: 'https://www.wegmans.com/api/cart/1', status: 200 },
+    { method: 'PATCH', url: 'https://www.wegmans.com/api/cart/1', status: 200 },
+    { method: 'DELETE', url: 'https://www.wegmans.com/api/cart/1', status: 204 },
+  ]);
+});
+
+test('network mutations are capped at 12 in first-seen order (parity with C# MutationCap)', () => {
+  const lines = Array.from(
+    { length: 15 },
+    (_, i) => `{"type":"resource-snapshot","snapshot":{"_resourceType":"fetch","time":${i},"timings":{"wait":1},"request":{"url":"https://www.wegmans.com/api/x${i}","method":"POST"},"response":{"status":200,"_transferSize":1,"content":{"size":1}}}}`,
+  ).join('\n');
+  const n = extractNetwork(lines, TARGET);
+  assert.equal(n.mutations.length, 12); // 15 POSTs → capped at 12
+  assert.equal(n.mutations[0].url, 'https://www.wegmans.com/api/x0'); // first-seen kept
+  assert.equal(n.mutations[11].url, 'https://www.wegmans.com/api/x11'); // the 13th–15th dropped
+});
+
+// ★ Redaction: a mutation carries a URL → it MUST go through the same redact() the other persisted urls use.
+test('a sensitive monitor mutation url is REDACTED in the persisted signal (not leaked)', () => {
+  const ndjson =
+    '{"type":"resource-snapshot","snapshot":{"_resourceType":"fetch","time":10,"timings":{"wait":5},"request":{"url":"https://www.wegmans.com/shop/cart?session=SECRET123&item=42","method":"POST"},"response":{"status":201,"_transferSize":100,"content":{"size":50}}}}';
+  const redacted = extractNetwork(ndjson, TARGET, makeRedactor(null));
+  assert.equal(redacted.mutations.length, 1);
+  assert.equal(redacted.mutations[0].url, 'https://www.wegmans.com/shop/cart?session=<redacted>&item=42');
+  assert.equal(redacted.mutations[0].method, 'POST'); // method + status untouched
+  assert.equal(redacted.mutations[0].status, 201);
+  // non-sensitive (identity redactor): url byte-for-byte unchanged → byte-matches C#'s raw url.
+  const plain = extractNetwork(ndjson, TARGET, IDENTITY_REDACTOR);
+  assert.equal(plain.mutations[0].url, 'https://www.wegmans.com/shop/cart?session=SECRET123&item=42');
 });
 
 test('extractTraceSignals parses a real zip (both streams) + derives targetHost from the URL', () => {
