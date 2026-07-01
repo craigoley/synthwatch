@@ -5,7 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import AdmZip from 'adm-zip';
-import { writeFileSync, rmSync, mkdtempSync } from 'node:fs';
+import { writeFileSync, rmSync, mkdtempSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { extractNetwork, extractConsole, extractTraceSignals } from './traceSignals.js';
@@ -219,4 +219,41 @@ test('extractConsole redacts a token the site logs when given a redactor', () =>
   // non-sensitive: unchanged.
   const plain = extractConsole(ndjson, TARGET, IDENTITY_REDACTOR);
   assert.equal(plain.messages[0].text, 'checkout failed for token=abc987ZZZ retry');
+});
+
+// ── ★ THE CROSS-REPO PARITY ANCHOR ────────────────────────────────────────────────────────────────────────
+// The golden fixture (test-fixtures/trace-signals-golden/) is the SINGLE source of truth both extractors must
+// reproduce: the runner asserts here, and the API's TraceSignalsGoldenParityTests checks out THIS repo and
+// asserts C# TraceExtractor.FromZip against the SAME expected.json. A divergence on EITHER side fails ITS CI.
+// The golden input deliberately exercises the drift-prone ops the recon audited: roundHalfEven exact-halves
+// (594.5→594, 1026.5→1026, 2.5→2 — banker's/to-even, NOT naive round-half-up), third-party grouping+order,
+// console composite ordering, uncompressed, failed, AND mutations (POST/PUT/DELETE with statuses, post-Move-0).
+// Resolve the golden dir across both run modes: tsx in-place (runner/) and compiled (runner/dist/).
+function goldenDir(): string {
+  const candidates = [
+    join(import.meta.dirname, 'test-fixtures', 'trace-signals-golden'), // npx tsx --test (in-place, cwd runner/)
+    join(import.meta.dirname, '..', 'test-fixtures', 'trace-signals-golden'), // tsc → dist/ then node --test
+  ];
+  for (const c of candidates) if (existsSync(join(c, 'expected.json'))) return c;
+  throw new Error(`golden fixture dir not found (tried: ${candidates.join(', ')})`);
+}
+
+test('★ golden parity: extractTraceSignals(golden input) === expected.json (the cross-repo contract with C#)', () => {
+  const dir = goldenDir();
+  const zip = new AdmZip();
+  zip.addFile('trace.network', readFileSync(join(dir, 'trace.network')));
+  zip.addFile('trace.trace', readFileSync(join(dir, 'trace.trace')));
+  const tdir = tmpDir();
+  const path = join(tdir, 'golden.zip');
+  zip.writeZip(path);
+  try {
+    // The golden was captured with a NON-sensitive (identity) redactor, so the persisted url is raw — this is
+    // exactly the shape the C# FromZip (no redactor) produces, so the two extractors must byte-match here.
+    const sig = extractTraceSignals(path, 'https://www.wegmans.com/checkout');
+    const actual = JSON.parse(JSON.stringify(sig)); // normalize (drop undefined) for a structural compare
+    const expected = JSON.parse(readFileSync(join(dir, 'expected.json'), 'utf8'));
+    assert.deepEqual(actual, expected);
+  } finally {
+    rmSync(tdir, { recursive: true, force: true });
+  }
 });

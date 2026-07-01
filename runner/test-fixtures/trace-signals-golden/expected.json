@@ -1,0 +1,193 @@
+{
+  "targetHost": "www.wegmans.com",
+  "network": {
+    "totalRequests": 8,
+    "wireKb": 2245,
+    "thirdPartyCount": 3,
+    "failed": [
+      {
+        "url": "https://images.wegmans.com/api/x",
+        "status": 404,
+        "resourceType": "fetch",
+        "timeMs": 200,
+        "waitMs": 150,
+        "size": 0,
+        "wire": 500,
+        "encoding": "",
+        "thirdParty": true
+      }
+    ],
+    "slowest": [
+      {
+        "url": "blob:https://www.wegmans.com/abc",
+        "status": 200,
+        "resourceType": "script",
+        "timeMs": 1499,
+        "waitMs": -1,
+        "size": 10,
+        "wire": 0,
+        "encoding": "",
+        "thirdParty": true
+      },
+      {
+        "url": "https://www.wegmans.com/_next/static/chunks/big.js",
+        "status": 200,
+        "resourceType": "script",
+        "timeMs": 1026,
+        "waitMs": 700,
+        "size": 120000,
+        "wire": 50000,
+        "encoding": "",
+        "thirdParty": false
+      },
+      {
+        "url": "https://www.wegmans.com/",
+        "status": 200,
+        "resourceType": "document",
+        "timeMs": 594,
+        "waitMs": 450,
+        "size": 235353,
+        "wire": 43165,
+        "encoding": "gzip",
+        "thirdParty": false
+      },
+      {
+        "url": "https://images.wegmans.com/hero.jpg",
+        "status": 200,
+        "resourceType": "image",
+        "timeMs": 300,
+        "waitMs": 100,
+        "size": 2205000,
+        "wire": 2205000,
+        "encoding": "",
+        "thirdParty": true
+      },
+      {
+        "url": "https://images.wegmans.com/api/x",
+        "status": 404,
+        "resourceType": "fetch",
+        "timeMs": 200,
+        "waitMs": 150,
+        "size": 0,
+        "wire": 500,
+        "encoding": "",
+        "thirdParty": true
+      }
+    ],
+    "largest": [
+      {
+        "url": "https://images.wegmans.com/hero.jpg",
+        "status": 200,
+        "resourceType": "image",
+        "timeMs": 300,
+        "waitMs": 100,
+        "size": 2205000,
+        "wire": 2205000,
+        "encoding": "",
+        "thirdParty": true
+      },
+      {
+        "url": "https://www.wegmans.com/",
+        "status": 200,
+        "resourceType": "document",
+        "timeMs": 594,
+        "waitMs": 450,
+        "size": 235353,
+        "wire": 43165,
+        "encoding": "gzip",
+        "thirdParty": false
+      },
+      {
+        "url": "https://www.wegmans.com/_next/static/chunks/big.js",
+        "status": 200,
+        "resourceType": "script",
+        "timeMs": 1026,
+        "waitMs": 700,
+        "size": 120000,
+        "wire": 50000,
+        "encoding": "",
+        "thirdParty": false
+      },
+      {
+        "url": "https://www.wegmans.com/api/cart",
+        "status": 201,
+        "resourceType": "fetch",
+        "timeMs": 2,
+        "waitMs": 0,
+        "size": 50,
+        "wire": 100,
+        "encoding": "",
+        "thirdParty": false
+      },
+      {
+        "url": "https://www.wegmans.com/api/cart/1",
+        "status": 200,
+        "resourceType": "fetch",
+        "timeMs": 4,
+        "waitMs": 2,
+        "size": 50,
+        "wire": 100,
+        "encoding": "",
+        "thirdParty": false
+      }
+    ],
+    "uncompressed": [
+      {
+        "url": "https://www.wegmans.com/_next/static/chunks/big.js",
+        "status": 200,
+        "resourceType": "script",
+        "timeMs": 1026,
+        "waitMs": 700,
+        "size": 120000,
+        "wire": 50000,
+        "encoding": "",
+        "thirdParty": false
+      }
+    ],
+    "topThirdParties": [
+      {
+        "host": "images.wegmans.com",
+        "count": 2,
+        "kb": 2153
+      }
+    ],
+    "mutations": [
+      {
+        "method": "POST",
+        "url": "https://www.wegmans.com/api/cart",
+        "status": 201
+      },
+      {
+        "method": "PUT",
+        "url": "https://www.wegmans.com/api/cart/1",
+        "status": 200
+      },
+      {
+        "method": "DELETE",
+        "url": "https://www.wegmans.com/api/cart/1",
+        "status": 204
+      }
+    ]
+  },
+  "console": {
+    "messages": [
+      {
+        "level": "error",
+        "origin": "site",
+        "text": "component:SiteHeaderSearch:helpers Invalid discovery pages storage data"
+      },
+      {
+        "level": "error",
+        "origin": "third-party",
+        "text": "WebSocket connection to 'wss://realtime-c.astutebot.com/eventHub' failed"
+      },
+      {
+        "level": "warning",
+        "origin": "site",
+        "text": "[Meta Pixel] - Duplicate Pixel ID: 376538596548029."
+      }
+    ],
+    "droppedInfoLog": 2,
+    "droppedExtensionNoise": 5
+  }
+}
