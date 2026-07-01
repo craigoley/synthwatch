@@ -20,3 +20,9 @@ npm-debug.log*
 .DS_Store
 .vscode/
 .idea/
+
+# Scratch analysis docs + scratch dirs — session working files, never committed (footgun: git add -A
+# swept these into commits repeatedly). scratch/ is defensive here (no such dir today); it holds probe
+# scaffolding in sibling repos.
+ANALYSIS-*.md
+scratch/
