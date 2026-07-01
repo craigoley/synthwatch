@@ -14,6 +14,8 @@
 import { chromium, type Browser } from 'playwright';
 import { pool, type Check, type RunRecord, type TerminalStatus } from './db.js';
 import { runHttpCheck } from './httpCheck.js';
+import { noteDeployMarker } from './deploys.js';
+import { captureMainDocHeaders } from './browserMarker.js';
 import { runSslCheck } from './sslCheck.js';
 import { runDnsCheck, runTcpCheck, runPingCheck } from './netChecks.js';
 import { runMultistepChain } from './multistep.js';
@@ -849,6 +851,11 @@ async function executeBrowser(
   // the whole page load; collected in the finally below.
   const capture = await startMetricsCapture(context, page);
 
+  // Deploy-markers browser path: retain the MAIN navigation document's response headers (the header half of
+  // input parity with the http path). Installed BEFORE the flow so the listener sees the navigation; read at
+  // the pass branch below alongside page.content(). Best-effort — never throws, never affects the run.
+  const getMainDocHeaders = captureMainDocHeaders(page);
+
   // Start a Playwright trace for the whole run (recording always happened; the cost change is the
   // SAVE). We keep it on FAILURE (per-run, rides the 90d purge) and on SUCCESS when captureSuccessTrace
   // is set (the last-known-good baseline). sources:false avoids embedding the flow source;
@@ -905,6 +912,14 @@ async function executeBrowser(
       // it's already rendered; we'd otherwise discard it). Non-fatal; runOne only
       // stores it if the final verdict is 'pass' (not a perf-budget 'warn').
       baselineScreenshot = await page.screenshot().catch(() => null);
+
+      // Deploy-markers browser path: feed the SAME curated ladder BOTH the rendered DOM and the main-doc
+      // response headers (input parity with the http path) so wegmans' sentry-release SHA (a body marker) and
+      // an etag-only host (a header marker) both land — per host, no per-target logic. PASS-ONLY: a red run's
+      // DOM is an unreliable deploy fingerprint (mirror the baseline-capture gating). Fully best-effort —
+      // noteDeployMarker is internally try/caught, and page.content() is guarded so it can never fail or slow a run.
+      const domHtml = await page.content().catch(() => null);
+      await noteDeployMarker(check.target_url, getMainDocHeaders(), domHtml, check.id, 'browser');
     } catch (err) {
       // A flow ExpectationError is a clean assertion miss ('fail'); any other
       // throw (Playwright timeout, navigation crash, loader error) is 'error'.
