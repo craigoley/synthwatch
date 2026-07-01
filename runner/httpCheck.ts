@@ -103,9 +103,14 @@ export async function runHttpCheck(check: Check): Promise<HttpResult> {
     const isHtml = (res.headers.get('content-type') ?? '').includes('text/html');
     let body: string | null = null;
     let sizeBytes: number | null = null;
-    if (needsBody || isHtml) {
+    if (needsBody) {
       body = await res.text();
-      sizeBytes = needsBody ? Buffer.byteLength(body) : null;
+      sizeBytes = Buffer.byteLength(body);
+    } else if (isHtml) {
+      // Best-effort read purely to mine a deploy marker. No assertion depends on it, so a body-read
+      // failure/timeout here must NEVER flip a healthy status-only check to 'error' (the marker feature
+      // is "never fails a run"). Swallow it — worst case we just miss a marker this tick.
+      body = await res.text().catch(() => null);
     } else {
       // No body assertion + non-HTML: discard the unread stream so undici can release the
       // socket promptly instead of holding it open until GC.
