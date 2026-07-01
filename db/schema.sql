@@ -1008,4 +1008,19 @@ CREATE TABLE runner_errors (
 );
 CREATE INDEX runner_errors_occurred_at_idx ON runner_errors (occurred_at DESC);
 
+-- deploys (migration 0056) — auto-detected deploy markers, one row per (host, distinct marker).
+CREATE TABLE deploys (
+    id           bigserial   PRIMARY KEY,
+    target_host  text        NOT NULL,
+    sha          text,
+    fingerprint  text        NOT NULL,
+    is_sha       boolean     NOT NULL DEFAULT false,
+    source       text        NOT NULL,
+    deployed_at  timestamptz NOT NULL DEFAULT now(),
+    detected_at  timestamptz NOT NULL DEFAULT now(),
+    detail       jsonb,
+    CONSTRAINT deploys_host_fingerprint_key UNIQUE (target_host, fingerprint)
+);
+CREATE INDEX deploys_host_time_idx ON deploys (target_host, deployed_at DESC);
+
 COMMIT;

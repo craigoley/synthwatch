@@ -13,6 +13,7 @@ import {
   type Assertion,
   type ResponseFacets,
 } from './assertions.js';
+import { noteDeployMarker } from './deploys.js';
 
 export interface HttpResult {
   // 'pass'  = all assertions met.
@@ -97,16 +98,24 @@ export async function runHttpCheck(check: Check): Promise<HttpResult> {
     const needsBody = assertions.some(
       (a) => a.source === 'body' || a.source === 'json_path' || a.source === 'size',
     );
+    // Read the body if an assertion needs it OR if it's HTML we can mine for a deploy marker (sentry-release /
+    // build-id / Next buildId live in the body; the etag marker is header-only). Otherwise release the socket.
+    const isHtml = (res.headers.get('content-type') ?? '').includes('text/html');
     let body: string | null = null;
     let sizeBytes: number | null = null;
-    if (needsBody) {
+    if (needsBody || isHtml) {
       body = await res.text();
-      sizeBytes = Buffer.byteLength(body);
+      sizeBytes = needsBody ? Buffer.byteLength(body) : null;
     } else {
-      // No body assertion: discard the unread stream so undici can release the
+      // No body assertion + non-HTML: discard the unread stream so undici can release the
       // socket promptly instead of holding it open until GC.
       await res.body?.cancel().catch(() => {});
     }
+
+    // Deploy-markers v1: auto-detect a deploy-identity marker from the response we already fetched. Best-effort
+    // (never fails the run); records a deploy on marker change, or flags a silent-null for a host that used to
+    // have one. sizeBytes stays null for the marker-only body read (no body assertion → no size to report).
+    await noteDeployMarker(check.target_url, res.headers, body, check.id);
 
     const facets: ResponseFacets = {
       status: res.status,
