@@ -15,6 +15,8 @@
 // the result; PR 2 adds the red_tests table + the INSERT + the API read.
 import { chromium } from 'playwright';
 import type { Check } from './db.js';
+import { pool } from './db.js';
+import type { Queryable } from './deploys.js';
 import { runHttpCheck } from './httpCheck.js';
 import { getCompiledSpecFromPool } from './specfetch/specCache.js';
 import { loadCompiledSpec } from './specfetch/compileSpec.js';
@@ -154,4 +156,22 @@ export function recordAttested(check: Check, att: Attestation): RedTestResult {
     verdict: null,
     detail: `MANUAL attestation (weaker than an executed red-test): a human ran the red-test and observed '${att.outcome}'. Evidence: ${att.evidenceRef}.`,
   };
+}
+
+/**
+ * ★ THE CAPTURE (PR 2) — the load-bearing honesty guardrail made a WRITE. Persist a red_tests row ONLY for a
+ * CONFIRMED red (outcome='red' — an executed harness proof, or an attested-manual RED). An 'inconclusive'
+ * result (the run failed for an UNRELATED reason) or a 'not-red' result (a weak assertion) writes NOTHING:
+ * captured=true is backed ONLY by a real red-test, NEVER inferred from a fail run or RCA. Returns true iff a
+ * row was written. Reconcile-safe by construction (a separate table; reconcile only writes `checks`). The
+ * outcome column is CHECK-constrained to 'red' in the schema, so this is also enforced below the write path.
+ */
+export async function persistRedTest(result: RedTestResult, db: Queryable = pool): Promise<boolean> {
+  if (result.outcome !== 'red') return false;
+  await db.query(
+    `INSERT INTO red_tests (check_id, method, outcome, detail)
+     VALUES ($1, $2, 'red', $3::jsonb)`,
+    [result.checkId, result.method, JSON.stringify({ fault: result.fault, verdict: result.verdict, detail: result.detail })],
+  );
+  return true;
 }
