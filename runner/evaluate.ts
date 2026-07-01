@@ -764,6 +764,22 @@ export async function burnStateFromTs(check: Check, exec: Queryable = pool): Pro
 }
 
 /**
+ * The burn STATE from the SHARED SQL function slo_burn_status — the SAME rows the read path (/reports/slo
+ * pills) uses, so read and page can never diverge. The differential red-test proves this equals
+ * burnStateFromTs (retained as the frozen oracle) byte-for-byte. slo_burn_status always returns one row.
+ */
+export async function burnStateFromSql(checkId: number, exec: Queryable = pool): Promise<BurnState> {
+  const { rows } = await exec.query<{ burn_state: 'fast' | 'slow' | 'none'; reported_burn: string | number }>(
+    `SELECT burn_state, reported_burn FROM slo_burn_status($1)`,
+    [checkId],
+  );
+  const r = rows[0];
+  return r
+    ? { burn_state: r.burn_state, reported_burn: Number(r.reported_burn) }
+    : { burn_state: 'none', reported_burn: 0 };
+}
+
+/**
  * SLO burn-rate alerting — opt-in (only when the check has slo_target). Routes a
  * fast-burn (1h) page or slow-burn (6h) ticket through the EXISTING alert profiles
  * (fast => 'error'/critical, slow => 'warn'/warning), debounced via
@@ -784,12 +800,13 @@ export async function maybeBurnAlert(check: Check): Promise<void> {
     let burn: number;
 
     // Page only when burn crosses threshold from >= N locations — the SAME effectiveN() as the incident
-    // verdict (so the two never diverge), over the burn-REPORTING locations (those with samples in the
-    // window) — AND each burning location has a real sample (>= failure_threshold runs) so one flaky
-    // region / a single failed run can't page. This is computed by burnStateFromTs (extracted verbatim);
-    // the differential red-test proves slo_burn_status reproduces it byte-for-byte. STATE ONLY — the
-    // dispatch suppressors (open incident / maintenance / debounce) are applied above + below, not in it.
-    const state = await burnStateFromTs(check);
+    // verdict, over the burn-REPORTING locations, AND each burning location has a real sample (>=
+    // failure_threshold runs) so one flaky region / a single failed run can't page.
+    // ★ STEP 3: the burn STATE now comes from the SHARED SQL function slo_burn_status (read == page) — the
+    // SAME rows /reports/slo reads. Byte-identical to the old inline TS path: the differential red-test
+    // asserts slo_burn_status == burnStateFromTs (the retained frozen oracle). STATE ONLY — the dispatch
+    // suppressors (open incident / maintenance / debounce) are applied above + below, exactly as before.
+    const state = await burnStateFromSql(check.id);
     if (state.burn_state === 'fast') {
       severity = 'critical'; label = 'fast burn'; windowLabel = '1h';
       burn = state.reported_burn;
