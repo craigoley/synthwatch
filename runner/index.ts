@@ -344,10 +344,12 @@ async function drainRunRequests(): Promise<number> {
       await runOne(check);
       ran++;
     } catch (err) {
-      console.warn(
-        `[run-now] check ${check_id} on-demand run threw (drain continues; check re-runs on cron):`,
-        err,
-      );
+      // ★ Mirror the due-loop (#162): record to the QUERYABLE runner_errors sink, not stdout-only. An
+      // on-demand run that throws AFTER runOne's finalize was previously console.warn → invisible to
+      // SELECT * FROM runner_errors (the same silent-monitoring class the due-loop closed; smaller,
+      // user-initiated blast radius). recordFatal writes the row (phase='on-demand-loop') AND still logs
+      // stdout with the invocation/check/run context. The drain still CONTINUES; the check re-runs on cron.
+      await recordFatal('on-demand-loop', err);
     }
   }
   return ran;
