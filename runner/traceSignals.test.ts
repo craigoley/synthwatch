@@ -135,18 +135,13 @@ test('network mutations are capped at 12 in first-seen order (parity with C# Mut
 });
 
 // ★ PARITY: the mutation url is stored RAW to byte-match C# (MutationDto stores r.Url; FromZip has no redactor).
-// It must NOT be redacted even for a sensitive monitor — redacting here (as #169 did) diverges from C# on a
-// sensitive input. (The regular network urls in `slim` still redact — that's a separate, established choice.)
-test('the mutation url is stored RAW (not redacted), byte-matching C#, even under a redactor', () => {
+// extractNetwork takes NO redactor at all — network-url redaction is structurally impossible now, so a
+// session-token-carrying url is stored raw (the fleet's store-more policy; these are non-sensitive monitors).
+test('the mutation url is stored RAW (not redacted), byte-matching C#', () => {
   const ndjson =
     '{"type":"resource-snapshot","snapshot":{"_resourceType":"fetch","time":10,"timings":{"wait":5},"request":{"url":"https://www.wegmans.com/shop/cart?session=SECRET123&item=42","method":"POST"},"response":{"status":201,"_transferSize":100,"content":{"size":50}}}}';
-  const RAW = 'https://www.wegmans.com/shop/cart?session=SECRET123&item=42';
-  // even with a real redactor (the sensitive path), the mutation url is UNCHANGED — parity with C#.
-  const withRedactor = extractNetwork(ndjson, TARGET, makeRedactor(null));
-  assert.equal(withRedactor.mutations[0].url, RAW);
-  // and identical without one (non-sensitive) — both paths agree with C#'s raw url.
-  const plain = extractNetwork(ndjson, TARGET, IDENTITY_REDACTOR);
-  assert.equal(plain.mutations[0].url, RAW);
+  const n = extractNetwork(ndjson, TARGET);
+  assert.equal(n.mutations[0].url, 'https://www.wegmans.com/shop/cart?session=SECRET123&item=42');
 });
 
 test('extractTraceSignals parses a real zip (both streams) + derives targetHost from the URL', () => {
@@ -196,18 +191,16 @@ test('extractTraceSignals -> null when the zip has no trace entries (not a Playw
   }
 });
 
-// ── B10: trace_signals are SCRUBBED when a redactor is passed (sensitive monitors) ───────────────
-test('extractNetwork redacts session tokens in the STORED url when given a redactor', () => {
+// ★ PARITY (inverted from the old "redacts the STORED url" test): network urls are stored RAW, byte-matching
+// C# (TraceRequestDto Slim stores r.Url; FromZip has no redactor). extractNetwork takes no redactor, so a
+// session-token url stays raw everywhere — completing the raw-URL parity #171 started for mutations.
+test('extractNetwork stores the network url RAW (byte-matching C#, no redaction)', () => {
   const ndjson = [
     '{"type":"resource-snapshot","snapshot":{"_resourceType":"fetch","time":10,"timings":{"wait":5},"request":{"url":"https://www.wegmans.com/shop/cart?session=SECRET123&item=42","method":"GET"},"response":{"status":200,"_transferSize":100,"content":{"size":50,"mimeType":"application/json"},"headers":[]}}}',
   ].join('\n');
-  const redacted = extractNetwork(ndjson, TARGET, makeRedactor(null));
-  assert.equal(redacted.slowest[0].url, 'https://www.wegmans.com/shop/cart?session=<redacted>&item=42');
-  // host-grouping/classification still works (host carries no secret) — it's still a same-site request.
-  assert.equal(redacted.totalRequests, 1);
-  // ...and WITHOUT a redactor (non-sensitive) the url is byte-for-byte unchanged.
-  const plain = extractNetwork(ndjson, TARGET, IDENTITY_REDACTOR);
-  assert.equal(plain.slowest[0].url, 'https://www.wegmans.com/shop/cart?session=SECRET123&item=42');
+  const n = extractNetwork(ndjson, TARGET);
+  assert.equal(n.slowest[0].url, 'https://www.wegmans.com/shop/cart?session=SECRET123&item=42'); // raw, not <redacted>
+  assert.equal(n.totalRequests, 1); // host-grouping/classification still works (same-site)
 });
 
 test('extractConsole redacts a token the site logs when given a redactor', () => {

@@ -112,7 +112,7 @@ export function extractTraceSignals(
     if (networkNdjson === null && traceNdjson === null) return null; // not a Playwright trace
     return {
       targetHost,
-      network: networkNdjson !== null ? extractNetwork(networkNdjson, targetHost, redact) : EMPTY_NETWORK,
+      network: networkNdjson !== null ? extractNetwork(networkNdjson, targetHost) : EMPTY_NETWORK,
       console: traceNdjson !== null ? extractConsole(traceNdjson, targetHost, redact) : EMPTY_CONSOLE,
     };
   } catch {
@@ -142,7 +142,6 @@ interface Req {
 export function extractNetwork(
   networkNdjson: string,
   targetHost: string | null,
-  redact: Redactor = IDENTITY_REDACTOR,
 ): NetworkSummary {
   const reqs: Req[] = [];
   for (const line of lines(networkNdjson)) {
@@ -167,10 +166,12 @@ export function extractNetwork(
     });
   }
 
-  // Redact the STORED url (session-token query params etc.) for sensitive monitors; host-grouping
-  // above runs on the raw url (hosts carry no secrets). No-op for non-sensitive monitors.
+  // Store the url RAW — byte-matching C# (TraceRequestDto Slim stores r.Url; FromZip has no redactor). Network
+  // urls are NEVER redacted, completing the raw-URL parity #171 started for mutation urls: a divergence here (as
+  // the runner did before) only shows on a sensitive input, which the golden guard can't see. Redaction on the
+  // persist path is now scoped to console TEXT only (extractConsole below), not network urls.
   const slim = (r: Req): TraceRequest => ({
-    url: redact(r.url),
+    url: r.url,
     status: r.status,
     resourceType: r.rtype,
     timeMs: r.time,
