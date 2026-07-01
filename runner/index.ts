@@ -174,7 +174,17 @@ async function main(): Promise<void> {
       // Another replica claimed it first, or it's no longer due.
       continue;
     }
-    await runOne(check);
+    // ★ B5: per-iteration try/catch (mirrors the on-demand drain above). runOne is try/FINALLY with NO
+    // catch, so a throw AFTER its finalize block (the terminal UPDATE / evaluate / alerts / OTel) — or a
+    // pool error in the 'running' INSERT — propagates and would abort the REST of this tick's due checks:
+    // a silent monitoring gap (the whole fleet stops mid-tick). Catch it, record to the queryable sink
+    // (runner_errors + stdout carrying the invocation/check/run context set in runOne), and CONTINUE. The
+    // run row itself is already stamped 'error' by runOne's B2 finalize fallback; the check re-runs next tick.
+    try {
+      await runOne(check);
+    } catch (err) {
+      await recordFatal('due-loop', err);
+    }
   }
 }
 
