@@ -35,6 +35,10 @@
 #                                     #   of WAITING for CI to finish building the target (the default).
 #   scripts/deploy.sh --post-reconcile # after deploy+verify: trigger the reconcile job, WAIT,
 #                                     #   then print spec_catalog + reconcile_drift (no manual sleep).
+#   scripts/deploy.sh --sync          # after a SUCCESSFUL deploy, reset local main to origin/main IF it's
+#                                     #   stale/behind (opt-in; refuses on a dirty tree). Default: OFF —
+#                                     #   the working tree is never auto-mutated; without it, a stale main
+#                                     #   only prints the sync one-liner as a suggestion.
 #   scripts/deploy.sh --help
 #
 # Requires: az (logged in), jq, git, curl; psql for the DB check (provided via ~/.synthwatch.env PATH).
@@ -77,6 +81,11 @@ readonly TEMPLATE="${ROOT}/infra/main.bicep"
 WHATIF_ONLY=0
 POST_RECONCILE=0
 SHA_OVERRIDE=''
+# ★ --sync (opt-in): after a SUCCESSFUL deploy, if local main is stale/behind vs origin, reset it to
+# origin/main. OFF by default — the working tree is NEVER auto-mutated. Even when set, it refuses on a
+# dirty tree (won't clobber uncommitted work). Set by classification; read post-deploy (offer_local_sync).
+SYNC_AFTER=0
+DRIFT_STATE=''
 # ★ FIX 3: when the newest deployable image PREDATES the target (CI mid-build), WAIT for CI to
 # finish building the target then proceed, instead of erroring out + making the user re-run.
 # Default ON; --no-wait restores the old immediate-refuse behavior. A CI FAILURE or a timeout
@@ -109,7 +118,7 @@ c_bold()  { printf '\033[1m%s\033[0m\n' "$*"; }
 fail() { c_red "ERROR: $*" >&2; exit 1; }
 
 usage() {
-  sed -n '3,40p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '3,45p' "$0" | sed 's/^# \{0,1\}//'
   exit 0
 }
 
@@ -124,6 +133,7 @@ while [[ $# -gt 0 ]]; do
     # image is overridden only with --sha — so there is nothing left for --yes to auto-proceed.
     --yes|-y) shift ;;
     --post-reconcile) POST_RECONCILE=1; shift ;;
+    --sync) SYNC_AFTER=1; shift ;;       # opt-in: reset local main to origin/main AFTER a successful deploy (refuses on a dirty tree)
     --no-wait) WAIT_FOR_CI=0; shift ;;   # ★ FIX 3: don't wait for CI — refuse immediately on a stale-image halt
     --sha) [[ $# -ge 2 ]] || fail "--sha needs a value"; SHA_OVERRIDE="$2"; shift 2 ;;
     --help|-h) usage ;;
@@ -317,6 +327,7 @@ sync_target_to_origin() {
     || fail "cannot resolve origin/main — is the 'origin' remote configured with a 'main' branch?"
   local_head="$(git rev-parse HEAD 2>/dev/null || echo '')"
   state="$(git_drift_state "${local_head}" "${origin_head}")"
+  DRIFT_STATE="${state}"   # hoisted for the post-deploy sync offer (offer_local_sync)
   case "${state}" in
     same)
       c_green "Local main == origin/main (${origin_head:0:12}) — deploying that." >&2 ;;
@@ -327,13 +338,54 @@ sync_target_to_origin() {
       # reserved for the 'diverged' case below — local commits that are NOT on origin).
       c_green "NOTE: local main is behind origin/main (benign, fast-forwardable) — deploying origin/main ${origin_head:0:12}." >&2
       c_green "      ('git pull' to catch up — not required; the deploy always targets origin.)" >&2 ;;
+    stale)
+      # ★ BENIGN squash-merge leftover: local main has commit(s) that aren't literally on origin, but
+      # git_drift_state confirmed every one is ALREADY on origin as an equivalent patch (the PR merged
+      # as a new squash SHA). Nothing un-merged is at risk, so this is a calm green NOTE — NOT the loud
+      # 'diverged' WARN. This is the case that repeatedly read like a failure; say plainly it's expected.
+      c_green "NOTE: local main is STALE (squash-merge leftover) — this is expected after a merge. Deploying" >&2
+      c_green "      origin/main ${origin_head:0:12} (the merged code). Your local commit(s) below are pre-squash" >&2
+      c_green "      duplicates, already on origin as a squash — safe to discard with:" >&2
+      c_green "          git checkout main && git fetch origin && git reset --hard origin/main" >&2
+      git log --oneline origin/main..HEAD 2>/dev/null | sed 's/^/        pre-squash duplicate (untouched): /' >&2 || true ;;
     diverged)
-      # local has commit(s) NOT on origin (e.g. an orphan never pushed). DO NOT reset — IGNORE them.
-      c_yellow "WARN: local main has commit(s) NOT on origin/main (diverged) — IGNORING them; deploying origin/main ${origin_head:0:12}:" >&2
+      # GENUINE divergence — local has commit(s) whose CHANGES are NOT on origin (real unpushed work, an
+      # orphan never pushed/built). It has no image, so it must NOT be the deploy target. DO NOT reset —
+      # IGNORE them and deploy origin. This is the one case that warrants the loud yellow WARN.
+      c_yellow "WARN: local main has un-merged commit(s) NOT on origin/main (genuine divergence) — IGNORING them; deploying origin/main ${origin_head:0:12}:" >&2
       git log --oneline origin/main..HEAD 2>/dev/null | sed 's/^/        local-only (untouched): /' >&2 || true
       c_yellow "      (Push + let CI build a local commit to deploy it, or use --sha. Your tree is left as-is.)" >&2 ;;
   esac
   TARGET_HEAD="${origin_head}"
+}
+
+# ---------------------------------------------------------------------------
+# offer_local_sync — post-deploy affordance for a stale/behind local main. OFFERS a sync, NEVER forces it:
+#   • default (no --sync): print the one-liner as a SUGGESTION only — the working tree is left untouched.
+#   • --sync: the user explicitly opted in, so reset local main to origin/main — BUT still refuse on a dirty
+#     tree (uncommitted work is never clobbered, even on request). The no-auto-mutate property is preserved:
+#     the tree only changes when the user both passed --sync AND has nothing uncommitted to lose.
+# Only relevant for 'stale'/'behind' (a benign, subsumed local); 'diverged' (real work) and 'same' are skipped.
+# ---------------------------------------------------------------------------
+offer_local_sync() {
+  case "${DRIFT_STATE}" in stale|behind) ;; *) return 0 ;; esac
+  if [[ "${SYNC_AFTER}" -eq 1 ]]; then
+    if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
+      c_yellow "--sync requested, but the working tree has UNCOMMITTED changes — NOT resetting (would lose them)." >&2
+      c_yellow "      Commit or stash them first, then: git checkout main && git fetch origin && git reset --hard origin/main" >&2
+      return 0
+    fi
+    c_bold "--sync: local main is ${DRIFT_STATE} and the tree is clean — resetting it to origin/main…" >&2
+    if git checkout main --quiet 2>/dev/null && git fetch origin --quiet 2>/dev/null && git reset --hard origin/main >/dev/null 2>&1; then
+      c_green "Local main is now at origin/main ($(git rev-parse --short origin/main 2>/dev/null))." >&2
+    else
+      c_yellow "WARN: --sync reset failed — the deploy still succeeded (it shipped origin/main); sync manually." >&2
+    fi
+  else
+    c_green "Tip: local main is ${DRIFT_STATE} vs origin/main (the deploy already shipped origin/main). To sync it (optional):" >&2
+    c_green "        git checkout main && git fetch origin && git reset --hard origin/main" >&2
+    c_green "     or re-run with --sync to do it automatically after a successful deploy (skipped if the tree is dirty)." >&2
+  fi
 }
 
 # Derive the target from origin/main (unless --sha overrides the whole pick). --sha is the manual escape
@@ -710,6 +762,11 @@ main() {
     c_bold "Post-reconcile (--post-reconcile)…"
     post_reconcile || c_red "post-reconcile reported a problem (see above)."
   fi
+
+  # Deploy shipped (origin/main). If local main is a benign stale/behind checkout, OFFER to sync it —
+  # print the one-liner, or perform it only if --sync was passed and the tree is clean. Never auto-mutates.
+  echo
+  offer_local_sync
 
   exit "$(( VERIFY_FAILS > 0 ? 1 : 0 ))"
 }
