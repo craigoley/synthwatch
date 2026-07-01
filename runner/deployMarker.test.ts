@@ -14,11 +14,20 @@ test('ladder prefers the sentry-release SHA over an etag when BOTH are present',
   assert.equal(m?.is_sha, true); // 40-hex → a real commit id
 });
 
-test('falls back to etag when only an etag is present (is_sha=false)', () => {
-  const m = extractDeployMarker({ etag: 'W/"93718211"' }, '<html>no markers here</html>');
+test('falls back to etag when only an etag is present on an HTML document (is_sha=false)', () => {
+  const m = extractDeployMarker({ etag: 'W/"93718211"', 'content-type': 'text/html; charset=utf-8' }, '<html>no markers here</html>');
   assert.equal(m?.source, 'etag');
   assert.equal(m?.value, '93718211'); // W/ + quotes stripped
   assert.equal(m?.is_sha, false);
+});
+
+// ★★ THE FALSE-POSITIVE GUARD (etag rung): the etag content-hash justification holds ONLY for the root HTML
+// document. A JSON/API endpoint's etag is header-only and often per-request → a phantom deploys row EVERY run.
+// The rung is gated on content-type text/html, so a non-HTML (or unknown-type) etag produces NO marker.
+test('★ an etag on a NON-HTML (JSON/API) response produces NO marker (phantom-deploy guard)', () => {
+  assert.equal(extractDeployMarker({ etag: '"abc123"', 'content-type': 'application/json' }, null), null);
+  // no content-type at all → response kind unknown → not trusted for the etag rung
+  assert.equal(extractDeployMarker({ etag: '"abc123"' }, null), null);
 });
 
 test('returns null when neither a known body marker nor an etag exists (amore/nextdoor today)', () => {

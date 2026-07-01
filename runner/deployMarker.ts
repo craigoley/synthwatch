@@ -29,6 +29,11 @@ const isSha = (v: string) => SHA_RE.test(v);
 // NOTE: an allowlist — csrf-token, viewport, theme-color, description, etc. are NOT deploy markers.
 const META_IDENTITY_NAMES = ['commit', 'git-sha', 'build-sha', 'build-id', 'buildid', 'revision', 'release', 'version'];
 
+/** True iff the response is an HTML document (content-type text/html) — the ONLY context the etag rung trusts. */
+function isHtmlResponse(headers: Headers | Record<string, string> | undefined): boolean {
+  return (header(headers, 'content-type') ?? '').toLowerCase().includes('text/html');
+}
+
 /** Read a header case-insensitively from a Headers or a plain object. */
 function header(headers: Headers | Record<string, string> | undefined, name: string): string | null {
   if (!headers) return null;
@@ -77,12 +82,15 @@ export function extractDeployMarker(
     if (bid && bid !== 'development') return { source: 'next-build-id', value: bid, is_sha: false };
   }
 
-  // ── 4. etag on the root document (meals2go) — the WEAKEST rung: a content-change signal, not a build id ──
-  //    Deploy-stable for static/SSG content (a content hash that changes on redeploy). is_sha=false. The
-  //    recording path is cadence-bounded + per-host deduped so a slowly-changing etag can't spam phantom rows;
-  //    a genuinely per-request etag is a target-specific risk we accept for the tier-3 fallback (labeled
-  //    honestly as "deploy detected, no commit id" in the UI).
-  const etagRaw = header(headers, 'etag');
+  // ── 4. etag on the root HTML document (meals2go) — the WEAKEST rung: a content-change signal, not a build id ──
+  //    Deploy-stable for static/SSG content (a content hash that changes on redeploy). is_sha=false.
+  //    ★ GATED ON content-type text/html: the "deploy-stable content hash" justification holds ONLY for the root
+  //    HTML document. A JSON/API endpoint (synthwatch-api, httpbin, …) commonly returns a per-request or
+  //    content-hash etag; since this rung is header-only it would otherwise fabricate a NEW deploys row on EVERY
+  //    run for such a target — the exact phantom-deploy machine the false-positive guard forbids. Restricting to
+  //    HTML keeps the tier-3 fallback inside its documented intent. (Even for HTML the recording path is
+  //    cadence-bounded + per-host deduped, and it's labeled honestly as "deploy detected, no commit id" in the UI.)
+  const etagRaw = isHtmlResponse(headers) ? header(headers, 'etag') : null;
   if (etagRaw) {
     const value = etagRaw.replace(/^W\//i, '').replace(/^"|"$/g, '').trim();
     if (value) return { source: 'etag', value, is_sha: false };
