@@ -270,6 +270,13 @@ CREATE TABLE runs (
 -- consecutive-failure count in evaluate.ts).
 CREATE INDEX runs_check_started_idx ON runs (check_id, started_at DESC);
 
+-- Backs the stale-'running' reap (reapStaleRunning() in runner/index.ts, ~288×/day):
+--   WHERE status='running' AND started_at < now() - interval '30 min'.
+-- PARTIAL on the handful of in-flight rows (not the whole history), so the reap is an
+-- index scan over ~1 row instead of a full seq scan of the unbounded runs table.
+-- Mirrors 0058_runs_running_started_idx.sql (created CONCURRENTLY on a live DB).
+CREATE INDEX runs_running_started_idx ON runs (started_at) WHERE status = 'running';
+
 -- ---------------------------------------------------------------------------
 -- run_steps: structural funnel telemetry. Every StepRecorder.step() writes one
 -- row here (pass or fail) so a browser flow's failure point is durable.

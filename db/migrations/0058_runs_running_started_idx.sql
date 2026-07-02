@@ -1,0 +1,36 @@
+-- Migration 0058 — runs_running_started_idx: back the stale-'running' reap.
+--
+-- reapStaleRunning() (runner/index.ts) runs EVERY tick (~288×/day) to reap runs stuck
+-- in 'running' past STALE_RUNNING (30 min):
+--   UPDATE runs SET status='error', ...
+--    WHERE status = 'running' AND started_at < now() - make_interval(mins => 30)
+-- EXPLAIN (ANALYZE, BUFFERS) against prod showed a full SEQ SCAN of the whole runs table
+-- (~19,786 rows, Rows Removed by Filter ~19,786) to find the ~0-1 currently-running rows —
+-- because no existing index serves status='running' (only runs_pkey and
+-- runs_check_started_idx on (check_id, started_at DESC)). Cost grows linearly with the
+-- unbounded runs table.
+--
+-- A PARTIAL index on (started_at) WHERE status='running' is tiny (indexes only the handful
+-- of in-flight rows, not the whole history) and turns the reap into an index scan over ~1
+-- row. Column order matches the reap's range predicate (started_at < cutoff).
+--
+-- ★ CONCURRENTLY (no table lock): runs is the hottest, most write-heavy table on a live DB;
+-- a plain CREATE INDEX takes ACCESS EXCLUSIVE for the whole build and would block every
+-- run insert/finalize. CONCURRENTLY builds without blocking writers.
+--
+-- ★ NO TRANSACTION BLOCK (unlike sibling migrations): CREATE INDEX CONCURRENTLY cannot run
+-- inside a transaction. migrate.sh applies each file with bare `psql -f` (NOT -1/
+-- --single-transaction) and documents "each migration file manages its own BEGIN/COMMIT",
+-- so a file with no BEGIN/COMMIT runs in autocommit — exactly what CONCURRENTLY needs. This
+-- file therefore deliberately has NO BEGIN/COMMIT. (Caveat of the trade: if a CONCURRENTLY
+-- build is interrupted it can leave an INVALID index; re-running is safe because IF NOT
+-- EXISTS skips a same-named index — drop an invalid one by hand before re-applying if that
+-- ever happens. Acceptable: the partial index is tiny and this is a one-time build.)
+-- Mirrors the CONCURRENTLY pattern established by 0032_incidents_opened_idx.sql.
+--
+-- New installs converge from db/schema.sql (which creates the same index, non-concurrently,
+-- on the empty table).
+-- Apply: psql "$DATABASE_URL" -f db/migrations/0058_runs_running_started_idx.sql  (IDEMPOTENT).
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS runs_running_started_idx
+    ON runs (started_at) WHERE status = 'running';
