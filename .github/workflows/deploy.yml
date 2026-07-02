@@ -114,14 +114,28 @@ jobs:
         with:
           azcliversion: latest
           # This is an ACA JOB, not a Container App — use `containerapp job update`,
-          # never `containerapp update`. Roll BOTH region jobs to the same image so the
-          # regions never drift. The centralus job is tolerated-missing (|| true) until
-          # its bicep deploy lands, so CD doesn't fail before the 2nd region exists.
+          # never `containerapp update`. ★ Roll ALL 6 runner-image jobs to the same image so NO region / aux
+          # job runs STALE code after a merge (TD-3: CD used to roll only eastus2 + centralus, leaving westus2 —
+          # the QUORUM region — plus narrative/rollup/reconcile on old code until a manual scripts/deploy.sh;
+          # cross-region skew can disagree on verdict/redaction/schema).
+          # ★★ THIS JOB LIST MUST EQUAL scripts/deploy.sh RUNNER_IMAGE_JOBS (that is the source of truth; its
+          # verify() asserts all 6 are on the same image — "BUG 2"). If you add a runner-image job, add it in
+          # BOTH places. All 6 use `image: runnerImage` in infra/main.bicep.
+          # The primary (eastus2) is hard-required; the others are tolerated-missing (|| notice) so CD doesn't
+          # fail before a region/job's bicep has landed — same as centralus was.
           inlineScript: |
             IMAGE=synthwatcholey0620.azurecr.io/synthwatch-runner:${{ github.sha }}
             az containerapp job update -n synthwatch-runner-job -g synthwatch-rg --image "$IMAGE"
             az containerapp job update -n synthwatch-runner-job-centralus -g synthwatch-rg --image "$IMAGE" \
-              || echo "::notice::centralus runner job not present yet — skipping (deploy its bicep to create it)."
+              || echo "::notice::synthwatch-runner-job-centralus not present yet — skipping (deploy its bicep to create it)."
+            az containerapp job update -n synthwatch-runner-job-westus2 -g synthwatch-rg --image "$IMAGE" \
+              || echo "::notice::synthwatch-runner-job-westus2 not present yet — skipping (deploy its bicep to create it)."
+            az containerapp job update -n synthwatch-narrative-job -g synthwatch-rg --image "$IMAGE" \
+              || echo "::notice::synthwatch-narrative-job not present yet — skipping (deploy its bicep to create it)."
+            az containerapp job update -n synthwatch-rollup-job -g synthwatch-rg --image "$IMAGE" \
+              || echo "::notice::synthwatch-rollup-job not present yet — skipping (deploy its bicep to create it)."
+            az containerapp job update -n synthwatch-reconcile-job -g synthwatch-rg --image "$IMAGE" \
+              || echo "::notice::synthwatch-reconcile-job not present yet — skipping (deploy its bicep to create it)."
 
       - name: Write deployment summary
         run: |
