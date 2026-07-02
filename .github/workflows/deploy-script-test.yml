@@ -1,0 +1,40 @@
+name: Deploy-script tests
+
+# ──────────────────────────────────────────────────────────────────────────────────────────
+# Runs scripts/deploy_test.sh — the unit tests for scripts/deploy.sh's SAFETY logic (the what-if drop
+# classifier, BUG 1/2/3 image/migration checks, git_drift_state, ci_wait_verdict, retry_nonempty) AND the
+# ★ CD↔deploy.sh job-list PARITY guard (deploy.yml must roll EXACTLY RUNNER_IMAGE_JOBS — TD-3).
+#
+# ★ WHY THIS WORKFLOW EXISTS: deploy_test.sh already had all those tests but ran in NO workflow — so it gated
+# NOTHING. A test that isn't run guards nothing (the #164 lesson). Without this, the parity guard would be
+# decorative: someone could add a runner-image job to deploy-lib.sh but not deploy.yml, deploy_test.sh would
+# go red locally, and CI would merge it green. This wires the whole suite into ci-gate.
+#
+# jq (the what-if classifier) + git (the drift-state throwaway-repo tests) ship on ubuntu-latest; az/psql/sleep
+# are STUBBED inside the test, so no cloud creds / DB / extra setup are needed. Sub-second, pure static.
+# ──────────────────────────────────────────────────────────────────────────────────────────
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-script-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy-script-test:
+    name: Deploy-script tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Run deploy_test.sh (deploy-lib logic + CD job-list parity guard)
+        run: bash scripts/deploy_test.sh
