@@ -134,7 +134,110 @@ Four sinks (all OBSERVED):
 
 ## 2. Schema stewardship audit
 
-*(pending)*
+Method: a throwaway local Postgres 16 instance (this repo's target version — `db/schema.sql:1` header, `postgres:16` in `test.yml:41` and `Dockerfile.migrate:12`) was stood up **locally** (no remote connections), plus a throwaway SQL-extraction script over `runner/**/*.ts`. All results below are OBSERVED unless marked INFERRED.
+
+### 2a. Grant coverage — mechanical cross-check (the missing-DELETE-grant class)
+
+**Method (mechanical, re-runnable).** Instead of regex-parsing GRANT statements (which can't account for REVOKEs like 0041 or the DO-block role guards), the check applies the real artifacts and reads back *effective* privileges:
+
+1. `CREATE ROLE "synthwatch-api" LOGIN` on a fresh local PG16.
+2. Load `db/schema.sql`, then run `db/migrate.sh` (all 57 migrations apply — see §2d).
+3. Dump `information_schema.role_table_grants` + `has_function_privilege()` per table/view/function.
+4. Extract every SQL statement the runner executes: a script walks `runner/**/*.ts` (excluding node_modules/dist), captures every `` .query(`…`) `` template literal (122 statements found), and classifies verb×table (CTE-name aware).
+
+**Result — effective grant matrix for `synthwatch-api` after schema.sql + 0001→0057** (local PG dump):
+
+| Table | Effective grants | Runner verbs used (from the 122-statement extraction) |
+|---|---|---|
+| access_requests | DELETE, INSERT, SELECT | — |
+| alert_profiles | **(NONE)** | — (legacy; routing replaced by channels/alert_routes, `evaluate.ts:127-129`) |
+| alert_routes | S,I,U,D | SELECT |
+| audit_log | INSERT, SELECT (U/D revoked — 0038:41-42) | — |
+| channels | S,I,U,D | SELECT |
+| check_locations | S,I,U,D | S,I,U,D |
+| check_tags | S,I,U,D | S,I,D |
+| **checks** | **(NONE)** | SELECT, UPDATE |
+| daily_check_rollup | SELECT | INSERT (upsert), SELECT |
+| deploys | SELECT | INSERT (upsert), SELECT |
+| editors | S,I,D | — |
+| **flow_manifest** | **(NONE)** | INSERT (upsert), DELETE |
+| **incidents** | **(NONE)** | S,I,U |
+| locations | S,I,U,D | SELECT |
+| **maintenance_windows** | **(NONE)** | SELECT |
+| otp_codes | S,I,U | — |
+| reconcile_apply_plan | SELECT, UPDATE (0051 + 0053) | S,I,D |
+| reconcile_drift | S,I,U,D | INSERT (upsert) |
+| red_tests | SELECT | INSERT |
+| report_narratives | SELECT | INSERT (upsert) |
+| **run_metrics** | **(NONE)** | S,I,D |
+| run_requests | INSERT, SELECT (0042 deliberate least-privilege) | SELECT, UPDATE |
+| **run_steps** | **(NONE)** | S,I,U,D |
+| **runner_errors** | **(NONE)** | INSERT |
+| **runs** | **(NONE)** | S,I,U |
+| sessions | S,I,U | — |
+| spec_cache | SELECT only (0034 granted SIUD; **0041 revoked I/U/D** — the check is REVOKE-aware) | SELECT, INSERT (upsert) |
+| spec_catalog | S,I,U,D | INSERT (upsert) |
+| tag_routes | S,I,U,D | SELECT |
+| test_send_requests | INSERT, SELECT (0026: runner owns transitions) | SELECT, UPDATE |
+| Views: sla_availability_24h / 7d / 30d | **(NONE)** | — |
+| View: sla_availability_90d | SELECT (0018) | — |
+| Functions: sla_availability, slo_status, slo_burn_status | EXECUTE = true (PG default: EXECUTE to PUBLIC) | slo_burn_status called (`evaluate.ts:772-779`) |
+
+(The runner itself connects as the server admin/owner role — `db.ts:49-51` uses `DATABASE_URL`, the same secret as the migrate job, and `0041:14` states "the runner (owner privileges are intrinsic, not grant-based — verified: synthadmin keeps write)" — so the runner's own verbs are never gated by these grants. The grant surface exists **for the API MI**.)
+
+**Findings:**
+
+- **F-2a-1 (Critical, systemic): there is no grant-coverage gate anywhere in this repo's CI.** `test.yml` seeds the test DB from `db/schema.sql`, which is deliberately CREATE-only — "grants to `synthwatch-api` are applied via migrations/ops, not here" (`test.yml:12-13`) — and CI never creates the role. So the exact class that shipped the production 500s (0044: missing DELETE on access_requests; 0053: missing UPDATE on reconcile_apply_plan) is structurally untestable today: a new table+API-endpoint pair with a missing verb cannot fail any check in this repo. *Falsification check run:* grepped all workflows, tests, and scripts for `has_table_privilege` / `role_table_grants` / grant assertions — zero hits outside migration comments.
+- **F-2a-2 (Major): the baseline grants for the core tables are invisible to the repo.** `checks`, `runs`, `run_steps`, `run_metrics`, `incidents`, `maintenance_windows`, `flow_manifest` — tables the dashboard demonstrably needs (the API's create/update path drives `locations.ts` per its header comment; incidents/runs are the dashboard's whole content) — have **no migration-shipped grants at all** (matrix above). INFERRED: prod carries out-of-band grants and/or `ALTER DEFAULT PRIVILEGES` — evidenced by `0053:4`: "the `synthwatch-api` MI role got only SELECT **(via default privileges)**". This cannot be verified from the repo (no prod access in this session — §7), which is precisely the problem: the repo that owns the schema cannot state, let alone test, the API's real privilege set. Any table created by a NEW migration gets only whatever the invisible default privileges grant (per 0053: SELECT), so **every new write-path table is a latent 0044/0053 recurrence** until someone remembers an explicit GRANT.
+- **F-2a-3 (Minor): asymmetric view grants.** `sla_availability_90d` gets SELECT (0018:24) but the sibling `sla_availability_24h/7d/30d` views get nothing from migrations. If the dashboard reads those (INFERRED — unverifiable here), they work only via the out-of-band baseline; if the baseline defaults don't cover *views* the pills would 500. Uncheckable from this repo → hypothesis, listed in §7.
+- **F-2a-4 (Info): deliberate least-privilege rows are documented in-migration** (spec_cache 0041, run_requests 0042:38, audit_log 0038:41-42, test_send_requests 0026:36) — the audit can distinguish "deliberately absent" from "forgotten" only via these comments. That distinction should be code, not comments (see proposal).
+
+**Proposal — permanent CI extension (grant-coverage gate).** The check above is fully mechanizable and cheap (~5s on top of the existing Postgres service job):
+
+1. Commit `db/expected-grants.txt` — the table×verb matrix *including* a codified baseline for the core tables (this forces the out-of-band prod grants to be written down once; an ops script `db/ops/baseline_grants.sql` would make fresh installs converge too — today a fresh install has a **broken API** for checks/runs/incidents unless someone re-applies undocumented grants by hand).
+2. In `test.yml`, before schema load: `CREATE ROLE "synthwatch-api"`. After `migrate.sh` (see §2d — the gate should exercise migrations, not schema.sql, for exactly this reason): dump `SELECT table_name, privilege_type FROM information_schema.role_table_grants WHERE grantee='synthwatch-api' ORDER BY 1,2` and `diff` against the expectations file. Any new table then *fails CI until a human writes an explicit grant decision* — deliberate-absence becomes an expectations-file entry instead of a comment.
+3. (Cross-repo, follow-up) the API repo runs its integration tests connected **as** `synthwatch-api` rather than as owner — the only test that catches a missing verb end-to-end. Evidence this gap is real: `0044:8` — "integration tests connect as the owner role, so they can't catch a privilege gap".
+
+### 2b. Index coverage — every runner query vs. every index
+
+Method: the 122 extracted statements were filtered to the high-row tables and each WHERE/JOIN/ORDER BY column set was checked against `pg_indexes` from the migrated local DB (58 indexes total; full list captured during the audit).
+
+**Covered well (no action):** `claim`/`findDueChecks` (PK `(check_id, location)` on check_locations); `countConsecutiveDown` (`runs_check_started_idx (check_id, started_at DESC)` + LIMIT — ideal); `burnRatesByLocation` and `slo_burn_status()` (check_id + started_at range — served by the same index); all `run_steps` reads (`run_steps_run_idx (run_id, step_index)`); `run_metrics` joins (`run_metrics_run_id_key`); `getOpenIncident` (partial unique `one_open_incident_per_check`); pending-queue scans (`run_requests_pending_idx`, `test_send_requests_pending_idx`, both partial on status='pending'); `deploys` seen-check (leading `target_host`).
+
+**Flagged:**
+
+- **F-2b-1 (Major — couples with F-2c-1): the incident verdict scans a check's *entire run history* on every single run.** `aggregateVerdict` (`evaluate.ts:414-446`) and, when down, `failingLocationNames` (`evaluate.ts:453-472`) both build a CTE over `runs WHERE check_id=$1 AND status NOT IN ('running','infra_error')` with **no time bound and no LIMIT**, then window-function over it to find each location's last `failure_threshold` runs. `runs_check_started_idx` makes it an index scan, but every tuple for that check is still read, per evaluation, i.e. on **every completed run**. Cost grows linearly with retained history; with no retention (F-2c-1) this is the primary query-latency time bomb — the arithmetic in §2c puts it at ~10⁸–10⁹ tuple-reads/day within a year on the configured `Standard_B1ms` burstable Postgres (`main.bicep:233`). A `started_at > now() - '1 day'` style bound (any window ≥ failure_threshold × interval × safety factor) or a per-location LIMIT would cap it.
+- **F-2b-2 (Minor): `reapStaleRunning` seq-scans `runs` every tick.** `WHERE status = 'running' AND started_at < …` (`index.ts:201-208`) has no supporting index (`status` is unindexed; `runs_check_started_idx` leads with check_id). Runs every 5 min × 3 regions. A tiny partial index `ON runs (started_at) WHERE status = 'running'` (near-zero rows by definition) would make it O(stale-rows). Same shape: the run-now dedup probe (`index.ts:322-326`) is served by check_id, fine.
+- **F-2b-3 (Minor): the daily rollup's day-discovery seq-scans `runs`.** `SELECT DISTINCT check_id, day FROM runs WHERE started_at >= $1 AND started_at < $2` (`rollup.ts`) — there is no index leading with `started_at`. Once daily (plus backfills), so tolerable, but it degrades with total table size, not window size. An index `ON runs (started_at)` fixes this and F-2b-2 partially overlaps.
+- **F-2b-4 (Info): `incidents` narrative/rollup reads** filter `check_id + opened_at` range; `incidents_opened_idx` is `(opened_at DESC, id DESC)` without check_id (0032). Incidents stay low-row by design (debounced) — no action unless incident volume grows.
+
+### 2c. Growth / retention
+
+- **F-2c-1 (Critical): there is no retention/pruning mechanism for any per-run table.** OBSERVED: grep of all runner code and all migrations for `DELETE FROM runs|run_steps|run_metrics|runner_errors|red_tests|deploys|audit_log|otp_codes|sessions` finds only the fast-retry per-run cleanup (`index.ts:483-484` — deletes the *current* run's rows between attempts) and test fixtures. No cron job, no migration, no SQL function prunes history. The **only** retention in the system is the Azure Blob lifecycle rule (`main.bicep:343-370`): traces/screenshots expire after `artifactRetentionDays` (90d). The bicep comment even acknowledges the DB half is missing: "The DB still holds runs.trace_url/screenshot_url after deletion (a dangling reference … tracked as a follow-up)" (`main.bicep:334-336`). Meanwhile the redaction pull-back direction (store more: raw URLs #171/#172, per-run trace_signals 0040, spec_provenance 0047, egress_ip 0054, retry_count 0048) keeps *widening* the per-run row.
+- **Row-growth arithmetic (OBSERVED inputs, stated assumptions):**
+  - Inputs: 3 regions × `*/5` cron (`main.bicep:460,625,781`); "all 9 checks" are multi-region (`db/ops/assign_westus2_quorum.sql:11`); per-check `interval_seconds` in prod is DB state (unverifiable here — §7), so two bracketing scenarios using the repo's own defaults: schema default 300s (`schema.sql:66`) and the seed mix (`db/seed.sql`: 4×300s, 1×600s, 1×1800s, 1×3600s).
+  - **runs:** worst case, 9 checks × (86 400/300) × 3 regions = **7 776 rows/day** (~2.84 M/yr). Seed-mix-like fleet: ≈ (6×288 + 1×144 + 1×48 + 1×24) × 3 ≈ **5 700 rows/day** (~2.1 M/yr). Fast-retry does not add rows (intermediate attempts are deleted).
+  - **run_steps:** browser+multistep only. At seed-like cadence: browser 48 runs/day/region × ~5–15 steps + multistep 144 × #steps ≈ **1–3 k rows/day**.
+  - **run_metrics:** 1 per browser run ≈ 150–900/day. **trace_signals:** jsonb *on the runs row* — every failure + ≤4 baseline refreshes/check/day (6 h throttle, `index.ts:114-118`); the golden fixture is 4.5 KB (`runner/test-fixtures/trace-signals-golden/expected.json`, 4 547 bytes) → single-digit MB/day worst case.
+  - Net: **~2–3 M runs-rows/yr** — modest in bytes (low GB/yr), but F-2b-1 makes *query cost*, not storage, the binding constraint: per-check history H ≈ 850 rows/day (3 regions × 288); after one year H ≈ 310 k rows, read **twice per evaluation** when down, once when up, ≈ 7 776 evaluations/day → order 10⁹ tuple-reads/day on a `Standard_B1ms` (2 vCores burstable). INFERRED (falsification: needs prod EXPLAIN/latency data — §7) that this bites well before storage does.
+- **Bounded-by-design tables (no concern):** `daily_check_rollup` (1 row/check/day, upsert), `deploys` (unique `(target_host, fingerprint)` — grows with real deploys), `spec_cache`/`spec_catalog` (per spec path), `flow_manifest` (per flow). `runner_errors`, `red_tests`, `audit_log`, `otp_codes`, `sessions` are event-driven and unbounded but low-rate; they still deserve inclusion in whatever retention policy lands.
+- **Remediation shape (proposal, not applied):** a `retentionMain.ts` on the existing aux-job pattern (rollup/narrative/reconcile precedent) — e.g. delete `runs` (cascading `run_steps`/`run_metrics` — FKs are `ON DELETE CASCADE`, `schema.sql:279,300`) older than N days *after* they've been rolled into `daily_check_rollup`, and null-or-delete rows whose blob artifacts the 90 d lifecycle already deleted. The rollup table already preserves the long-horizon reporting series, so raw-run retention can be much shorter than 90 d for everything except open-incident forensics.
+
+### 2d. Migration hygiene — bootstrap proven on a local Postgres 16
+
+All three bootstrap paths were **actually run** (not inferred), on local PG16:
+
+| Path | What | Result (OBSERVED) |
+|---|---|---|
+| A | `schema.sql` alone into an empty DB (what CI does) | ✅ loads clean with `ON_ERROR_STOP` |
+| B | `migrate.sh` 0001→0057 into an **empty** DB | ❌ **fails at 0001**: `ERROR: relation "runs" does not exist`. `migrate.sh` exits non-zero (observed exit 3) and records nothing in `schema_migrations` (0 rows) — correct failure behavior, but the path itself is unsupported |
+| C | `schema.sql` **then** `migrate.sh` (the documented baseline flow, `migrate.sh:17-21`) | ✅ all **57 applied**, only benign `already exists, skipping` NOTICEs |
+| C′ | Re-run: `DELETE FROM schema_migrations`, `migrate.sh` again over the migrated DB (simulates the record-after-apply crash gap the header describes) | ✅ all 57 re-apply as no-ops — the idempotency contract (`migrate.sh:12-20`) holds for the *entire* chain, mechanically proven |
+
+- **F-2d-1 (Major): fresh-database bootstrap is a two-artifact ritual with no guard.** Migrations are deltas that presuppose the base schema (Path B). The migrate ACA job (`main.bicep:902-919`) pointed at a truly fresh database fails mid-0001 — nothing checks "is this DB baselined?" first, and nothing in the repo *applies* schema.sql to prod-like environments (deploy.sh runs only the migrate job — `scripts/deploy.sh:623,640`). Fresh-install docs say "new installs converge from db/schema.sql" (every migration header), but no automation encodes it. Compounding: schema.sql carries zero grants (§2a), so even Path A+C yields a database where the API role can't read `checks`/`runs`/`incidents`.
+- **F-2d-2 (Major): a stack-specific activation is baked into the migration chain.** `0022_centralus_registry.sql` INSERTs `centralus` into `locations` + a cursor per check. OBSERVED on the local bootstrap: fresh DB after Path C has `locations = {default:t, centralus:t}` while schema.sql alone yields `{default}`. 0022's own header says "centralus is THIS stack's activation, not a schema default" — but `migrate.sh` runs it on every fresh install, so any new deployment starts with a phantom second region enabled (its checks get centralus cursors that no runner will ever claim; harmless for paging **only** because `effectiveN` counts *reporting* locations, `evaluate.ts:387-391`). The westus2 activation was correctly kept in `db/ops/` — 0022 predates that convention and was grandfathered in.
+- **F-2d-3 (Minor): schema.sql ↔ migrations functional convergence holds; comment drift only.** OBSERVED: `pg_dump -s` of Path A vs Path C, comments stripped, shows **no functional difference** — but the *raw* `slo_burn_status` function body differs in embedded comments (Path C's 0055 version carries the important `::text::float8` node-pg parity explanation; schema.sql's copy lacks it) and `COMMENT ON FUNCTION slo_status` texts differ. Cosmetic today; it means the two sources are hand-synced and nothing would catch a *functional* divergence. A CI step `diff <(pg_dump -s schema-only-db) <(pg_dump -s migrated-db)` (exactly what this audit ran) would freeze convergence permanently — cheap to add to the grant gate proposed in §2a.
+- **F-2d-4 (Info): ordering + idempotency conventions hold.** Zero-padded 4-digit lexical ordering, no duplicate prefixes (`ls db/migrations` — 57 files, 0001–0057 contiguous). Every migration manages its own `BEGIN/COMMIT`; C′ proves whole-chain idempotency. `db/ops/*` scripts are correctly excluded from auto-apply and document their coordination requirements (`relabel_default_to_eastus2.sql:5-16` even documents the race with the lazy-insert era claim()).
 
 ## 3. Code health
 
