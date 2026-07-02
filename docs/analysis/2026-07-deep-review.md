@@ -241,7 +241,64 @@ All three bootstrap paths were **actually run** (not inferred), on local PG16:
 
 ## 3. Code health
 
-*(pending)*
+### 3.1 Typecheck: current config vs. stricter flags (all OBSERVED, run locally)
+
+Current config (`runner/tsconfig.json`: `strict: true`, NodeNext, ES2022): **`npx tsc --noEmit` → 0 errors.**
+
+Delta with strict flags *not* currently enabled (each run individually over the same tree, which includes test files; "prod" excludes `*.test.ts`):
+
+| Flag | Errors (all) | Errors (prod only) |
+|---|---:|---:|
+| `noUncheckedIndexedAccess` | 142 | 30 |
+| `noPropertyAccessFromIndexSignature` | 171 | 146 |
+| `exactOptionalPropertyTypes` | 7 | 4 |
+| `noImplicitOverride`, `noFallthroughCasesInSwitch`, `noImplicitReturns`, `noUnusedLocals`, `noUnusedParameters` | 0 each | 0 each |
+| **All combined** | **320** | — |
+
+Reading: the codebase is already clean against the flow/dead-code flags. The `noUncheckedIndexedAccess` prod hits (top files: `alerts.ts` 10, `narrative.ts` 9, `multistep.ts` 4, `index.ts` 2) are the classically risky ones — unchecked `array[0]`/record-key access; `reconcile.test.ts` alone accounts for 59 of the test-side hits. `noUncheckedIndexedAccess` on prod code is a plausible S/M-sized hardening PR; `noPropertyAccessFromIndexSignature` is mostly stylistic churn.
+
+### 3.2 Test suite + coverage (OBSERVED, run against a local PG16 seeded exactly like CI)
+
+`npm test` equivalent with `--experimental-test-coverage`: **227/227 pass, 0 skipped, ~26 s** (CI's claim of "0 unguarded skips" reproduces; the suite includes the 6 DB-gated integration files).
+
+Overall: **81.4 % line / 88.8 % branch / 86.5 % function.** But the distribution is what matters — coverage by prod file, weakest first:
+
+| File | Line % | Note |
+|---|---:|---|
+| **`index.ts` (the dispatch/result-write path)** | **0 — absent from the coverage report entirely** (never imported by any test; the 45 % `index.js` in the table is `checks/index.js`, the flow loader) | The tick loop, `claim()`, `runOne`/`runOneInner` (terminal result-write, trace routing, redaction wiring, egress stamp), `executeBrowser` — the most load-bearing file in the repo has no direct test. Its logic is partially covered *indirectly* via extracted pure functions (`retry.ts`, `evaluate.ts` verdict fns) and the swallowed-errors integration test, but the assembly itself is untested. |
+| also absent (0 %): `multistep.ts`, `netChecks.ts`, `sslCheck.ts`, `rollup.ts`, `narrative.ts`, `otel.ts`, `testSend.ts`, `flowManifest.ts`, `tags.ts`, `locations.ts`, `aoai.ts`, aux `*Main.ts` | 0 | Executors for 5 of 7 check kinds (ssl/dns/tcp/ping/multistep) and the whole rollup/narrative pipeline have zero coverage. |
+| `httpCheck.ts` | 9.2 | The 6th executor — near-zero. |
+| `alertEmail.ts` / `assertions.ts` | 13.9 / 18.1 | Alert rendering + the no-code assertion engine. |
+| `rca.ts` / `artifacts.ts` | 33.6 / 34.2 | |
+| `alerts.ts` | 49.3 | Channel resolution partially tested. |
+| `evaluate.ts` | 73.0 | Uncovered ranges include `aggregateVerdict`'s SQL (`413-446`) and the incident open/resolve dispatch branches (`242-267`, `166-193`) — the quorum *pure functions* are well tested (`quorum.test.ts`) but the SQL they wrap is not. |
+| `redact.ts` **100**, `traceSignals.ts` 98.5, `retry.ts` 100, `reconcile.ts` 95.3, `specfetch/*` 75–100 | | The redaction and trace_signals paths — the ones with golden-fixture parity stakes — are the *best*-covered. |
+
+**Against the named critical paths:** redaction ✅ strong; trace_signals ✅ strong; **dispatch ❌ 0 %; result-write ❌ 0 %** (both live in `index.ts`). The pattern is consistent: logic extracted into pure modules is tested; the orchestration file that composes them is not.
+
+### 3.3 Dependencies (OBSERVED)
+
+`npm audit`: **0 vulnerabilities.** `npm outdated`: 7 packages, all patch/minor behind (`@azure/storage-blob` 12.32→12.33, `@types/node` 26.0→26.1, `adm-zip` 0.5.17→0.5.18, `eslint` 10.5→10.6, `globals` 17.6→17.7, `playwright` 1.61.0→1.61.1, `typescript-eslint` 8.61→8.62). Nothing major-version behind. The Playwright pin is version-locked to the Docker base image with an explicit bump-both comment (`Dockerfile:3-7` ↔ `package.json:33`, both 1.61.0) — drift here breaks browser launch, and there is no automated check that the two stay equal (Dependabot could bump the npm side alone; a one-line CI grep would close it).
+
+### 3.4 Error-handling consistency audit (every catch path)
+
+Full sweep of every `catch`/`.catch` in prod code. The dominant pattern is healthy and consistent: **fatal → `recordFatal` (runner_errors + stdout, 5 phases); non-fatal → `console.warn` with a bracketed channel and continue; monitor verdict errors → DB columns.** Two writers rethrow (manifest parse, txn wrappers). Findings:
+
+- **F-3-1 (Minor): one truly silent catch.** `deploys.ts:107-109` — `noteDeployMarker` swallows *any* throw (including DB errors) with a comment and no log. Everything else that swallows either logs or is an intentional, documented fail-soft (egress reflectors, trace-zip parse, per-metric capture — the last is *observable* via `captureFailed` rather than logged).
+- **F-3-2 (Major, redaction uniformity): the redaction system is applied at exactly three sinks — and provably not at the others.** Scrubbed (sensitive monitors): `runs.error_message` (`index.ts:516-519`), `run_steps.error_message` (browser `stepRecorder.ts:131`; multistep `multistep.ts:156`), `trace_signals` (`index.ts:543`). **Not scrubbed:**
+  - `runner_errors.message`/`.stack` (`runnerErrors.ts:61-63`): `recordFatal` has the check/run context (`setErrorContext`) but never consults `check.sensitive` — an exception escaping a *sensitive* monitor's run (due-loop/on-demand-loop catch) persists the raw Playwright message + stack, which is exactly the text class B10 scrubs elsewhere (a native error can echo a Bearer/JWT — `index.ts:512-514`'s own rationale). This is the one persisted error-text sink where sensitive-derived text lands raw.
+  - `runs.error_message` when status is `infra_error` (`index.ts:518` gates the scrub on `fail|error` only): the text embeds spec_path + monitors-repo fetch diagnostics (`index.ts:815`), not target-site secrets — low risk, but an unredacted-for-sensitive path by construction. `warn` messages are self-generated (no PII) — fine.
+  - `test_send_requests.detail` (`testSend.ts:33-37,75-78`): carries raw dispatch errors that can embed channel config (webhook URL with token — `alerts.ts:158` acknowledges webhook URLs may embed tokens). Infra-config-sensitive rather than monitor-sensitive.
+  - `reconcile_drift.detail` / `reconcile_apply_plan` blockedReason: raw monitors-repo compile/fetch text — low sensitivity, noted for completeness.
+  - Verdict: redaction is **uniform across the monitor-data writers** (the B10 design surface) but was never extended to the *infra* error writers, one of which (`runner_errors`) demonstrably receives sensitive-monitor-derived exception text.
+- **F-3-3 (Info):** `spec_cache` has no error column at all — fetch/compile failures are stdout-only, then degrade (`specCache.ts:108-125`); the drift row's `orphan.reason` is the only queryable residue.
+
+### 3.5 spec_path-NULL class: systemic guard or per-instance fix?
+
+**Verdict: systemic — four independent layers — with one real hole.** Layers: (1) DB constraint `browser_needs_flow` (`schema.sql:157-159`) + `checks_spec_path_shape` (0033, validates existing rows); (2) runtime backstop in `executeBrowser` — a browser check with neither spec_path nor flow_name returns a clean `error` outcome instead of crashing (`index.ts:841-843`); (3) reconcile plan gate — an unresolvable browser spec plans as `status:'blocked'` with zero statements (`reconcile.ts:611-634`, PR #156), and `buildApplyUpsert`/`buildChangedUpdate` always write a validated spec_path (self-heals NULL on re-apply, `reconcile.ts:399-445`); (4) one shared `assertValidSpecPath` used by runtime, reconcile, and mirrored by the DB CHECK (`fetchSpec.ts:28-32`).
+
+- **F-3-4 (Major): `browser_needs_flow` exists only in `db/schema.sql` — no migration ever adds it.** OBSERVED: `grep -rn browser_needs_flow db/` matches only `schema.sql:158`. A database provisioned before that constraint (i.e. **the production database**, which converges via migrations) never acquires it; on such installs the DB layer enforces nothing and the whole class rests on the runtime backstop and the (currently dry-run-only) reconcile gate. Contrast 0033, which correctly shipped `checks_spec_path_shape` as an `ADD CONSTRAINT` migration. Falsification check run: searched all 57 migrations for the constraint name and its predicate — zero hits. A backfill migration (validate-then-add, with a pre-check for violating rows) closes it.
+- **F-3-5 (Info):** the `index.ts:843` backstop itself has no direct test (asserted only implicitly); reconcile's blocked-gate is well tested (`reconcile.test.ts:524-534`).
 
 ## 4. Tech debt register
 
