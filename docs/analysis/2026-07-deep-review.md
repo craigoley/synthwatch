@@ -323,11 +323,39 @@ Ranked by (severity × blast radius) ÷ remediation cost. IDs reference §-findi
 
 ## 5. Improvements + feature ideas
 
-*(pending)*
+Each item is grounded in something observed (a capability the data already supports, or a seam the code already has). Ranked by value/effort.
 
-## 5. Improvements + feature ideas
+### 5.1 Ranked list
 
-*(pending)*
+| # | Idea | Grounded in (OBSERVED) | Value | Effort |
+|---|---|---|---|---|
+| 1 | **Roll all 6 runner-image jobs in CD** (= TD-3) | `deploy.sh` already defines the exact job list (`RUNNER_IMAGE_JOBS`, `deploy.sh:72-74`) and verify() proves the invariant | Kills a standing cross-region skew after every merge | S |
+| 2 | **Grant-coverage CI gate + baseline codification** (= TD-1, mechanics proven §2a) | The audit's own harness: role + schema + migrate + `role_table_grants` diff ran in ~5 s locally | Ends the recurring prod-500 class permanently | M |
+| 3 | **Retention job + verdict time-bound** (= TD-2) | Aux-job seam exists (rollup/narrative/reconcile all follow the same `*Main.ts` + bicep job pattern); `daily_check_rollup` already preserves the reporting series; FKs already `ON DELETE CASCADE` (`schema.sql:279,300`) | Defuses the §2c time bomb before it pages | M |
+| 4 | **"Degrading-but-green" (flaky-monitor) signal** | `runs.retry_count` is written on every run (`index.ts:596`) and `0048:9` explicitly names the query — `status='pass' AND retry_count>1` — but **nothing in this repo reads the column** (grep: write-only). The data for a "this monitor only passes on retry" warn/narrative fact already exists | Surfaces degradation *before* it becomes an incident — the exact gap fast-retry papers over | S (a warn-path or narrative fact) |
+| 5 | **Scheduled red-test sweep (alarm fire-drill)** | The harness is built and persisting (`redTestMain.ts`, `red_tests` table 0057, exit-2 non-red contract) but has **no ACA job** (§1.2) — it runs only when a human remembers | Converts "we believe the monitor would go red" into a scheduled, queryable proof per monitor | S (one bicep job block + cadence) |
+| 6 | **runner_errors rate alert** | `runner_errors` is queryable + indexed by time (0050) and every fatal path writes it (§1.4), but nothing alerts on it — a runner that fatals every tick is only visible if someone SELECTs | Closes the "who monitors the monitor" loop with data already flowing | S |
+| 7 | **Deploy-correlation surfacing** | `deploys` (0056) records per-host deploy identity with timestamps + `runs` has per-run timing; a "runs that first failed within N min after a deploys row" join needs no new capture | Turns the deploy-markers investment into an RCA fact (rca.ts could cite it) | M |
+| 8 | **Egress-IP Phase 1 decision** | Phase 0 capture is live per-run (`runs.egress_ip`, 0054) and the runbook (`docs/runbooks/phase0-egress-measurement.md`) defines the verdict query ("distinct IPs per region") | Unblocks allowlisting the monitors at the target WAF; data accrues every tick | S to decide, L if NAT is needed |
+| 9 | **Bicep module-ization of the per-region job** | Three near-identical ~150-line job blocks (`main.bicep:444, 609, 765` — comments say "Identical to the primary job except region + SYNTHWATCH_LOCATION") | A 4th region (or an env-var change) becomes a 5-line diff instead of a 150-line copy-paste that verify() has to police | M |
+| 10 | **Enable `noUncheckedIndexedAccess` on prod** (= TD-9) | 30 prod errors measured (§3.1) | Removes a latent-undefined class in alert routing | M |
+
+### 5.2 What safe auto-deploy would require to retire manual `deploy.sh`
+
+First, scope precisely: **code/image deploy is already automated** (`deploy.yml`: build → migrate-job (gated, polled, fail-closed) → roll, serialized by a concurrency group, `deploy.yml:27-31`). What remains manual is the **infra/template deploy** (`az deployment group create` of `main.bicep`) plus the post-deploy verification. `deploy.sh` is explicitly "a LOCAL helper Craig runs — not CD" (`deploy.sh:13`). The risks the manual step currently absorbs, **evidenced from the script itself**:
+
+1. **Secret wipe on template deploy.** "never deploys without the @secure params (missing one WIPES a live secret)" (`deploy.sh:7`); secrets come from `~/.synthwatch.env` and are passed inline (`deploy.sh:45,147-152`). The recurring instance is enshrined as a named canary: `ACS_SECRET_REF` = "the wipe canary" (`deploy.sh:59`), re-verified after every deploy (`deploy.sh:549-552`).
+2. **Destructive what-if drift.** The what-if is parsed and **halted** on: resource Delete, job env-key removal, secret removal (`scripts/lib/whatif-halts.jq:5-11`); benign representation noise is auto-proceeded. Crucially, `confirm_drop` **ignores `--yes` by design — "a drop is NEVER auto-proceeded"** (`deploy.sh:746-747, 30-32`).
+3. **DB-ahead-of-code half-state.** The image↔target classifier (`deploy-lib.sh:6-28`, mirrors the CD trigger paths) refuses to apply the target's migrations with a stale image; it waits for CI to build the target or requires `--sha` (`deploy.sh:20-25, 89-93`).
+4. **Failed-but-landed.** ARM deploys can fail *after* the jobs rolled; `verify()` always runs and checks what actually landed (`deploy.sh:10-11, 536-621`): AOAI api-version preserved (#93/#94), ACS secretRef present, `AZURE_CLIENT_ID` present, **every** job on the intended image ("BUG 2"), Postgres reachable, API health 200, and **each shipped migration recorded in `schema_migrations`** ("BUG 3" — "migrate job exited 0" ≠ "migration applied").
+5. **Migration auto-run coordination.** A template deploy that ships a migration must start the Manual-trigger migrate job and confirm (`deploy.sh:691` block, `624-628` comment — 0032 silently didn't apply until this existed).
+
+**Assessment.** Every one of these is a *mechanizable check that already exists as tested shell* (`deploy_test.sh` exercises the exact lib the deploy uses — `deploy-lib.sh:2-4`). The honest blockers for CI are (a) the @secure params — CI has deliberately no Azure secrets (`deploy.yml:3-5`, OIDC-only), so the template params must move to Key Vault references (bicep `getSecret`/`keyVault` param pattern) or a GitHub *environment* with required reviewers; and (b) the drop-halt, whose whole design is "a human must look" — which maps exactly onto a GitHub environment **approval gate** (fail the run on a detected drop; require a manually-approved re-run with an explicit ack input to proceed). Concretely:
+
+- **Phase 1 (S):** add an `infra-deploy.yml` triggered on `infra/**` merge: what-if → run `whatif-halts.jq` → **fail on any halt line** (no approval path yet); else deploy with Key-Vault-referenced params; then run a ported `verify()` as a workflow step. `--what-if-only` semantics on PRs (comment the classified diff).
+- **Phase 2 (M):** wire the halt path to a protected GitHub environment so a drop requires named-reviewer approval instead of a local terminal; port the migration-confirmation into the existing deploy.yml verify.
+- **Keep `deploy.sh` as the break-glass path** — the script already handles the cases CD can't (deploy a specific `--sha` pair, `--post-reconcile` inspection).
+- **Residual risks a human still owns:** intentionally destructive template changes (the approval gate is the human), and Key Vault secret rotation (new surface). Both are smaller than today's risk of *forgetting* an inline param — the thing the script's own header says wiped a live secret.
 
 ## 6. Boundary contracts
 
