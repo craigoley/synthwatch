@@ -1,6 +1,6 @@
 # SynthWatch Deep Review — July 2026 (docs-only analysis)
 
-> **Status:** in progress (overnight run, sections committed incrementally).
+> **Status:** complete (overnight run, sections committed incrementally).
 > **Scope:** analysis only — no fixes applied. Every finding cites `file:line` or pasted
 > command output. **OBSERVED** = ran it / read it here; **INFERRED** = deduced, with the
 > falsification check named. Where a claim depends on external behavior (Node, Playwright,
@@ -359,8 +359,70 @@ First, scope precisely: **code/image deploy is already automated** (`deploy.yml`
 
 ## 6. Boundary contracts
 
-*(pending)*
+Exact heading per spec, for cross-repo synthesis. All shapes OBSERVED from code/schema in this repo; enum lists are the **actual CHECK constraints dumped from the migrated local DB** (`pg_constraint`), not prose.
+
+### 6.1 EXPOSED — interfaces this repo writes that others consume
+
+**Database tables (consumer: `synthwatch-api` / dashboard; grants per §2a):**
+
+| Table | Columns written (writer) | Semantics / enums (from CHECKs + code) |
+|---|---|---|
+| `runs` | INSERT `(check_id, started_at, status='running', location)` (`index.ts:387`); terminal UPDATE `(status, finished_at, duration_ms, http_status, error_message, failed_step, screenshot_url, cert_days_remaining, trace_url, trace_signals::jsonb, retry_count, egress_ip)` (`index.ts:591-613`); `spec_provenance::jsonb` mid-run (`index.ts:829-840`) | `status ∈ {pass, warn, fail, error, infra_error, running}` (CHECK). Availability partition: up = pass\|warn, down = fail\|error; `infra_error` = "didn't run", excluded from SLA *and* paging; `running` in-flight only (reaped to error after 30 min). `retry_count`: 1 = first try; pass with >1 = degrading-but-green (0048). `trace_signals`: same JSON schema as the API's TraceExtractor (golden-fixture parity, `runner/test-fixtures/trace-signals-golden/`). `spec_provenance`: `{spec_path, origin, resolved_etag, cache_fetched_at, executed_sha256, executed_len, has_preclick}` (`index.ts:829-837`) |
+| `run_steps` | INSERT/UPDATE by StepRecorder (browser) + multistep (`stepRecorder.ts:68,74`; `multistep.ts:113`) | `status ∈ {pass, fail, error, running}` (CHECK); `error_message` scrubbed for sensitive monitors |
+| `run_metrics` | one INSERT per browser run, `ON CONFLICT (run_id) DO NOTHING` (`metrics.ts:335-366`) | 14 nullable numeric columns (ttfb/dcl/load/fcp/lcp ms, cls, inp, transfer_bytes, resource_count, dom_node_count, js_heap, cpu_time, layout_count, recalc_style_count); null = absent, **not** zero |
+| `incidents` | open INSERT (`evaluate.ts:267-274`), resolve UPDATE, `consecutive_failures` refresh, `rca` jsonb, `rca_notified_at` (`evaluate.ts:167-172, 237, 318, 493`) | `status ∈ {open, resolved}`, `severity ∈ {critical, warning}` (CHECKs); ≤1 open per check (partial unique index); `rca = {classification, confidence, summary?, cached?}` |
+| `checks` (runner-written cols only) | `last_run_at` mirror (`index.ts:277`), `success_trace_url/_at`, `baseline_screenshot_url`, `last_warn_notified_at`, `last_burn_notified_at` (+ reconcile's scoped `sensitive`/`redact_patterns` sync, `reconcileMain.ts:193-199`) | `checks.last_run_at` is a **legacy mirror**; the canonical cadence cursor is `check_locations.last_run_at` (`index.ts:276-279`) |
+| `check_locations` | cursor UPDATE on claim (`index.ts:264-274`) | PK `(check_id, location)`; row-existence **is** the assignment (`locations.ts:1-9`) |
+| `daily_check_rollup` | 26-column upsert per (check, day) (`rollup.ts`) | maintenance-excluded, infra_error-excluded aggregates; the long-horizon reporting series |
+| `report_narratives` | upsert per scope (`narrative.ts`) | `scope_type ∈ {fleet, monitor}` (CHECK) |
+| `flow_manifest` | full-sync upsert `(name, description, entry_url_hint, updated_at)` + DELETE of unlisted (`flowManifest.ts:77-79`) | the deployed-flows catalogue for the dashboard picker |
+| `reconcile_drift` / `reconcile_apply_plan` | hourly recompute (`reconcileMain.ts:48-49, 177-178`) | `drift_type ∈ {new, changed, missing, orphan, redaction_mismatch}`; plan `status ∈ {pending, auto, blocked, noop, approved, rejected, applied}` (CHECKs). **Plan-as-contract:** the API approves/rejects (0052 decision cols, its UPDATE grant is 0053) and the emitted statements are executed verbatim — today's apply is DRY-RUN except the B10 field sync |
+| `spec_cache` / `spec_catalog` | specfetch upsert (`specCache.ts:209-223`); catalog upsert (`reconcileMain.ts`) | `spec_cache.compiled_js` **executes at runner privilege on cache hit** — hence API write access REVOKEd (0041); no error column (stdout-only failures) |
+| `runner_errors` | `recordFatal` (`runnerErrors.ts:61-63`), deploy-marker silent-null (`deploys.ts:81-87`) | `{invocation_id, occurred_at, phase, check_id?, run_id?, message, stack?}`; phase ∈ {main, due-loop, on-demand-loop, uncaughtException, unhandledRejection, deploy-marker…} — superset of 0050's documented list |
+| `red_tests` | confirmed-red persist only (`redTest.ts:171-174`) | `outcome = 'red'` (CHECK — the table *cannot* record a non-red result; exit-2 is the only signal), `method ∈ {executed-red-fixture, attested-manual}` |
+| `deploys` | upsert on `(target_host, fingerprint)` (`deploys.ts:41-45`) | deploy-identity markers: `{target_host, fingerprint, deployed_at, detail{checkId, source, path}}` |
+| `locations` | read by runner; managed by API (grants 0020) | registry of active regions; `enabled` drives default assignment |
+
+**SQL functions (shared read/page contract):** `sla_availability(from,to)` (+ 24h/7d/30d/90d views), `slo_status(check,from,to)`, `slo_burn_status(check)` — the last is the **shared paging decision** (runner pages from it, `evaluate.ts:771-780`; the dashboard's SLO pills read it), kept byte-identical to the frozen TS oracle by a differential red-test (0055).
+
+**Blob artifact key conventions** (consumer: dashboard links): per-run `run-<runId>-<ts>.png`, `traces/run-<runId>-<ts>.zip` (both under the 90 d lifecycle purge); per-monitor overwrite slots `baselines/check-<id>.png`, `success-latest/check-<id>.zip` (deliberately purge-exempt) — `artifacts.ts:19,33,61,86`; purge prefixes `main.bicep:354-362`.
+
+**Telemetry:** OTel span `check <name>` + per-step child spans, metrics `synthwatch.check.duration|runs|up` with bounded labels (`otel.ts:122-134,195-287`); stdout `invocation <uuid>` correlation convention (`index.ts:134`).
+
+### 6.2 CONSUMED — interfaces this repo reads
+
+| Interface | Shape (evidence) |
+|---|---|
+| `checks` config columns (written by API) | `kind ∈ {http, browser, ssl, dns, tcp, ping, multistep}` (CHECK); `interval_seconds>0`, `failure_threshold>0`, `retries≥0`, `slo_target ∈ (0,1)`, `spec_path ~ '^monitors/.+\.spec\.ts$'` (CHECKs); `auth` is a **secret-reference** shape (`*_env` names, never plaintext — `db.ts:12-19`); `steps` jsonb chain (`db.ts:37-46`); `assertions`, `net_config`, `request_headers`, perf budgets, `sensitive`/`redact_patterns` |
+| `run_requests` / `test_send_requests` (API-enqueued queues) | claim by conditional UPDATE; `run_requests.status ∈ {pending, done}`, `test_send_requests.status ∈ {pending, sending, delivered, failed}` (CHECKs) |
+| `channels`/`alert_routes`/`tag_routes`/`check_tags` | routing config; `channels.type ∈ {email, webhook}`; route dimensions are mutually exclusive (`alert_route_one_dimension` CHECK) |
+| `maintenance_windows` | `ends_at > starts_at` (CHECK); check-scoped or fleet-wide (NULL check_id) |
+| GitHub — `craigoley/synthwatch-monitors` | contents API at main@HEAD (never raw CDN — propagation window, `fetchSpec.ts:3-5,20`); `manifest.json` entries `{id ~ ^[a-z0-9-]{3,64}$, script ~ ^monitors/.+\.spec\.ts$, suggestedIntervalSeconds?…}` (`reconcile.ts:85-87`); spec files compiled via esbuild |
+| ARM inbound | the API starts runner/reconcile jobs via `jobs/start` (Jobs Operator role assignments, `main.bicep:395-415`) — the "Run now"/test-send trigger |
+| Azure services | ACS email (connection string), Blob storage, Azure OpenAI (MI token via `AZURE_CLIENT_ID`), Log Analytics (stdout) |
+| Misc external | IP reflectors (`checkip.amazonaws.com`, `api.ipify.org` — `egress.ts:14`); monitored sites themselves; Vercel protection bypass header `x-vercel-protection-bypass` sent host-scoped only (`vercelBypass.ts:18`) |
+
+### 6.3 Schema ↔ write-shape disagreements (and contract traps)
+
+1. **`runs.error_message` is not always an error.** ssl/dns/tcp/ping runs write their informational message (resolved records, latency, cert line) into `error_message` **on pass too** (`index.ts:735-741, 752-756` comments). A consumer treating non-null `error_message` as failure misreads healthy runs. The column name disagrees with its semantics; the STATUS-TAXONOMY doc should carry this (it's currently a code comment).
+2. **`run_requests.status='done'` ≠ "ran".** A claimed request whose run throws stays consumed — "no migration for an 'error' state" (`index.ts:339-343`); dedup also consumes without a new run (`index.ts:322-331`). The API cannot distinguish executed from consumed-but-failed.
+3. **`runs.trace_url` is null for successful traced runs by design** — the success baseline lives on `checks.success_trace_url` (shared overwrite slot, `index.ts:529-534`). A per-run reader misses baselines.
+4. **Blob URLs outlive their blobs.** After the 90 d lifecycle purge, `runs.trace_url`/`screenshot_url` dangle — acknowledged as an open follow-up in the template itself (`main.bicep:334-336`).
+5. **`browser_needs_flow` is a fresh-install-only constraint** (F-3-4): the schema *document* promises it; the migrated prod database does not enforce it.
+6. **`checks.last_run_at` is a mirror, not truth** — readers must use `check_locations` for per-region cadence (`index.ts:276-279`).
+7. **`docs/SCHEMA.md` (the cross-repo contract snapshot) is stale**: generated 2026-06-21, documents 5 of the 31 tables, and predates migrations 0054–0057 entirely (zero mentions of `egress_ip`, `deploys`, `red_tests`, `slo_burn_status`; grep count = 0). Its own header says it exists because "we have had repeated drift between assumed and actual schema" — it is currently exhibiting the drift it was created to prevent.
+8. **`red_tests` cannot record a failed red-test** (`outcome='red'` CHECK): "the harness proved the monitor does NOT go red" exists only as a process exit code (`redTestMain.ts:88`), not as data a dashboard could show.
 
 ## 7. Open questions + unverifiable
 
-*(pending)*
+Everything below could not be checked from this repo/session (no prod DB access, no Azure access, API repo out of scope — and the task forbade az/remote-Postgres, correctly):
+
+1. **Prod effective grants** — the out-of-band baseline (default privileges + manual GRANTs) for `checks`/`runs`/`incidents`/etc. (F-2a-2). Needs one read-only `role_table_grants` dump from prod (or the API repo's provisioning notes) to codify into `db/ops/baseline_grants.sql`.
+2. **Which verbs the API actually executes per table** — API code is in `synthwatch-api` (out of session scope). The §2a matrix should be joined against that repo's query inventory; migration comments (0044, 0053) were the only in-repo evidence.
+3. **Whether the dashboard reads `sla_availability_24h/7d/30d` views** (F-2a-3) — determines whether their missing grants are latent 500s or dead views.
+4. **Prod `interval_seconds`/cadence mix and current table sizes** — §2c's growth arithmetic brackets with repo defaults; one `SELECT count(*)` + `pg_total_relation_size` on prod would pin it, and an `EXPLAIN (ANALYZE, BUFFERS)` of `aggregateVerdict` would confirm or falsify the F-2b-1 latency projection.
+5. **Whether ACA cron ticks are ever actually missed/late** (the missed-tick analysis is from code); Log Analytics would show inter-invocation gaps.
+6. **Egress-IP stability verdict** — the data is accruing in `runs.egress_ip`; the distinct-per-region query in the runbook needs prod data.
+7. **Node/Playwright external behavior** relied on here was verified against the repo's own pinned artifacts (Playwright 1.61.0 npm↔image parity; Node 22 in CI, engines ≥22) rather than upstream docs; the one external-behavior claim taken on the repo's word is ACA's `parallelism: 1`/cron semantics (`main.bicep` comments + README Decision 1/3). No claim in this report depends on unverified external behavior beyond that.
+8. **`OTEL_EXPORTER_OTLP_HEADERS` handling** — consumed inside the OTLP SDK (`otel.ts:84` comment); whether it can leak via SDK debug logging was not verified (no OTLP endpoint configured locally).
+9. **Whether anything consumes `runner_errors` / `retry_count` downstream** (API/dashboard) — in this repo both are write-only (§5.1 #4, #6); if the dashboard already surfaces them, those two ideas collapse to "already done".
