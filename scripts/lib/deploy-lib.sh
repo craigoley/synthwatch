@@ -4,6 +4,25 @@
 # top-level side effects; sourcing this runs nothing.
 
 # ---------------------------------------------------------------------------
+# RUNNER_IMAGE_JOBS — the ACA jobs that run the RUNNER image (all use `image: runnerImage` in
+# infra/main.bicep). ★ SINGLE SOURCE OF TRUTH, HERE (not deploy.sh) so BOTH deploy.sh AND the unit test
+# (deploy_test.sh) read the SAME value — a job added here reaches both. Two consumers enforce it:
+#   • deploy.sh verify() asserts every one is on the same image after a deploy (BUG 2);
+#   • CD (.github/workflows/deploy.yml) MUST roll EXACTLY this set on every merge, or the un-rolled jobs run
+#     STALE code until a manual deploy (TD-3 — CD had drifted to 2 of 6). deploy_test.sh's parity test asserts
+#     deploy.yml rolls exactly RUNNER_IMAGE_JOBS, so a future one-sided edit FAILS CI. Add a job in ONE place: here.
+# ---------------------------------------------------------------------------
+readonly RUNNER_JOB='synthwatch-runner-job'
+readonly CENTRALUS_RUNNER_JOB='synthwatch-runner-job-centralus'
+readonly WESTUS2_RUNNER_JOB='synthwatch-runner-job-westus2'   # 3rd region (2-of-3 quorum)
+readonly NARRATIVE_JOB='synthwatch-narrative-job'
+readonly ROLLUP_JOB='synthwatch-rollup-job'
+readonly RECONCILE_JOB='synthwatch-reconcile-job'
+readonly RUNNER_IMAGE_JOBS=(
+  "${RUNNER_JOB}" "${CENTRALUS_RUNNER_JOB}" "${WESTUS2_RUNNER_JOB}" "${NARRATIVE_JOB}" "${ROLLUP_JOB}" "${RECONCILE_JOB}"
+)
+
+# ---------------------------------------------------------------------------
 # classify_paths — decide whether a set of changed files (newline-separated on stdin, as
 # `git diff --name-only` produces) means the newest-image≠HEAD mismatch is EXPECTED or
 # AMBIGUOUS.

@@ -292,7 +292,7 @@ expect_unapplied "fallback: empty schema_migrations -> all unapplied" \
 # ===========================================================================
 # H. FIX 2 — post_reconcile triggers + waits + reports (az/psql/sleep stubbed).
 # ===========================================================================
-RG='rg-test'; RECONCILE_JOB='synthwatch-reconcile-job'; DATABASE_URL='db'; RECONCILE_POLL_TRIES=1
+RG='rg-test'; DATABASE_URL='db'; RECONCILE_POLL_TRIES=1   # RECONCILE_JOB now comes from deploy-lib.sh (sourced above, readonly)
 sleep() { :; }   # no real waiting in tests
 check_contains() {
   local name="$1" hay="$2" needle="$3"
@@ -398,6 +398,18 @@ run_retry_tests() {
   rm -f "${statef}"; unset -f sleep _read_transient _read_missing; unset STATEF VERIFY_READ_TRIES VERIFY_READ_SLEEP
 }
 run_retry_tests   # retry_nonempty is sourced from deploy-lib.sh (the EXACT shipped function)
+
+# ===========================================================================
+# I. ★ CD ↔ deploy.sh JOB-LIST PARITY (the structural guard). CD (.github/workflows/deploy.yml) MUST roll
+#    EXACTLY the RUNNER_IMAGE_JOBS set on every merge (TD-3: CD had drifted to 2 of 6 → westus2/narrative/
+#    rollup/reconcile ran STALE code until a manual deploy). RUNNER_IMAGE_JOBS is the single source (in
+#    deploy-lib.sh, sourced above); the CD set is parsed from deploy.yml's `az containerapp job update -n
+#    <name>` lines. (The migrate update uses `-n "$JOB"`, so the literal-name grep captures ONLY the 6 runner
+#    jobs — never the migrate one.) Set-equality BOTH directions: a job in one but not the other FAILS.
+# ===========================================================================
+cd_rolled="$(grep -oE 'containerapp job update -n [a-z0-9-]+' "${ROOT}/.github/workflows/deploy.yml" | awk '{print $NF}' | sort -u | tr '\n' ' ')"
+runner_image_set="$(printf '%s\n' "${RUNNER_IMAGE_JOBS[@]}" | sort -u | tr '\n' ' ')"
+expect_eq "deploy.yml rolls EXACTLY RUNNER_IMAGE_JOBS (no CD/deploy.sh drift)" "${runner_image_set}" "${cd_rolled}"
 
 echo
 if [[ "${FAILS}" -eq 0 ]]; then

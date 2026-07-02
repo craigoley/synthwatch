@@ -59,22 +59,12 @@ readonly EXPECTED_API_VERSION='2025-04-01-preview'   # the #93/#94 fix — must 
 readonly ACS_SECRET_REF='acs-email-conn'             # the runner ACS env's secretRef — the wipe canary
 readonly API_HEALTH_URL='https://synthwatch-api.azurewebsites.net/api/checks'
 
-# Jobs that reuse the RUNNER image (their deployed image == the intended SHA after a deploy).
-readonly RUNNER_JOB='synthwatch-runner-job'
-readonly CENTRALUS_RUNNER_JOB='synthwatch-runner-job-centralus'
-readonly WESTUS2_RUNNER_JOB='synthwatch-runner-job-westus2'   # 3rd region (2-of-3 quorum)
-readonly NARRATIVE_JOB='synthwatch-narrative-job'
-readonly ROLLUP_JOB='synthwatch-rollup-job'
-readonly RECONCILE_JOB='synthwatch-reconcile-job'
+# The runner-image jobs (RUNNER_JOB, CENTRALUS_RUNNER_JOB, WESTUS2_RUNNER_JOB, NARRATIVE_JOB, ROLLUP_JOB,
+# RECONCILE_JOB) + the RUNNER_IMAGE_JOBS array now live in scripts/lib/deploy-lib.sh — the SINGLE SOURCE OF
+# TRUTH that BOTH this script AND the unit test (deploy_test.sh) read, so the CD job list can't silently drift
+# from it (deploy_test.sh asserts deploy.yml rolls EXACTLY this set). Sourced below; usages are all after that.
 # The migrate job runs on the MIGRATE image (its own repo, same SHA) and applies migrations.
 readonly MIGRATE_JOB='synthwatch-migrate-job'
-# Every job that should be on the runner image after a deploy (verify checks each — BUG 2). ★ SOURCE OF TRUTH:
-# CD (.github/workflows/deploy.yml, "Roll the ACA Job to the new image") MUST roll this SAME set on every merge,
-# or the un-rolled jobs run STALE code until a manual deploy (TD-3 — CD had drifted to only 2 of these 6). If
-# you add/remove a runner-image job here, mirror it in deploy.yml too. All 6 use `image: runnerImage` in bicep.
-readonly RUNNER_IMAGE_JOBS=(
-  "${RUNNER_JOB}" "${CENTRALUS_RUNNER_JOB}" "${WESTUS2_RUNNER_JOB}" "${NARRATIVE_JOB}" "${ROLLUP_JOB}" "${RECONCILE_JOB}"
-)
 
 # Repo root, so the script works from any cwd.
 ROOT="$(git rev-parse --show-toplevel)"
