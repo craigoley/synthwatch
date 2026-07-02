@@ -18,8 +18,9 @@ readonly WESTUS2_RUNNER_JOB='synthwatch-runner-job-westus2'   # 3rd region (2-of
 readonly NARRATIVE_JOB='synthwatch-narrative-job'
 readonly ROLLUP_JOB='synthwatch-rollup-job'
 readonly RECONCILE_JOB='synthwatch-reconcile-job'
+readonly RETENTION_JOB='synthwatch-retention-job'
 readonly RUNNER_IMAGE_JOBS=(
-  "${RUNNER_JOB}" "${CENTRALUS_RUNNER_JOB}" "${WESTUS2_RUNNER_JOB}" "${NARRATIVE_JOB}" "${ROLLUP_JOB}" "${RECONCILE_JOB}"
+  "${RUNNER_JOB}" "${CENTRALUS_RUNNER_JOB}" "${WESTUS2_RUNNER_JOB}" "${NARRATIVE_JOB}" "${ROLLUP_JOB}" "${RECONCILE_JOB}" "${RETENTION_JOB}"
 )
 
 # ---------------------------------------------------------------------------

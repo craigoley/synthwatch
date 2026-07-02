@@ -136,6 +136,8 @@ jobs:
               || echo "::notice::synthwatch-rollup-job not present yet — skipping (deploy its bicep to create it)."
             az containerapp job update -n synthwatch-reconcile-job -g synthwatch-rg --image "$IMAGE" \
               || echo "::notice::synthwatch-reconcile-job not present yet — skipping (deploy its bicep to create it)."
+            az containerapp job update -n synthwatch-retention-job -g synthwatch-rg --image "$IMAGE" \
+              || echo "::notice::synthwatch-retention-job not present yet — skipping (deploy its bicep to create it)."
 
       - name: Write deployment summary
         run: |

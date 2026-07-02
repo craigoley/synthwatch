@@ -140,6 +140,9 @@ param narrativeJobName string = 'synthwatch-narrative-job'
 @description('Daily Container Apps Job that reconciles the monitors-as-code manifest into checks (detect-only; writes reconcile_drift).')
 param reconcileJobName string = 'synthwatch-reconcile-job'
 
+@description('Daily Container Apps Job that prunes runs older than artifactRetentionDays (rows expire on the same 90d clock as the blob lifecycle; cascades run_steps/run_metrics).')
+param retentionJobName string = 'synthwatch-retention-job'
+
 @description('User-assigned managed identity name (used for ACR pull).')
 param identityName string = 'synthwatch-runner-id'
 
@@ -1224,6 +1227,82 @@ resource reconcileJob 'Microsoft.App/jobs@2024-03-01' = {
 }
 
 // ---------------------------------------------------------------------------
+// Daily row-RETENTION job. Prunes runs older than RETENTION_DAYS (=90 in runner/retention.ts,
+// MUST stay equal to artifactRetentionDays) so the runs family stops growing unbounded and the
+// rows expire on the SAME 90d clock as the blob lifecycle (closing the dangling-ref window).
+// Reuses the RUNNER image, overriding the command to run the retention entry point. Runs at
+// 00:45 UTC — AFTER rollup ('7 0') and narrative ('30 0'), so the day's rollup is captured before
+// any raw run becomes prune-eligible (the long-horizon series is safe). CASCADE cleans
+// run_steps/run_metrics; incident-pinned runs are excluded in code. DATABASE_URL only (no AOAI/ACS).
+// One-off run: `az containerapp job start -n synthwatch-retention-job`.
+// ---------------------------------------------------------------------------
+resource retentionJob 'Microsoft.App/jobs@2024-03-01' = {
+  name: retentionJobName
+  location: location
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${identity.id}': {}
+    }
+  }
+  properties: {
+    environmentId: managedEnvironment.id
+    configuration: {
+      triggerType: 'Schedule'
+      replicaTimeout: 600
+      replicaRetryLimit: 1
+      scheduleTriggerConfig: {
+        cronExpression: '45 0 * * *'
+        parallelism: 1
+        replicaCompletionCount: 1
+      }
+      registries: [
+        {
+          server: acr.properties.loginServer
+          identity: identity.id
+        }
+      ]
+      secrets: [
+        {
+          // Same value/shape as the runner job's database-url secret.
+          name: 'database-url'
+          value: 'postgresql://${postgresAdminLogin}:${postgresAdminPassword}@${postgres.properties.fullyQualifiedDomainName}:5432/synthwatch?sslmode=require'
+        }
+      ]
+    }
+    template: {
+      containers: [
+        {
+          name: 'retention'
+          image: runnerImage
+          // Override the image's default CMD (dist/index.js, the check loop) -> the retention
+          // entry. Prunes runs older than RETENTION_DAYS (cascades children).
+          command: [
+            'node'
+          ]
+          args: [
+            'dist/retentionMain.js'
+          ]
+          resources: {
+            cpu: json('0.25')
+            memory: '0.5Gi'
+          }
+          env: [
+            {
+              name: 'DATABASE_URL'
+              secretRef: 'database-url'
+            }
+          ]
+        }
+      ]
+    }
+  }
+  dependsOn: [
+    acrPull
+  ]
+}
+
+// ---------------------------------------------------------------------------
 // Outputs
 // ---------------------------------------------------------------------------
 output postgresFqdn string = postgres.properties.fullyQualifiedDomainName
@@ -1233,3 +1312,4 @@ output migrateJobName string = migrateJob.name
 output rollupJobName string = rollupJob.name
 output narrativeJobName string = narrativeJob.name
 output reconcileJobName string = reconcileJob.name
+output retentionJobName string = retentionJob.name
