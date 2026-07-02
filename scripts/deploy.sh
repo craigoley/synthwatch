@@ -68,7 +68,10 @@ readonly ROLLUP_JOB='synthwatch-rollup-job'
 readonly RECONCILE_JOB='synthwatch-reconcile-job'
 # The migrate job runs on the MIGRATE image (its own repo, same SHA) and applies migrations.
 readonly MIGRATE_JOB='synthwatch-migrate-job'
-# Every job that should be on the runner image after a deploy (verify checks each — BUG 2).
+# Every job that should be on the runner image after a deploy (verify checks each — BUG 2). ★ SOURCE OF TRUTH:
+# CD (.github/workflows/deploy.yml, "Roll the ACA Job to the new image") MUST roll this SAME set on every merge,
+# or the un-rolled jobs run STALE code until a manual deploy (TD-3 — CD had drifted to only 2 of these 6). If
+# you add/remove a runner-image job here, mirror it in deploy.yml too. All 6 use `image: runnerImage` in bicep.
 readonly RUNNER_IMAGE_JOBS=(
   "${RUNNER_JOB}" "${CENTRALUS_RUNNER_JOB}" "${WESTUS2_RUNNER_JOB}" "${NARRATIVE_JOB}" "${ROLLUP_JOB}" "${RECONCILE_JOB}"
 )
