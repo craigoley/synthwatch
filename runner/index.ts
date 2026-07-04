@@ -2,7 +2,8 @@
 //
 // Lifecycle of one Job tick (the Job fires on */5 UTC; this process runs once
 // and exits):
-//   1. due-filter  — find checks where now() - last_run_at >= interval_seconds
+//   1. due-filter  — find checks where now() - last_run_at >= interval_seconds minus the
+//                    tick-slip guard (duePredicate.ts — the δ-slip cadence fix)
 //   2. claim       — conditional UPDATE that advances last_run_at ONLY if still
 //                    due. ACA runs replicas in parallel; the replica whose
 //                    UPDATE returns a row owns that check, the rest skip it.
@@ -62,6 +63,8 @@ import {
 } from './metrics.js';
 import { isExpectationError } from './errors.js';
 import { runWithRetry, effectiveRetries } from './retry.js';
+import { DUE_PREDICATE_SQL } from './duePredicate.js';
+import { withDeadline } from './timeBudget.js';
 import {
   INVOCATION_ID,
   installGlobalErrorHandlers,
@@ -111,6 +114,13 @@ const STALE_RUNNING = "30 minutes";
 // config is a possible follow-up; a single sane default keeps this PR one concern.)
 const RETRY_BACKOFF_MS = 5000;
 
+// Whole-flow wall-clock ceiling for a BROWSER run (mirrors multistep's MAX_CHAIN_MS — that family
+// fixed this exact class first). page.setDefaultTimeout bounds each ACTION (check.timeout_ms);
+// without a flow ceiling, k slow-but-passing actions could run ~k × timeout_ms and ride into the
+// ACA replicaTimeout (240s) kill — no verdict, a stranded 'running' row, and the rest of the tick's
+// due checks silently deferred. 180s leaves ~60s of the 240s budget for teardown/steps that follow.
+const MAX_FLOW_MS = 180_000;
+
 // How fresh the per-monitor success-trace baseline must be before we SKIP re-uploading it on a pass.
 // Capturing+uploading a multi-MB trace on every successful tick would be wasteful for a healthy 5-min
 // monitor (288 uploads/day to maintain ONE overwritten slot); a baseline up to this stale is a fine
@@ -130,6 +140,9 @@ async function getBrowser(): Promise<Browser> {
 }
 
 async function main(): Promise<void> {
+  // Tick wall-clock start — the budget denominator for the loop-end summary line below (the ACA
+  // replicaTimeout is 240s; a tick nearing it is about to defer work to the next tick).
+  const tickStartMs = Date.now();
   // Stamp the per-invocation correlation id on stdout so an ACA log line + a runner_errors row reconcile.
   console.log(`[runner] invocation ${INVOCATION_ID} (location=${LOCATION})`);
   // ★ Egress-IP capture (static-egress-IP Phase 0): WARM the per-process egress IP now so it overlaps with
@@ -171,12 +184,14 @@ async function main(): Promise<void> {
   const due = await findDueChecks();
   console.log(`[runner] ${due.length} check(s) due`);
 
+  let claimed = 0;
   for (const candidate of due) {
     const check = await claim(candidate.id);
     if (!check) {
       // Another replica claimed it first, or it's no longer due.
       continue;
     }
+    claimed++;
     // ★ B5: per-iteration try/catch (mirrors the on-demand drain above). runOne is try/FINALLY with NO
     // catch, so a throw AFTER its finalize block (the terminal UPDATE / evaluate / alerts / OTel) — or a
     // pool error in the 'running' INSERT — propagates and would abort the REST of this tick's due checks:
@@ -189,6 +204,16 @@ async function main(): Promise<void> {
       await recordFatal('due-loop', err);
     }
   }
+
+  // Tick-budget telemetry (zero schema change): one greppable line per tick with claimed-vs-due
+  // and wall-time. This is how starvation becomes VISIBLE — a replicaTimeout (240s) kill leaves no
+  // queryable trace (no SIGTERM handler; the process just dies), so a tick that ran long shows up
+  // here as wall-time approaching the budget, and one that was killed shows up as this line MISSING
+  // for that invocation (grep the invocation id from the first log line).
+  console.log(
+    `[runner] tick summary: claimed ${claimed}/${due.length} due check(s), ` +
+      `wall-time ${Date.now() - tickStartMs}ms (location=${LOCATION})`,
+  );
 }
 
 /**
@@ -232,7 +257,17 @@ async function reapStaleRunning(): Promise<void> {
  * check is a candidate ONLY if it has a check_locations cursor for THIS region — a
  * check not assigned here is simply not selected (no lazy-insert auto-creates one;
  * see claim()). Due when the cursor is NULL (freshly seeded => due-now) or aged past
- * interval_seconds. Cheap pre-filter; claim() is the real (atomic) gate.
+ * the guarded threshold (interval_seconds minus the tick-slip guard — the shared
+ * DUE_PREDICATE_SQL in duePredicate.ts explains the δ-slip mechanism and why the
+ * guard cannot double-fire). Cheap pre-filter; claim() is the real (atomic) gate.
+ *
+ * ★ ORDER BY last_run_at ASC NULLS FIRST — longest-unserved first (NULL = never ran =
+ * most starved). The loop is sequential and the ACA replicaTimeout (240s) can kill a
+ * tick mid-list; with UNSPECIFIED order (Postgres heap order, ~stable tick-to-tick)
+ * the SAME tail checks would starve on every over-budget tick. Oldest-first turns
+ * persistent starvation into rotation: whatever was deferred last tick has the oldest
+ * cursor, so it goes FIRST next tick. The c.id tiebreak makes intra-cohort order
+ * (esp. the all-NULL never-ran group) deterministic instead of heap-order.
  */
 async function findDueChecks(): Promise<{ id: number }[]> {
   const { rows } = await pool.query<{ id: number }>(
@@ -241,8 +276,8 @@ async function findDueChecks(): Promise<{ id: number }[]> {
        JOIN check_locations cl
          ON cl.check_id = c.id AND cl.location = $1
       WHERE c.enabled
-        AND (cl.last_run_at IS NULL
-             OR now() - cl.last_run_at >= make_interval(secs => c.interval_seconds))`,
+        AND ${DUE_PREDICATE_SQL}
+      ORDER BY cl.last_run_at ASC NULLS FIRST, c.id ASC`,
     [LOCATION],
   );
   return rows;
@@ -269,8 +304,7 @@ async function claim(id: number): Promise<Check | null> {
           AND cl.location = $2
           AND c.id = cl.check_id
           AND c.enabled
-          AND (cl.last_run_at IS NULL
-               OR now() - cl.last_run_at >= make_interval(secs => c.interval_seconds))
+          AND ${DUE_PREDICATE_SQL}
        RETURNING cl.check_id
      ),
      mirror AS (
@@ -929,7 +963,15 @@ async function executeBrowser(
       } else {
         flow = await loadFlow(check.flow_name as string);
       }
-      await flow(rec);
+      // Whole-flow deadline (MAX_FLOW_MS): a budget breach rejects with a plain Error → the catch
+      // below classifies it 'error' (isExpectationError is false), with an honest message instead
+      // of a replicaTimeout kill. The context.close() in the finally aborts the abandoned flow's
+      // in-flight Playwright work; withDeadline marks its late rejection handled.
+      await withDeadline(
+        flow(rec),
+        MAX_FLOW_MS,
+        `browser flow wall-clock budget (${MAX_FLOW_MS}ms) exhausted — per-action timeouts (${check.timeout_ms}ms) never bound the WHOLE flow`,
+      );
       status = 'pass';
       // Capture the RCA visual-diff baseline from the just-rendered page (cheap —
       // it's already rendered; we'd otherwise discard it). Non-fatal; runOne only
