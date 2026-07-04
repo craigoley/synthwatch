@@ -28,10 +28,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out the runner repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Check out synthwatch-monitors@main (the authoring lib/flow.ts)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: craigoley/synthwatch-monitors
           ref: main
