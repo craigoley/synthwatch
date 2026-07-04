@@ -2,7 +2,8 @@
 //
 // Lifecycle of one Job tick (the Job fires on */5 UTC; this process runs once
 // and exits):
-//   1. due-filter  — find checks where now() - last_run_at >= interval_seconds
+//   1. due-filter  — find checks where now() - last_run_at >= interval_seconds minus the
+//                    tick-slip guard (duePredicate.ts — the δ-slip cadence fix)
 //   2. claim       — conditional UPDATE that advances last_run_at ONLY if still
 //                    due. ACA runs replicas in parallel; the replica whose
 //                    UPDATE returns a row owns that check, the rest skip it.
@@ -62,6 +63,8 @@ import {
 } from './metrics.js';
 import { isExpectationError } from './errors.js';
 import { runWithRetry, effectiveRetries } from './retry.js';
+import { DUE_PREDICATE_SQL } from './duePredicate.js';
+import { withDeadline } from './timeBudget.js';
 import {
   INVOCATION_ID,
   installGlobalErrorHandlers,
@@ -110,6 +113,13 @@ const STALE_RUNNING = "30 minutes";
 // retry counts are tiny and the tick is time-bounded by the ACA replicaTimeout. (Per-check backoff
 // config is a possible follow-up; a single sane default keeps this PR one concern.)
 const RETRY_BACKOFF_MS = 5000;
+
+// Whole-flow wall-clock ceiling for a BROWSER run (mirrors multistep's MAX_CHAIN_MS — that family
+// fixed this exact class first). page.setDefaultTimeout bounds each ACTION (check.timeout_ms);
+// without a flow ceiling, k slow-but-passing actions could run ~k × timeout_ms and ride into the
+// ACA replicaTimeout (240s) kill — no verdict, a stranded 'running' row, and the rest of the tick's
+// due checks silently deferred. 180s leaves ~60s of the 240s budget for teardown/steps that follow.
+const MAX_FLOW_MS = 180_000;
 
 // How fresh the per-monitor success-trace baseline must be before we SKIP re-uploading it on a pass.
 // Capturing+uploading a multi-MB trace on every successful tick would be wasteful for a healthy 5-min
@@ -247,7 +257,9 @@ async function reapStaleRunning(): Promise<void> {
  * check is a candidate ONLY if it has a check_locations cursor for THIS region — a
  * check not assigned here is simply not selected (no lazy-insert auto-creates one;
  * see claim()). Due when the cursor is NULL (freshly seeded => due-now) or aged past
- * interval_seconds. Cheap pre-filter; claim() is the real (atomic) gate.
+ * the guarded threshold (interval_seconds minus the tick-slip guard — the shared
+ * DUE_PREDICATE_SQL in duePredicate.ts explains the δ-slip mechanism and why the
+ * guard cannot double-fire). Cheap pre-filter; claim() is the real (atomic) gate.
  *
  * ★ ORDER BY last_run_at ASC NULLS FIRST — longest-unserved first (NULL = never ran =
  * most starved). The loop is sequential and the ACA replicaTimeout (240s) can kill a
@@ -263,8 +275,7 @@ async function findDueChecks(): Promise<{ id: number }[]> {
        JOIN check_locations cl
          ON cl.check_id = c.id AND cl.location = $1
       WHERE c.enabled
-        AND (cl.last_run_at IS NULL
-             OR now() - cl.last_run_at >= make_interval(secs => c.interval_seconds))
+        AND ${DUE_PREDICATE_SQL}
       ORDER BY cl.last_run_at ASC NULLS FIRST`,
     [LOCATION],
   );
@@ -292,8 +303,7 @@ async function claim(id: number): Promise<Check | null> {
           AND cl.location = $2
           AND c.id = cl.check_id
           AND c.enabled
-          AND (cl.last_run_at IS NULL
-               OR now() - cl.last_run_at >= make_interval(secs => c.interval_seconds))
+          AND ${DUE_PREDICATE_SQL}
        RETURNING cl.check_id
      ),
      mirror AS (
@@ -952,7 +962,15 @@ async function executeBrowser(
       } else {
         flow = await loadFlow(check.flow_name as string);
       }
-      await flow(rec);
+      // Whole-flow deadline (MAX_FLOW_MS): a budget breach rejects with a plain Error → the catch
+      // below classifies it 'error' (isExpectationError is false), with an honest message instead
+      // of a replicaTimeout kill. The context.close() in the finally aborts the abandoned flow's
+      // in-flight Playwright work; withDeadline marks its late rejection handled.
+      await withDeadline(
+        flow(rec),
+        MAX_FLOW_MS,
+        `browser flow wall-clock budget (${MAX_FLOW_MS}ms) exhausted — per-action timeouts (${check.timeout_ms}ms) never bound the WHOLE flow`,
+      );
       status = 'pass';
       // Capture the RCA visual-diff baseline from the just-rendered page (cheap —
       // it's already rendered; we'd otherwise discard it). Non-fatal; runOne only
