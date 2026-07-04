@@ -50,7 +50,7 @@ jobs:
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
       - name: Build and push runner image (ACR)
-        uses: azure/cli@089eac9d8cc39f5d003e94f8b65efc51076c9cbd # v2.1.0
+        uses: azure/cli@9eb25b8360668fb0ecbafa808d40e2197b2f5f52 # v3.0.0
         with:
           azcliversion: latest
           # Build context is runner/ (NOT repo root) because the Dockerfile's
@@ -61,7 +61,7 @@ jobs:
               -f runner/Dockerfile runner
 
       - name: Build and push migration image (ACR)
-        uses: azure/cli@089eac9d8cc39f5d003e94f8b65efc51076c9cbd # v2.1.0
+        uses: azure/cli@9eb25b8360668fb0ecbafa808d40e2197b2f5f52 # v3.0.0
         with:
           azcliversion: latest
           # Build context is db/ — Dockerfile.migrate COPYs migrations/ and migrate.sh.
@@ -77,7 +77,7 @@ jobs:
       # the password never reaches GitHub. If migrations fail, this step exits
       # non-zero and the workflow stops here: the new image is NOT rolled.
       - name: Apply DB migrations (ACA Job, inside Azure)
-        uses: azure/cli@089eac9d8cc39f5d003e94f8b65efc51076c9cbd # v2.1.0
+        uses: azure/cli@9eb25b8360668fb0ecbafa808d40e2197b2f5f52 # v3.0.0
         with:
           azcliversion: latest
           inlineScript: |
@@ -110,7 +110,7 @@ jobs:
             exit 1
 
       - name: Roll the ACA Job to the new image
-        uses: azure/cli@089eac9d8cc39f5d003e94f8b65efc51076c9cbd # v2.1.0
+        uses: azure/cli@9eb25b8360668fb0ecbafa808d40e2197b2f5f52 # v3.0.0
         with:
           azcliversion: latest
           # This is an ACA JOB, not a Container App — use `containerapp job update`,
