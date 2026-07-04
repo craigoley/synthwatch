@@ -130,6 +130,9 @@ async function getBrowser(): Promise<Browser> {
 }
 
 async function main(): Promise<void> {
+  // Tick wall-clock start — the budget denominator for the loop-end summary line below (the ACA
+  // replicaTimeout is 240s; a tick nearing it is about to defer work to the next tick).
+  const tickStartMs = Date.now();
   // Stamp the per-invocation correlation id on stdout so an ACA log line + a runner_errors row reconcile.
   console.log(`[runner] invocation ${INVOCATION_ID} (location=${LOCATION})`);
   // ★ Egress-IP capture (static-egress-IP Phase 0): WARM the per-process egress IP now so it overlaps with
@@ -171,12 +174,14 @@ async function main(): Promise<void> {
   const due = await findDueChecks();
   console.log(`[runner] ${due.length} check(s) due`);
 
+  let claimed = 0;
   for (const candidate of due) {
     const check = await claim(candidate.id);
     if (!check) {
       // Another replica claimed it first, or it's no longer due.
       continue;
     }
+    claimed++;
     // ★ B5: per-iteration try/catch (mirrors the on-demand drain above). runOne is try/FINALLY with NO
     // catch, so a throw AFTER its finalize block (the terminal UPDATE / evaluate / alerts / OTel) — or a
     // pool error in the 'running' INSERT — propagates and would abort the REST of this tick's due checks:
@@ -189,6 +194,16 @@ async function main(): Promise<void> {
       await recordFatal('due-loop', err);
     }
   }
+
+  // Tick-budget telemetry (zero schema change): one greppable line per tick with claimed-vs-due
+  // and wall-time. This is how starvation becomes VISIBLE — a replicaTimeout (240s) kill leaves no
+  // queryable trace (no SIGTERM handler; the process just dies), so a tick that ran long shows up
+  // here as wall-time approaching the budget, and one that was killed shows up as this line MISSING
+  // for that invocation (grep the invocation id from the first log line).
+  console.log(
+    `[runner] tick summary: claimed ${claimed}/${due.length} due check(s), ` +
+      `wall-time ${Date.now() - tickStartMs}ms (location=${LOCATION})`,
+  );
 }
 
 /**
@@ -233,6 +248,13 @@ async function reapStaleRunning(): Promise<void> {
  * check not assigned here is simply not selected (no lazy-insert auto-creates one;
  * see claim()). Due when the cursor is NULL (freshly seeded => due-now) or aged past
  * interval_seconds. Cheap pre-filter; claim() is the real (atomic) gate.
+ *
+ * ★ ORDER BY last_run_at ASC NULLS FIRST — longest-unserved first (NULL = never ran =
+ * most starved). The loop is sequential and the ACA replicaTimeout (240s) can kill a
+ * tick mid-list; with UNSPECIFIED order (Postgres heap order, ~stable tick-to-tick)
+ * the SAME tail checks would starve on every over-budget tick. Oldest-first turns
+ * persistent starvation into rotation: whatever was deferred last tick has the oldest
+ * cursor, so it goes FIRST next tick.
  */
 async function findDueChecks(): Promise<{ id: number }[]> {
   const { rows } = await pool.query<{ id: number }>(
@@ -242,7 +264,8 @@ async function findDueChecks(): Promise<{ id: number }[]> {
          ON cl.check_id = c.id AND cl.location = $1
       WHERE c.enabled
         AND (cl.last_run_at IS NULL
-             OR now() - cl.last_run_at >= make_interval(secs => c.interval_seconds))`,
+             OR now() - cl.last_run_at >= make_interval(secs => c.interval_seconds))
+      ORDER BY cl.last_run_at ASC NULLS FIRST`,
     [LOCATION],
   );
   return rows;
