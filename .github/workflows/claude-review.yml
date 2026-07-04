@@ -154,16 +154,23 @@ jobs:
           echo "::warning::[review] no verdict parsed — failing open to PASS (an LLM hiccup must not deadlock merge)."
           exit 0
 
-  # Deterministic hands-free merge — TRUSTED AUTHORS ONLY. This `if:` is the security
-  # gate: it fires only when the PR author's login is in the allowlist (the operator
-  # craigoley / cao825, the agent craigoleyagent, and dependabot[bot]). Any other
-  # author -> the job is skipped -> the PR NEVER auto-merges, even with all checks
-  # green. `gh pr merge --auto` enables GitHub native auto-merge, which holds the
+  # Deterministic hands-free merge — TRUSTED AUTHORS ONLY, MAIN-BASE ONLY. This `if:` is
+  # the security gate: it fires only when the PR author's login is in the allowlist (the
+  # operator craigoley / cao825, the agent craigoleyagent, and dependabot[bot]) AND the PR
+  # targets `main`. Any other author -> skipped -> the PR NEVER auto-merges, even with all
+  # checks green. `gh pr merge --auto` enables GitHub native auto-merge, which holds the
   # merge until required status checks pass (once branch protection requires them);
   # without protection it merges as soon as the PR is mergeable.
+  # ★ base.ref == 'main' (2026-07-04, PR #192): branch protection + required checks exist
+  # ONLY on main — a PR based on an unprotected feature branch (a STACKED PR) has zero
+  # required checks, so arming auto-merge there merges it INSTANTLY, unreviewed, into the
+  # stack base. A non-main-base PR now skips this job entirely: auto-merge is never armed,
+  # and the PR waits for a human (or a retarget to main) — nothing merges by itself.
   automerge:
     runs-on: ubuntu-latest
-    if: contains(fromJSON('["craigoley", "cao825", "craigoleyagent", "dependabot[bot]"]'), github.event.pull_request.user.login)
+    if: >-
+      github.event.pull_request.base.ref == 'main' &&
+      contains(fromJSON('["craigoley", "cao825", "craigoleyagent", "dependabot[bot]"]'), github.event.pull_request.user.login)
     permissions:
       contents: write
       pull-requests: write
