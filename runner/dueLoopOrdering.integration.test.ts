@@ -44,7 +44,7 @@ async function findDueChecks(): Promise<number[]> {
       WHERE c.enabled
         AND (cl.last_run_at IS NULL
              OR now() - cl.last_run_at >= make_interval(secs => c.interval_seconds))
-      ORDER BY cl.last_run_at ASC NULLS FIRST`,
+      ORDER BY cl.last_run_at ASC NULLS FIRST, c.id ASC`,
     [LOC],
   );
   return rows.map((r) => r.id);

@@ -266,7 +266,8 @@ async function reapStaleRunning(): Promise<void> {
  * tick mid-list; with UNSPECIFIED order (Postgres heap order, ~stable tick-to-tick)
  * the SAME tail checks would starve on every over-budget tick. Oldest-first turns
  * persistent starvation into rotation: whatever was deferred last tick has the oldest
- * cursor, so it goes FIRST next tick.
+ * cursor, so it goes FIRST next tick. The c.id tiebreak makes intra-cohort order
+ * (esp. the all-NULL never-ran group) deterministic instead of heap-order.
  */
 async function findDueChecks(): Promise<{ id: number }[]> {
   const { rows } = await pool.query<{ id: number }>(
@@ -276,7 +277,7 @@ async function findDueChecks(): Promise<{ id: number }[]> {
          ON cl.check_id = c.id AND cl.location = $1
       WHERE c.enabled
         AND ${DUE_PREDICATE_SQL}
-      ORDER BY cl.last_run_at ASC NULLS FIRST`,
+      ORDER BY cl.last_run_at ASC NULLS FIRST, c.id ASC`,
     [LOCATION],
   );
   return rows;

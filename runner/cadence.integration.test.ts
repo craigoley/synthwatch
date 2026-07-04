@@ -66,7 +66,7 @@ async function simulate(predicate: string, loc: string, checkIds: number[]): Pro
       `SELECT c.id FROM checks c
         JOIN check_locations cl ON cl.check_id = c.id AND cl.location = $1
        WHERE c.enabled AND ${predicate}
-       ORDER BY cl.last_run_at ASC NULLS FIRST`,
+       ORDER BY cl.last_run_at ASC NULLS FIRST, c.id ASC`,
       [loc],
     );
     for (const { id } of due) {
