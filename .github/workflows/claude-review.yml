@@ -41,7 +41,7 @@ jobs:
         # Verdict gate below is the sole arbiter of the conclusion (no/garbled
         # verdict => PASS). Only a parsed BLOCK fails the check.
         continue-on-error: true
-        uses: anthropics/claude-code-action@a92e7c70a4da9793dc164451d829089dc057a464 # v1
+        uses: anthropics/claude-code-action@558b1d6cab4085c7753fe402c10bef0fbb92ac7a # v1
         env:
           # Authenticate the `gh` CLI used by the Bash tool (comments are posted via
           # the MCP inline tool + the auto-posted tracking comment).
