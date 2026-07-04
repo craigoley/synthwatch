@@ -9,6 +9,7 @@
 import { test as nodeTest } from 'node:test';
 import assert from 'node:assert/strict';
 import { pool } from './db.js';
+import { DUE_PREDICATE_SQL } from './duePredicate.js';
 
 const SKIP = !process.env.DATABASE_URL;
 const test = SKIP ? nodeTest.skip : nodeTest;
@@ -34,7 +35,10 @@ async function seedCursor(checkId: number, lastRunAt: string | null): Promise<vo
   );
 }
 
-// The EXACT production query from index.ts findDueChecks (incl. the ORDER BY under test).
+// The EXACT production query from index.ts findDueChecks — the predicate is IMPORTED (the same
+// string index.ts interpolates; see duePredicate.ts), so this file cannot silently diverge if the
+// predicate changes again. The ORDER BY is what's under test; the guarded due threshold for the
+// 300s checks below is 150s (interval − LEAST(150, interval/2)), which the seeded ages respect.
 async function findDueChecks(): Promise<number[]> {
   const { rows } = await pool.query<{ id: number }>(
     `SELECT c.id
@@ -42,8 +46,7 @@ async function findDueChecks(): Promise<number[]> {
        JOIN check_locations cl
          ON cl.check_id = c.id AND cl.location = $1
       WHERE c.enabled
-        AND (cl.last_run_at IS NULL
-             OR now() - cl.last_run_at >= make_interval(secs => c.interval_seconds))
+        AND ${DUE_PREDICATE_SQL}
       ORDER BY cl.last_run_at ASC NULLS FIRST, c.id ASC`,
     [LOC],
   );
