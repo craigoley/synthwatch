@@ -5,10 +5,13 @@ name: Claude review
 # token, NOT an API key, so there is no per-use API cost.
 #
 # SECURITY (this is a PUBLIC repo that DEPLOYS the runner to Azure on merge):
-# auto-merge is enforced by the `automerge` job's `if:` allowlist — a deterministic
-# check on the PR author's login, NOT the LLM. The review job CANNOT merge (it has
-# no gh-pr/gh-api tools); merging is solely the automerge job, which never fires for
-# a non-allowlisted author even if every check is green.
+# auto-merge is enforced by the `automerge` job's `if:` — TWO deterministic conditions,
+# NOT the LLM: (1) the PR author's login is in the trusted allowlist, AND (2) the PR's
+# base is `main` (the only branch with required checks; arming auto-merge on an
+# unprotected base merges instantly — the 2026-07-04 #192 stacked-PR incident). The
+# review job CANNOT merge (it has no gh-pr/gh-api tools) and still runs on stacked PRs;
+# merging is solely the automerge job, which never fires for a non-allowlisted author
+# or a non-main base even if every check is green.
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
