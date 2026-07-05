@@ -529,6 +529,20 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
               value: location
             }
             {
+              // ★ Universal deployed-environment marker — present on EVERY job in this template
+              // (mains AND aux), absent in any local shell. The A4 prod-guard's aux fan-out
+              // (runner/prodGuard.ts step 2) will trust THIS var, so the aux jobs — which carry
+              // no SYNTHWATCH_LOCATION — aren't gated on unverifiable ACA platform vars.
+              // ★ ORDERING INVARIANT: this marker must be DEPLOYED + VERIFIED on all 8 jobs
+              // BEFORE the guard fan-out PR merges, or the aux fleet refuses to start.
+              // Named SYNTHWATCH_DEPLOYED (not SYNTHWATCH_ENV): otel.ts:82,107 already reads
+              // SYNTHWATCH_ENV as the OTel deployment.environment attr (default 'production') —
+              // reusing it would silently relabel telemetry. Template-owned so every
+              // `az deployment group create` re-asserts it (the out-of-band-env wipe class).
+              name: 'SYNTHWATCH_DEPLOYED'
+              value: '1'
+            }
+            {
               // RCA via Azure OpenAI (MI auth — no key). Declared so a redeploy can't
               // wipe RCA off (the cutover-wipe bug). rcaEnabled() needs ENDPOINT+DEPLOYMENT.
               name: 'AZURE_OPENAI_ENDPOINT'
@@ -689,6 +703,11 @@ resource centralusJob 'Microsoft.App/jobs@2024-03-01' = {
               value: centralusLocation
             }
             {
+              // Universal deployed marker — see the primary job's SYNTHWATCH_DEPLOYED comment.
+              name: 'SYNTHWATCH_DEPLOYED'
+              value: '1'
+            }
+            {
               // RCA via Azure OpenAI (MI auth). Identical to the primary job — both
               // regions open incidents, so both need RCA. Declared so a redeploy
               // preserves it.
@@ -844,6 +863,11 @@ resource westus2Job 'Microsoft.App/jobs@2024-03-01' = {
               value: westus2Location
             }
             {
+              // Universal deployed marker — see the primary job's SYNTHWATCH_DEPLOYED comment.
+              name: 'SYNTHWATCH_DEPLOYED'
+              value: '1'
+            }
+            {
               // RCA via Azure OpenAI (MI auth). Identical to the other jobs — every region
               // opens incidents, so every region needs RCA. Declared so a redeploy preserves it.
               name: 'AZURE_OPENAI_ENDPOINT'
@@ -949,6 +973,11 @@ resource migrateJob 'Microsoft.App/jobs@2024-03-01' = {
               name: 'DATABASE_URL'
               secretRef: 'database-url'
             }
+            {
+              // Universal deployed marker — see the primary job's SYNTHWATCH_DEPLOYED comment.
+              name: 'SYNTHWATCH_DEPLOYED'
+              value: '1'
+            }
           ]
         }
       ]
@@ -1026,6 +1055,11 @@ resource rollupJob 'Microsoft.App/jobs@2024-03-01' = {
               name: 'DATABASE_URL'
               secretRef: 'database-url'
             }
+            {
+              // Universal deployed marker — see the primary job's SYNTHWATCH_DEPLOYED comment.
+              name: 'SYNTHWATCH_DEPLOYED'
+              value: '1'
+            }
           ]
         }
       ]
@@ -1102,6 +1136,11 @@ resource narrativeJob 'Microsoft.App/jobs@2024-03-01' = {
             {
               name: 'DATABASE_URL'
               secretRef: 'database-url'
+            }
+            {
+              // Universal deployed marker — see the primary job's SYNTHWATCH_DEPLOYED comment.
+              name: 'SYNTHWATCH_DEPLOYED'
+              value: '1'
             }
             // AOAI — the SAME config the runner jobs carry. This IS the Layer-3 opt-in:
             // present => narratives generate; absent => narrativeMain no-ops (dark).
@@ -1210,6 +1249,11 @@ resource reconcileJob 'Microsoft.App/jobs@2024-03-01' = {
               secretRef: 'database-url'
             }
             {
+              // Universal deployed marker — see the primary job's SYNTHWATCH_DEPLOYED comment.
+              name: 'SYNTHWATCH_DEPLOYED'
+              value: '1'
+            }
+            {
               // Pin the user-assigned MI for DefaultAzureCredential (the #90 pattern),
               // derived from the MI resource. Reconcile makes no AAD calls today; carried
               // to match the other jobs and future-proof any AAD need.
@@ -1291,6 +1335,11 @@ resource retentionJob 'Microsoft.App/jobs@2024-03-01' = {
             {
               name: 'DATABASE_URL'
               secretRef: 'database-url'
+            }
+            {
+              // Universal deployed marker — see the primary job's SYNTHWATCH_DEPLOYED comment.
+              name: 'SYNTHWATCH_DEPLOYED'
+              value: '1'
             }
           ]
         }
