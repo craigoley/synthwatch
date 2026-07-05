@@ -143,8 +143,8 @@ async function getBrowser(): Promise<Browser> {
 async function main(): Promise<void> {
   // ★ FIRST, before ANY query (the pg Pool connects lazily, so nothing has touched the DB yet):
   // refuse to run a LOCAL shell against the prod Postgres (the June 25–26 check-74 incident —
-  // ~/.synthwatch.env hands prod DATABASE_URL to anything that sources it). Deployed runners carry
-  // SYNTHWATCH_LOCATION (bicep) and pass silently; deliberate local-against-prod runs set
+  // ~/.synthwatch.env hands prod DATABASE_URL to anything that sources it). Deployed jobs carry
+  // the universal SYNTHWATCH_DEPLOYED=1 marker (bicep, all 8 jobs — #197) and pass silently; deliberate local-against-prod runs set
   // SYNTHWATCH_ALLOW_PROD=1. Refusal is log+exit, NOT throw — a throw would route through
   // recordFatal and INSERT into the prod DB, the exact write class being prevented (prodGuard.ts).
   enforceProdGuard();

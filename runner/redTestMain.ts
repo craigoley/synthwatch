@@ -19,6 +19,14 @@ import {
   type Fault,
 } from './redTest.js';
 
+import { enforceProdGuard } from './prodGuard.js';
+
+// ★ FIRST, before ANY query (module scope — runs before main() below is invoked): refuse a LOCAL
+// shell pointed at prod. NOTE — red-tests are often run on-demand from a workstation; against
+// prod that is now a DELIBERATE act: SYNTHWATCH_ALLOW_PROD=1 states the intent. Deployed
+// contexts (SYNTHWATCH_DEPLOYED=1) pass silently. See prodGuard.ts.
+enforceProdGuard();
+
 function arg(name: string): string | undefined {
   const hit = process.argv.find((a) => a.startsWith(`--${name}=`));
   return hit ? hit.slice(name.length + 3) : undefined;

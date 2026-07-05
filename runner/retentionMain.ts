@@ -7,6 +7,13 @@ import { pool } from './db.js';
 import { runRetention } from './retention.js';
 import { recordFatal } from './runnerErrors.js';
 
+import { enforceProdGuard } from './prodGuard.js';
+// ★ FIRST, before ANY query (this entrypoint DELETEs — the scariest local-against-prod shape):
+// refuse a LOCAL shell pointed at prod. Deployed jobs carry the universal SYNTHWATCH_DEPLOYED=1
+// marker (bicep, all 8 jobs — #197) and pass silently; a deliberate local run sets
+// SYNTHWATCH_ALLOW_PROD=1. log+exit, not throw — a throw would reach recordFatal → a prod INSERT.
+enforceProdGuard();
+
 runRetention()
   .then((r) => {
     console.log(
