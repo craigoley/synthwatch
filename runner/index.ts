@@ -65,6 +65,7 @@ import { isExpectationError } from './errors.js';
 import { runWithRetry, effectiveRetries } from './retry.js';
 import { DUE_PREDICATE_SQL } from './duePredicate.js';
 import { withDeadline } from './timeBudget.js';
+import { enforceProdGuard } from './prodGuard.js';
 import {
   INVOCATION_ID,
   installGlobalErrorHandlers,
@@ -140,6 +141,14 @@ async function getBrowser(): Promise<Browser> {
 }
 
 async function main(): Promise<void> {
+  // ★ FIRST, before ANY query (the pg Pool connects lazily, so nothing has touched the DB yet):
+  // refuse to run a LOCAL shell against the prod Postgres (the June 25–26 check-74 incident —
+  // ~/.synthwatch.env hands prod DATABASE_URL to anything that sources it). Deployed runners carry
+  // SYNTHWATCH_LOCATION (bicep) and pass silently; deliberate local-against-prod runs set
+  // SYNTHWATCH_ALLOW_PROD=1. Refusal is log+exit, NOT throw — a throw would route through
+  // recordFatal and INSERT into the prod DB, the exact write class being prevented (prodGuard.ts).
+  enforceProdGuard();
+
   // Tick wall-clock start — the budget denominator for the loop-end summary line below (the ACA
   // replicaTimeout is 240s; a tick nearing it is about to defer work to the next tick).
   const tickStartMs = Date.now();
