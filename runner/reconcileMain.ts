@@ -21,6 +21,13 @@ import {
 import { activeLocations } from './locations.js';
 import { probeSpecsFromPool, type SpecProbe } from './specfetch/specCache.js';
 
+import { enforceProdGuard } from './prodGuard.js';
+
+// ★ FIRST, before ANY query (module scope — runs before main() below is invoked): refuse a LOCAL
+// shell pointed at prod (the June 25–26 incident class). Deployed jobs carry
+// SYNTHWATCH_DEPLOYED=1 (bicep, all 8 — #197); deliberate local runs set SYNTHWATCH_ALLOW_PROD=1.
+enforceProdGuard();
+
 /** Read the Git-managed checks (source_key set). Unmanaged rows are intentionally excluded. */
 async function loadManagedChecks(): Promise<ManagedCheck[]> {
   const { rows } = await pool.query<ManagedCheck>(

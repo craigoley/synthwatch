@@ -6,6 +6,12 @@
 import { pool } from './db.js';
 import { runNarratives } from './narrative.js';
 
+import { enforceProdGuard } from './prodGuard.js';
+// ★ FIRST, before ANY query: refuse a LOCAL shell pointed at prod (the June 25–26 incident
+// class). Deployed jobs carry SYNTHWATCH_DEPLOYED=1 (bicep, all 8 — #197); deliberate local
+// runs set SYNTHWATCH_ALLOW_PROD=1. See prodGuard.ts.
+enforceProdGuard();
+
 runNarratives()
   .then((n) => {
     console.log(`[narrative] done: ${n} narrative(s) upserted`);
