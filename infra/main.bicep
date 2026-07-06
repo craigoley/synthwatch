@@ -203,6 +203,9 @@ param rcaMaxTokens string = '4000'
 @description('Verified ACS sender for alert emails (ALERT_EMAIL_FROM). NON-secret — a property of the ACS-owned domain, set once here; the ACS connection string stays out-of-band (secret).')
 param alertEmailFrom string = 'donotreply@0ad660ff-ac71-4b63-a5f6-ce885666c796.azurecomm.net'
 
+@description('Recipient address for the EXTERNAL fleet-liveness alerts (the Action Group below). An operator email — NOT a secret, but deliberately NOT committed (the repo keeps recipients out of git; the runner\'s own recipients are DB-managed). Supplied at deploy like postgresAdminPassword: scripts/deploy.sh sources it from ~/.synthwatch.env as ALERT_RECIPIENT_EMAIL. No default → a deploy without it fails fast rather than creating an Action Group that notifies nobody.')
+param alertRecipientEmail string
+
 // AcrPull built-in role.
 var acrPullRoleId = '7f951dda-4ed3-4680-a7ca-43fe172d538d'
 
@@ -1352,6 +1355,123 @@ resource retentionJob 'Microsoft.App/jobs@2024-03-01' = {
 }
 
 // ---------------------------------------------------------------------------
+// EXTERNAL fleet-liveness detection (the 2026-07-06 outage fix).
+//
+// SynthWatch's own alerting runs INSIDE the runner — so when the A4 prod-guard made every
+// runner job REFUSE TO START, the alerting was dead too and nothing noticed for ~23h. These
+// Azure Monitor scheduled-query rules run in Azure's CONTROL PLANE, query the Log Analytics
+// workspace, and survive the runner being completely dead — they detect the exact failure
+// mode the runner's self-alerting cannot. Created by the bicep apply (scripts/deploy.sh);
+// take effect on the next infra deploy.
+//
+// Column names + KQL were confirmed live against ContainerAppConsoleLogs_CL (2026-07-06):
+//   - Log_s              — the runner's stdout/stderr line
+//   - ContainerJobName_s — STABLE ACA job name (no replica suffix); the per-job identifier
+//   - location is embedded in the heartbeat line: "... (location=<region>)"
+// Both queries were proven to FIRE on the historical incident window (see the PR body).
+// ---------------------------------------------------------------------------
+
+// Action Group — where a fired rule sends notifications. Global resource (not regional).
+resource fleetAlertActionGroup 'microsoft.insights/actionGroups@2023-01-01' = {
+  name: 'synthwatch-fleet-alerts'
+  location: 'global'
+  properties: {
+    groupShortName: 'swfleet' // SMS/short-name field, ≤12 chars
+    enabled: true
+    emailReceivers: [
+      {
+        name: 'fleet-admin'
+        emailAddress: alertRecipientEmail
+        useCommonAlertSchema: true
+      }
+    ]
+  }
+}
+
+// Rule 1 — GUARD REFUSAL / fleet-down. Any "REFUSING TO START … SYNTHWATCH_DEPLOYED" line in
+// the last 15m fires this. This is the DIRECT signal of the 2026-07-06 incident. Count of
+// matching rows > 0 ⇒ fire. windowSize controls the time range (no ago() in the query).
+resource fleetGuardRefusalAlert 'microsoft.insights/scheduledQueryRules@2023-12-01' = {
+  name: 'synthwatch-fleet-guard-refusal'
+  location: location
+  kind: 'LogAlert'
+  properties: {
+    displayName: 'SynthWatch fleet — prod-guard REFUSING TO START'
+    description: 'A runner entrypoint refused to start because SYNTHWATCH_DEPLOYED != 1 (the A4 prod-guard). This is the exact 2026-07-06 fleet-down signal. External to the runner, so it fires even when the runner (and its own alerting) is dead.'
+    severity: 1
+    enabled: true
+    evaluationFrequency: 'PT5M'
+    windowSize: 'PT15M'
+    scopes: [
+      logAnalytics.id
+    ]
+    criteria: {
+      allOf: [
+        {
+          query: 'ContainerAppConsoleLogs_CL | where Log_s has "REFUSING TO START" and Log_s has "SYNTHWATCH_DEPLOYED"'
+          timeAggregation: 'Count'
+          operator: 'GreaterThan'
+          threshold: 0
+          failingPeriods: {
+            numberOfEvaluationPeriods: 1
+            minFailingPeriodsToAlert: 1
+          }
+        }
+      ]
+    }
+    autoMitigate: true
+    actions: {
+      actionGroups: [
+        fleetAlertActionGroup.id
+      ]
+    }
+  }
+}
+
+// Rule 2 — RUNS STALE / heartbeat absent, PER REGION. The healthy heartbeat is the runner's
+// "[runner] tick summary: … (location=<region>)" line, emitted every tick per region. This
+// left-joins the EXPECTED region set against the regions actually seen in the last 20m and
+// returns a row for each region with ZERO heartbeats — so a SINGLE dead region fires it (the
+// F-4 silent-dead-region class), not only an all-three-dead fleet. Count of dead-region rows
+// > 0 ⇒ fire. windowSize controls the time range (no ago() in the query).
+resource fleetHeartbeatAbsentAlert 'microsoft.insights/scheduledQueryRules@2023-12-01' = {
+  name: 'synthwatch-fleet-heartbeat-absent'
+  location: location
+  kind: 'LogAlert'
+  properties: {
+    displayName: 'SynthWatch fleet — region heartbeat absent (no tick summary)'
+    description: 'An expected runner region emitted no "tick summary" heartbeat in the last 20m — that region is stalled or dead. Fires per-region so one silent region is caught, not just a total outage. External to the runner.'
+    severity: 1
+    enabled: true
+    evaluationFrequency: 'PT5M'
+    windowSize: 'PT20M'
+    scopes: [
+      logAnalytics.id
+    ]
+    criteria: {
+      allOf: [
+        {
+          query: 'let expected = datatable(location:string)["eastus2","centralus","westus2"]; let seen = ContainerAppConsoleLogs_CL | where Log_s has "tick summary" | extend location = extract("location=([a-z0-9]+)", 1, Log_s) | summarize Heartbeats = count() by location; expected | join kind=leftouter seen on location | extend Heartbeats = coalesce(Heartbeats, toint(0)) | where Heartbeats == 0'
+          timeAggregation: 'Count'
+          operator: 'GreaterThan'
+          threshold: 0
+          failingPeriods: {
+            numberOfEvaluationPeriods: 1
+            minFailingPeriodsToAlert: 1
+          }
+        }
+      ]
+    }
+    autoMitigate: true
+    actions: {
+      actionGroups: [
+        fleetAlertActionGroup.id
+      ]
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Outputs
 // ---------------------------------------------------------------------------
 output postgresFqdn string = postgres.properties.fullyQualifiedDomainName
@@ -1362,3 +1482,6 @@ output rollupJobName string = rollupJob.name
 output narrativeJobName string = narrativeJob.name
 output reconcileJobName string = reconcileJob.name
 output retentionJobName string = retentionJob.name
+output fleetAlertActionGroupName string = fleetAlertActionGroup.name
+output fleetGuardRefusalAlertName string = fleetGuardRefusalAlert.name
+output fleetHeartbeatAbsentAlertName string = fleetHeartbeatAbsentAlert.name
