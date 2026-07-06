@@ -20,6 +20,13 @@ on:
     paths:
       - 'runner/**'
       - 'db/**'
+      # Docs-only changes under db/ must NOT roll production. On 2026-07-06, PR #200 changed
+      # only CLAUDE.md + db/migrations/README.md, but README.md matched 'db/**' → it rolled a
+      # new runner image to every job, creating the fresh revision that surfaced the A4-guard
+      # marker-absence outage. This negative glob (evaluated after 'db/**', so it wins for .md)
+      # excludes db/ markdown while KEEPING the triggers db/** is actually for: migration *.sql,
+      # db/Dockerfile.migrate, and db/migrate.sh (none of which match '**/Dockerfile' or *.md).
+      - '!db/**/*.md'
       - '**/Dockerfile'
       - '.github/workflows/deploy.yml'
   workflow_dispatch:
