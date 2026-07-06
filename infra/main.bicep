@@ -1430,21 +1430,26 @@ resource fleetGuardRefusalAlert 'microsoft.insights/scheduledQueryRules@2023-12-
 
 // Rule 2 — RUNS STALE / heartbeat absent, PER REGION. The healthy heartbeat is the runner's
 // "[runner] tick summary: … (location=<region>)" line, emitted every tick per region. This
-// left-joins the EXPECTED region set against the regions actually seen in the last 20m and
+// left-joins the EXPECTED region set against the regions actually seen in the last 15m and
 // returns a row for each region with ZERO heartbeats — so a SINGLE dead region fires it (the
 // F-4 silent-dead-region class), not only an all-three-dead fleet. Count of dead-region rows
 // > 0 ⇒ fire. windowSize controls the time range (no ago() in the query).
+// ★ windowSize MUST be one of Azure's supported granularities {5,10,15,30,45,60,120,180,240,
+// 300,360,720,1440,2880} minutes — PT20M is NOT supported and Azure rejects the WHOLE ARM
+// deploy (the 2026-07-06 detection deploy failed on exactly this). PT15M is supported and, at a
+// 5-min evaluationFrequency, still catches a dead region within ~15min. Keep both fields on
+// this list; see the guard-refusal rule above (PT15M / PT5M, both supported).
 resource fleetHeartbeatAbsentAlert 'microsoft.insights/scheduledQueryRules@2023-12-01' = {
   name: 'synthwatch-fleet-heartbeat-absent'
   location: location
   kind: 'LogAlert'
   properties: {
     displayName: 'SynthWatch fleet — region heartbeat absent (no tick summary)'
-    description: 'An expected runner region emitted no "tick summary" heartbeat in the last 20m — that region is stalled or dead. Fires per-region so one silent region is caught, not just a total outage. External to the runner.'
+    description: 'An expected runner region emitted no "tick summary" heartbeat in the last 15m — that region is stalled or dead. Fires per-region so one silent region is caught, not just a total outage. External to the runner.'
     severity: 1
     enabled: true
     evaluationFrequency: 'PT5M'
-    windowSize: 'PT20M'
+    windowSize: 'PT15M'
     scopes: [
       logAnalytics.id
     ]
