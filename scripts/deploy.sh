@@ -551,6 +551,21 @@ verify() {
     check "${ok}" "${j} AZURE_CLIENT_ID present (or job absent)"
   done
 
+  # ★ A4 prod-guard marker: SYNTHWATCH_DEPLOYED=='1' on EVERY guard-protected job. The
+  # 2026-07-06 outage: a full bicep-apply ran, verify() printed "all checks passed", yet every
+  # runner job was REFUSING TO START — the marker never landed on the RUNNING jobs and verify()
+  # checked every env var EXCEPT the one the prod-guard (runner/prodGuard.ts) actually gates on.
+  # A deploy must not report success while the guard would refuse. RUNNER_IMAGE_JOBS is exactly
+  # the set that runs a guarded entrypoint (index.ts + the aux *Main.ts: narrative/rollup/
+  # reconcile/retention); the migrate job runs the migrate image, has no guard, and is deliberately
+  # excluded. The marker now also ships baked into the runner image (runner Dockerfile) — this
+  # assertion is the deploy-time proof it is genuinely present on each running job.
+  for j in "${RUNNER_IMAGE_JOBS[@]}"; do
+    v="$(job_env_value "${j}" SYNTHWATCH_DEPLOYED)"
+    [[ "${v}" == "1" ]] && ok=1 || ok=0
+    check "${ok}" "${j} SYNTHWATCH_DEPLOYED='${v}' (expect 1 — A4 prod-guard; the job REFUSES TO START without it)"
+  done
+
   # ★ BUG 2: EVERY job must be on the intended image — not just the runner job. A correct
   # deploy puts the migrate job on migrate:SHA and every other job on runner:SHA. The old
   # verify only checked the runner job, so today's split (migrate stuck on the old SHA while
