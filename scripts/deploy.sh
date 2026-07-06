@@ -137,12 +137,16 @@ done
 # ---------------------------------------------------------------------------
 # 1. Source env + FAIL FAST if a @secure value is missing (the wipe risk).
 # ---------------------------------------------------------------------------
-[[ -f "${ENV_FILE}" ]] || fail "${ENV_FILE} not found — needs PG_PW, ACS_CONN, VERCEL_BYPASS_TOKEN, DATABASE_URL."
+[[ -f "${ENV_FILE}" ]] || fail "${ENV_FILE} not found — needs PG_PW, ACS_CONN, VERCEL_BYPASS_TOKEN, ALERT_RECIPIENT_EMAIL, DATABASE_URL."
 # shellcheck source=/dev/null
 source "${ENV_FILE}"
 : "${PG_PW:?PG_PW is unset — refusing to deploy (a missing @secure param WIPES the Postgres secret). Set it in ${ENV_FILE}.}"
 : "${ACS_CONN:?ACS_CONN is unset — refusing to deploy (a missing acsEmailConnectionString WIPES ACS email alerting). Set it in ${ENV_FILE}.}"
 : "${VERCEL_BYPASS_TOKEN:?VERCEL_BYPASS_TOKEN is unset — refusing to deploy (a missing vercelBypassToken WIPES the Vercel bypass secret → protected Wegmans checks would fail the deployment-protection gate). Set it in ${ENV_FILE}.}"
+# Not a secret, but REQUIRED (no bicep default): the external fleet-liveness Action Group needs a
+# recipient — a deploy without it would create alerts that notify nobody. Kept out of git like the
+# runner's DB-managed recipients; supplied here at deploy, same channel as the secrets above.
+: "${ALERT_RECIPIENT_EMAIL:?ALERT_RECIPIENT_EMAIL is unset — refusing to deploy (the fleet-liveness alerts need a recipient; a missing one creates an Action Group that notifies nobody). Set it in ${ENV_FILE}.}"
 
 command -v az >/dev/null || fail "az CLI not found"
 command -v jq >/dev/null || fail "jq not found"
@@ -408,6 +412,7 @@ run_whatif() {
         postgresAdminPassword="${PG_PW}" \
         acsEmailConnectionString="${ACS_CONN}" \
         vercelBypassToken="${VERCEL_BYPASS_TOKEN}" \
+        alertRecipientEmail="${ALERT_RECIPIENT_EMAIL}" \
         runnerImage="${RUNNER_IMG}" \
         migrateImage="${MIGRATE_IMG}" \
     > "${WHATIF_JSON}" 2>/dev/null \
@@ -470,6 +475,7 @@ do_deploy() {
         postgresAdminPassword="${PG_PW}" \
         acsEmailConnectionString="${ACS_CONN}" \
         vercelBypassToken="${VERCEL_BYPASS_TOKEN}" \
+        alertRecipientEmail="${ALERT_RECIPIENT_EMAIL}" \
         runnerImage="${RUNNER_IMG}" \
         migrateImage="${MIGRATE_IMG}" \
     -o none
