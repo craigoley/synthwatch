@@ -37,7 +37,7 @@ The task framed PR 2 as "mirror the aux-job bicep pattern" (mostly infra). Recon
 the easy part; the harness is the blocker.**
 
 ### OBSERVED — no fleet-sweep entrypoint; the harness is single-check + hand-crafted fault
-`runner/redTestMain.ts:2` — *"Not cron-wired; run on demand."* It takes ONE `check_id` (`argv[2]`) plus a
+`runner/redTestMain.ts:3` — *"Not cron-wired; run on demand."* It takes ONE `check_id` (`argv[2]`) plus a
 per-check `--fault=`:
 - `--fault=bad-url:<url>` (http) or `--fault=route-block:<pattern>` (browser) — `parseFault()`
   supports **only these two kinds**.
@@ -46,7 +46,8 @@ per-check `--fault=`:
 
 ### OBSERVED — harness coverage by monitor kind
 - **http** — `runHttpRedTest(check, {bad-url})` re-runs the check against a swapped `target_url`
-  (`redTest.ts:82`). A bad url is **synthesizable** (e.g. an unresolvable host) → the up-assertion fires
+  (`redTest.ts:87`, the `target_url: fault.url` swap; `runHttpRedTest` signature at `:82`). A bad url is
+  **synthesizable** (e.g. an unresolvable host) → the up-assertion fires
   → red. Ephemeral: writes NOTHING but the `red_tests` row (no `runs`, no incident, no page). ✅ auto-testable.
 - **browser** — `runBrowserRedTest(check, {route-block})` aborts THE ANCHOR request the red-condition
   names (`redTest.ts:98`). The anchor is **monitor-specific** — which request the key assertion depends
@@ -63,7 +64,9 @@ ssl     |  4   ← no red-test path
 dns     |  4   ← no red-test path
 ```
 → A naive fleet sweep over the existing harness meaningfully covers **8 of 33** enabled monitors (24%)
-and would `inconclusive`/error on the other 25. **INFERRED:** shipping that as "the fleet red-test
+and would `inconclusive`/error on the other 25 (composition is a **point-in-time fleet read as of
+2026-07-07** — the ratio shifts as monitors are added, but the *kind-coverage* gap is structural).
+**INFERRED:** shipping that as "the fleet red-test
 sweep" reads as full-fleet coverage while silently skipping the majority — a false-confidence outcome
 that undercuts the whole point of a red-test (proving alerts CAN fire). Hence: defer.
 
