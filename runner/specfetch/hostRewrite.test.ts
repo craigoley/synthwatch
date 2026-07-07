@@ -10,6 +10,7 @@ import {
   compileHostRewrite,
   rewriteRequestUrl,
   resolveRewrite,
+  hostRewriteFor,
 } from './hostRewrite.js';
 
 const PROD = 'https://app.example.com';
@@ -90,4 +91,25 @@ test('(3d) rewriteRequestUrl on a matching origin preserves protocol (https stay
   const { from, to } = pair();
   const out = rewriteRequestUrl('https://app.example.com/x', from, to);
   assert.ok(out!.startsWith('https://'), 'protocol must be preserved');
+});
+
+// ── (4) hostRewriteFor — the S3 check→pair glue ──────────────────────────────────────────────────────
+test('(4a) hostRewriteFor: no FROM origin (prod check) → undefined (S2 inert)', () => {
+  assert.equal(hostRewriteFor(null, 'https://preview.commerce.wegmans.com/checkout'), undefined);
+  assert.equal(hostRewriteFor(undefined, 'https://preview.commerce.wegmans.com'), undefined);
+  assert.equal(hostRewriteFor('', 'https://preview.commerce.wegmans.com'), undefined);
+});
+
+test('(4b) hostRewriteFor: FROM origin + a target_url → {from, to=origin(target)} (path on target stripped)', () => {
+  const rw = hostRewriteFor('https://www.wegmans.com', 'https://preview.commerce.wegmans.com/checkout?step=1');
+  assert.deepEqual(rw, { fromOrigin: 'https://www.wegmans.com', toOrigin: 'https://preview.commerce.wegmans.com' });
+  // and it compiles + rewrites end-to-end
+  const compiled = compileHostRewrite(rw!);
+  assert.equal(resolveRewrite('https://www.wegmans.com/cart', compiled), 'https://preview.commerce.wegmans.com/cart');
+});
+
+test('(4c) hostRewriteFor: a malformed target_url is passed RAW → compileHostRewrite fail-louds (no silent no-rewrite against prod)', () => {
+  const rw = hostRewriteFor('https://www.wegmans.com', 'not a url');
+  assert.equal(rw!.toOrigin, 'not a url'); // raw, not swallowed
+  assert.throws(() => compileHostRewrite(rw!), /malformed origin/);
 });
