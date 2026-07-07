@@ -154,6 +154,15 @@ CREATE TABLE checks (
                               OR (spec_path ~ '^monitors/.+\.spec\.ts$'
                                   AND position('..' in spec_path) = 0)),
 
+    -- Environment dimension (mirrors 0059_checks_environment.sql, pre-prod-regression arc S1a).
+    -- DEFAULT 'prod' → every existing/native check is in the prod fleet; only a deliberate non-prod
+    -- value takes a check OUT of the prod rollups. The default-EXCLUDE lives in the readers
+    -- (coalesce(environment,'prod')='prod' in synthwatch-api's slo/mttr/trust). CHECK pins the
+    -- vocabulary so a typo can't silently drop a check from the prod fleet.
+    environment        TEXT        NOT NULL DEFAULT 'prod'
+                       CONSTRAINT checks_environment_vocab
+                       CHECK (environment IN ('prod', 'staging', 'dev')),
+
     -- A browser check is meaningless without a flow to run.
     CONSTRAINT browser_needs_flow
         CHECK (kind <> 'browser' OR flow_name IS NOT NULL)
