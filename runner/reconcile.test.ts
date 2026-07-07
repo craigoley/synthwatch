@@ -642,6 +642,13 @@ test('S3: validateManifest REJECTS rewrite_from_origin with no target to rewrite
   assert.throws(() => validateManifest(noTarget), /rewrite_from_origin set but no target/);
 });
 
+test('S3: validateManifest REJECTS a malformed rewrite_from_origin at parse time (bare host / path)', () => {
+  const bareHost = { ...VALID, monitors: [{ ...VALID.monitors[0], target: 'https://preview.commerce.wegmans.com', rewrite_from_origin: 'www.wegmans.com' }] };
+  assert.throws(() => validateManifest(bareHost), /rewrite_from_origin.*malformed origin/);
+  const withPath = { ...VALID, monitors: [{ ...VALID.monitors[0], target: 'https://preview.commerce.wegmans.com', rewrite_from_origin: 'https://www.wegmans.com/search' }] };
+  assert.throws(() => validateManifest(withPath), /rewrite_from_origin.*carries a path/);
+});
+
 test('S3: buildApplyUpsert seeds environment + rewrite_from_origin (defaults prod/null when omitted)', () => {
   const staged = buildApplyUpsert(monitor({ environment: 'staging', target: 'https://preview.commerce.wegmans.com', rewrite_from_origin: 'https://www.wegmans.com' }));
   // environment at index 7, rewrite_from_origin at index 8 (after the redaction pair)

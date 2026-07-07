@@ -18,6 +18,7 @@
 //
 // IDENTITY: manifest `id` -> checks.source_key (NOT flow_name — they deliberately differ).
 import { assertValidSpecPath, fetchContentsAtMain } from './specfetch/fetchSpec.js';
+import { parseOrigin } from './specfetch/hostRewrite.js';
 
 /** A monitor entry from synthwatch-monitors' manifest.json (kind is browser-only today). */
 export interface Monitor {
@@ -225,6 +226,14 @@ export function validateManifest(raw: unknown): Manifest {
     if (e.rewrite_from_origin !== undefined) {
       if (typeof e.rewrite_from_origin !== 'string' || e.rewrite_from_origin.length === 0) {
         throw new Error(`${where}.rewrite_from_origin invalid (non-empty string)`);
+      }
+      // Validate it's a bare http(s) ORIGIN at parse time (the SAME check compileHostRewrite fail-louds on
+      // at run time) — surface a malformed manifest at reconcile/CI rather than materializing a check that
+      // can only fail per-run.
+      try {
+        parseOrigin(e.rewrite_from_origin);
+      } catch (err) {
+        throw new Error(`${where}.rewrite_from_origin ${err instanceof Error ? err.message : String(err)}`, { cause: err });
       }
       if (e.target === undefined) {
         throw new Error(`${where}.rewrite_from_origin set but no target to rewrite TO — declare target (the pre-prod origin).`);
