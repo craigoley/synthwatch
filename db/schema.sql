@@ -163,6 +163,11 @@ CREATE TABLE checks (
                        CONSTRAINT checks_environment_vocab
                        CHECK (environment IN ('prod', 'staging', 'dev')),
 
+    -- S2 host-rewrite FROM origin (mirrors 0060_checks_rewrite_from_origin.sql, pre-prod-arc S3). When set,
+    -- the runner rewrites requests whose origin == this to the check's OWN target_url origin (the preview
+    -- env), so a pre-prod check reuses a prod spec WITHOUT editing it. NULL = no rewrite (S2 inert).
+    rewrite_from_origin TEXT,
+
     -- A browser check is meaningless without a flow to run.
     CONSTRAINT browser_needs_flow
         CHECK (kind <> 'browser' OR flow_name IS NOT NULL)

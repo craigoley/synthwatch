@@ -34,7 +34,7 @@ import { loadFlow, type Flow } from './checks/index.js';
 import { getCompiledSpecFromPool, sha256 } from './specfetch/specCache.js';
 import { loadCompiledSpec } from './specfetch/compileSpec.js';
 import { specToFlow } from './specfetch/specShim.js';
-import { compileHostRewrite, resolveRewrite, type HostRewrite } from './specfetch/hostRewrite.js';
+import { compileHostRewrite, resolveRewrite, hostRewriteFor, type HostRewrite } from './specfetch/hostRewrite.js';
 import { syncFlowManifest } from './flowManifest.js';
 import { drainTestSends } from './testSend.js';
 import {
@@ -515,7 +515,13 @@ async function runOneInner(
         if (check.kind === 'dns' || check.kind === 'tcp' || check.kind === 'ping')
           return await executeNet(check);
         if (check.kind === 'multistep') return await executeMultistep(check, runId);
-        return await executeBrowser(check, runId, captureSuccessTrace);
+        return await executeBrowser(
+          check,
+          runId,
+          captureSuccessTrace,
+          // S2/S3: re-point a pre-prod check's reused prod spec to its own target_url (undefined = no rewrite).
+          hostRewriteFor(check.rewrite_from_origin, check.target_url),
+        );
       } catch (err) {
         // Unexpected runner error (e.g. flow loader threw) -> 'error', not 'fail'.
         return errorOutcome(err instanceof Error ? err.message : String(err));

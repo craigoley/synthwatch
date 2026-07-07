@@ -30,8 +30,14 @@ enforceProdGuard();
 
 /** Read the Git-managed checks (source_key set). Unmanaged rows are intentionally excluded. */
 async function loadManagedChecks(): Promise<ManagedCheck[]> {
+  // ★ This EXPLICIT column list is the runtime projection of ManagedCheck — pool.query<ManagedCheck>
+  // is a CAST, not a checked projection, so a column present on the interface but MISSING here reads as
+  // undefined at runtime with a green tsc (it bit environment/rewrite_from_origin once: computeDrift saw
+  // existing.environment=undefined and flagged a phantom 'changed' on every check). KEEP THIS SELECT IN
+  // SYNC WITH the ManagedCheck interface in reconcile.ts.
   const { rows } = await pool.query<ManagedCheck>(
-    `SELECT source_key, name, kind, target_url, flow_name, sensitive, redact_patterns
+    `SELECT source_key, name, kind, target_url, flow_name, sensitive, redact_patterns,
+            environment, rewrite_from_origin
        FROM checks
       WHERE source_key IS NOT NULL`,
   );

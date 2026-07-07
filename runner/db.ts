@@ -146,6 +146,12 @@ export interface Check {
   // null => a legacy/dashboard check that runs the baked-in flow_name. claim() does SELECT *,
   // so it rides along; typed here so executeBrowser can branch on it.
   spec_path: string | null;
+  // Environment dimension (0059). 'prod' (default) | 'staging' | 'dev'. The runner does not gate on it
+  // (the pre-prod EXCLUDE is API-side); read here so reconcile can detect drift + it rides SELECT *.
+  environment: string;
+  // S2 host-rewrite FROM origin (0060). When non-null, executeBrowser re-points requests from this
+  // origin to the check's target_url origin (the preview env). null => no rewrite (S2 inert).
+  rewrite_from_origin: string | null;
 }
 
 /** A row from the `runs` table after we've finished executing a check. */

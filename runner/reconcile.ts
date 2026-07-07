@@ -18,6 +18,7 @@
 //
 // IDENTITY: manifest `id` -> checks.source_key (NOT flow_name — they deliberately differ).
 import { assertValidSpecPath, fetchContentsAtMain } from './specfetch/fetchSpec.js';
+import { parseOrigin } from './specfetch/hostRewrite.js';
 
 /** A monitor entry from synthwatch-monitors' manifest.json (kind is browser-only today). */
 export interface Monitor {
@@ -34,6 +35,12 @@ export interface Monitor {
   // redact_patterns when sensitive is true (the enable gate); reconcile writes both to checks (Git-auth).
   sensitive?: boolean;
   redact_patterns?: string[];
+  // Pre-prod-arc S3: the environment this monitor targets (0059; default 'prod' in the DB) and the S2
+  // host-rewrite FROM origin (0060). Both Git-authoritative — the manifest owns them. A pre-prod monitor
+  // sets environment:'staging' (excluded from the prod slo/mttr/trust) + rewrite_from_origin to re-point a
+  // reused prod spec at its own `target` (the preview env). Omitted => prod check, no rewrite.
+  environment?: 'prod' | 'staging' | 'dev';
+  rewrite_from_origin?: string;
 }
 
 export interface Manifest {
@@ -53,6 +60,9 @@ export interface ManagedCheck {
   // diverge from the manifest (the leak: manifest says sensitive but the live row defaulted to false).
   sensitive: boolean;
   redact_patterns: string[] | null;
+  // Pre-prod-arc S3 (0059/0060): read so drift on the environment label / rewrite origin is detectable.
+  environment: string;
+  rewrite_from_origin: string | null;
 }
 
 // 'redaction_mismatch' (0049): a sensitive/redact_patterns divergence — kept SEPARATE from generic
@@ -206,6 +216,29 @@ export function validateManifest(raw: unknown): Manifest {
         `${where} is marked sensitive but declares no redact_patterns — B10 requires a sensitive monitor to declare redaction before it can be enabled.`,
       );
     }
+    // Pre-prod-arc S3 (0059/0060). environment is CHECK-constrained in the DB to prod/staging/dev; reject a
+    // bad value here so it never reaches the DB. rewrite_from_origin is a free origin string (validated at
+    // runtime by compileHostRewrite). ★ A rewrite is meaningless without a `target` to rewrite TO — reject a
+    // rewrite_from_origin with no target rather than silently no-op at run time.
+    if (e.environment !== undefined && !['prod', 'staging', 'dev'].includes(e.environment as string)) {
+      throw new Error(`${where}.environment invalid (one of prod|staging|dev)`);
+    }
+    if (e.rewrite_from_origin !== undefined) {
+      if (typeof e.rewrite_from_origin !== 'string' || e.rewrite_from_origin.length === 0) {
+        throw new Error(`${where}.rewrite_from_origin invalid (non-empty string)`);
+      }
+      // Validate it's a bare http(s) ORIGIN at parse time (the SAME check compileHostRewrite fail-louds on
+      // at run time) — surface a malformed manifest at reconcile/CI rather than materializing a check that
+      // can only fail per-run.
+      try {
+        parseOrigin(e.rewrite_from_origin);
+      } catch (err) {
+        throw new Error(`${where}.rewrite_from_origin ${err instanceof Error ? err.message : String(err)}`, { cause: err });
+      }
+      if (e.target === undefined) {
+        throw new Error(`${where}.rewrite_from_origin set but no target to rewrite TO — declare target (the pre-prod origin).`);
+      }
+    }
 
     return {
       id: e.id,
@@ -219,6 +252,8 @@ export function validateManifest(raw: unknown): Manifest {
       enabledByDefault: e.enabledByDefault as boolean | undefined,
       sensitive: e.sensitive as boolean | undefined,
       redact_patterns: e.redact_patterns as string[] | undefined,
+      environment: e.environment as 'prod' | 'staging' | 'dev' | undefined,
+      rewrite_from_origin: e.rewrite_from_origin as string | undefined,
     };
   });
 
@@ -307,6 +342,14 @@ export function computeDrift(
       diff.target_url = { git: m.target, live: existing.target_url };
     }
     if (existing.flow_name !== flow) diff.flow_name = { git: flow, live: existing.flow_name };
+    // Pre-prod-arc S3 (0059/0060): the manifest owns environment + rewrite_from_origin. Manifest omits
+    // environment => 'prod' (the DB default); omits rewrite_from_origin => null (no rewrite).
+    const gitEnv = m.environment ?? 'prod';
+    if (existing.environment !== gitEnv) diff.environment = { git: gitEnv, live: existing.environment };
+    const gitRewrite = m.rewrite_from_origin ?? null;
+    if ((existing.rewrite_from_origin ?? null) !== gitRewrite) {
+      diff.rewrite_from_origin = { git: gitRewrite, live: existing.rewrite_from_origin ?? null };
+    }
     if (Object.keys(diff).length > 0) {
       rows.push({ source_key: m.id, drift_type: 'changed', detail: { fields: diff } });
     }
@@ -355,6 +398,11 @@ export const GIT_AUTHORITATIVE_COLUMNS = [
   'flow_name',
   'sensitive',
   'redact_patterns',
+  // Pre-prod-arc S3 (0059/0060). Appended AFTER the redaction pair so sensitive/redact_patterns keep their
+  // positions (REDACTION_COLUMNS logic). Non-redaction, so they auto-join CHANGED_UPDATE_COLUMNS (a manifest
+  // change re-syncs them). computeApplyPlan finds `enabled` by indexOf, so appending here is index-safe.
+  'environment',
+  'rewrite_from_origin',
 ] as const;
 /** Git-seeds-then-dashboard-owns: written on INSERT only, never in the UPDATE SET. */
 export const SEED_ONLY_COLUMNS = ['interval_seconds', 'enabled'] as const;
@@ -394,8 +442,8 @@ export function buildApplyUpsert(monitor: Monitor): {
   // baked-in dist/checks/<name>.js, which a manifest monitor never has — so a materialize that omits
   // spec_path produces a check that can ONLY fail ("Cannot find module .../<flow_name>.js"). The
   // manifest `script` IS the spec path (validated at parse time; re-asserted here, same guard as
-  // specPathForSourceKey). spec_path is appended LAST so `enabled` keeps index 8 (computeApplyPlan
-  // forces it false by that index).
+  // specPathForSourceKey). enabled + spec_path stay at the END (after seed-only) — computeApplyPlan
+  // locates `enabled` by indexOf (not a hardcoded index), so appending git-auth columns above is safe.
   assertValidSpecPath(monitor.script);
   const specPath = monitor.script;
   // INSERT column order: identity, Git-authoritative, seed-only, then spec_path.
@@ -408,9 +456,11 @@ export function buildApplyUpsert(monitor: Monitor): {
     flow,
     monitor.sensitive ?? false, // sensitive
     JSON.stringify(monitor.redact_patterns ?? null), // redact_patterns (jsonb; assignment-cast from text)
+    monitor.environment ?? 'prod', // environment (0059) — DB has a NOT NULL DEFAULT 'prod'; explicit here too
+    monitor.rewrite_from_origin ?? null, // rewrite_from_origin (0060) — null = no S2 rewrite
     monitor.suggestedIntervalSeconds ?? DEFAULT_INTERVAL_SECONDS,
     monitor.enabledByDefault ?? false,
-    specPath, // spec_path (index 9) — re-synced on conflict so an existing NULL row self-heals on re-apply.
+    specPath, // spec_path (last) — re-synced on conflict so an existing NULL row self-heals on re-apply.
   ];
   const placeholders = insertColumns.map((_, i) => `$${i + 1}`).join(', ');
   // ON CONFLICT updates the Git-authoritative columns + spec_path (seed-only + dashboard-owned excluded).
@@ -450,6 +500,10 @@ export function buildChangedUpdate(
     kind: monitor.kind,
     target_url: monitor.target ?? null,
     flow_name: flowNameFor(monitor),
+    // Pre-prod-arc S3 git-auth columns (non-redaction → on the changed allow-list): the manifest is the
+    // source of truth, same as buildApplyUpsert's INSERT values.
+    environment: monitor.environment ?? 'prod',
+    rewrite_from_origin: monitor.rewrite_from_origin ?? null,
   };
   // SET only the columns that ACTUALLY drifted AND are on the changed allow-list (never sensitive/redact_patterns).
   const cols = CHANGED_UPDATE_COLUMNS.filter((c) => driftedFields.includes(c));

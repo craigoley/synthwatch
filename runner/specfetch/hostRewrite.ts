@@ -106,3 +106,20 @@ export function rewriteRequestUrl(requestUrl: string, from: URL, to: URL): strin
 export function resolveRewrite(requestUrl: string, rw: CompiledRewrite | null): string | null {
   return rw ? rewriteRequestUrl(requestUrl, rw.from, rw.to) : null;
 }
+
+/**
+ * S3 wiring glue (pure): build the rewrite pair for a check from its stored FROM origin
+ * (checks.rewrite_from_origin) + its target_url (the pre-prod env). FROM null/empty → undefined (no
+ * rewrite; S2 inert). TO = the origin of targetUrl; a malformed targetUrl is passed through RAW so the
+ * downstream compileHostRewrite fail-louds (a bad rewrite must refuse the run, not silently hit prod).
+ */
+export function hostRewriteFor(fromOrigin: string | null | undefined, targetUrl: string): HostRewrite | undefined {
+  if (!fromOrigin) return undefined;
+  let toOrigin = targetUrl;
+  try {
+    toOrigin = new URL(targetUrl).origin;
+  } catch {
+    /* leave raw → compileHostRewrite throws (fail-loud) rather than a silent no-rewrite against prod */
+  }
+  return { fromOrigin, toOrigin };
+}

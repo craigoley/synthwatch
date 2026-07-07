@@ -115,6 +115,8 @@ const managed = (over: Partial<ManagedCheck> = {}): ManagedCheck => ({
   flow_name: 'search-product',
   sensitive: false,
   redact_patterns: null,
+  environment: 'prod',
+  rewrite_from_origin: null,
   ...over,
 });
 
@@ -238,7 +240,8 @@ test('apply upsert NEVER writes dashboard-owned columns', () => {
 test('apply upsert conflict-targets source_key and seeds the right values', () => {
   const { text, values } = buildApplyUpsert(monitor({ suggestedIntervalSeconds: undefined }));
   assert.match(text, /ON CONFLICT \(source_key\) WHERE source_key IS NOT NULL DO UPDATE/);
-  // values order = [source_key, name, kind, target_url, flow_name, sensitive, redact_patterns, interval, enabled, spec_path]
+  // values order = [source_key, name, kind, target_url, flow_name, sensitive, redact_patterns,
+  //                 environment, rewrite_from_origin, interval, enabled, spec_path]
   assert.deepEqual(values, [
     'wegmans-search-product',
     'Wegmans: search → product page',
@@ -247,6 +250,8 @@ test('apply upsert conflict-targets source_key and seeds the right values', () =
     'search-product',
     false, // sensitive default
     'null', // redact_patterns: JSON.stringify(null) — none declared
+    'prod', // environment (0059) — omitted -> 'prod'
+    null, // rewrite_from_origin (0060) — omitted -> null (no S2 rewrite)
     300, // omitted suggestedIntervalSeconds -> column default 300
     false, // enabledByDefault false
     'monitors/wegmans/search-product.spec.ts', // spec_path = the manifest script
@@ -507,11 +512,12 @@ test('★ apply-plan: a NEW drift → materialize-DISABLED (enabled=false), sens
   const matStmt = p.plan.statements.find((s) => s.purpose.includes('materialize'))!;
   assert.match(matStmt.text, /INSERT INTO checks/);
   assert.match(matStmt.text, /sensitive/);
-  // insert column order: source_key,name,kind,target_url,flow_name,sensitive,redact_patterns,interval,enabled,spec_path
+  // insert column order: source_key,name,kind,target_url,flow_name,sensitive,redact_patterns,
+  //                      environment,rewrite_from_origin,interval,enabled,spec_path
   assert.equal(matStmt.values![5], true, 'sensitive=true inline in the INSERT values');
-  assert.equal(matStmt.values![8], false, '★ enabled FORCED false (materialize-disabled)');
-  // ★ spec_path (index 9) is materialized — without it the runner can only fail with "Cannot find module".
-  assert.equal(matStmt.values![9], 'monitors/wegmans/search-product.spec.ts', 'spec_path inline in the INSERT values');
+  assert.equal(matStmt.values![10], false, '★ enabled FORCED false (materialize-disabled)');
+  // ★ spec_path (last) is materialized — without it the runner can only fail with "Cannot find module".
+  assert.equal(matStmt.values![11], 'monitors/wegmans/search-product.spec.ts', 'spec_path inline in the INSERT values');
   // and the location-assignment statement carries the active regions.
   const locStmt = p.plan.statements.find((s) => s.purpose.includes('locations'))!;
   assert.deepEqual(locStmt.regions, REGIONS);
@@ -579,7 +585,7 @@ test('apply-plan: a CHANGED target_url drift (non-sensitive monitor) → SET upd
 });
 
 test('CHANGED_UPDATE_COLUMNS is exactly GIT_AUTHORITATIVE_COLUMNS minus the redaction pair (single source of truth)', () => {
-  assert.deepEqual([...CHANGED_UPDATE_COLUMNS], ['name', 'kind', 'target_url', 'flow_name']);
+  assert.deepEqual([...CHANGED_UPDATE_COLUMNS], ['name', 'kind', 'target_url', 'flow_name', 'environment', 'rewrite_from_origin']);
   for (const c of REDACTION_COLUMNS) assert.equal(CHANGED_UPDATE_COLUMNS.includes(c), false);
   // every changed-updatable column IS git-authoritative (never a seed-only / dashboard-owned column)
   for (const c of CHANGED_UPDATE_COLUMNS) assert.equal((GIT_AUTHORITATIVE_COLUMNS as readonly string[]).includes(c), true);
@@ -613,4 +619,54 @@ test('apply-plan: an ORPHAN drift → noop (no apply, spec not runnable)', () =>
   const plan = computeApplyPlan([], [{ source_key: 'x', drift_type: 'orphan', detail: { reason: 'not fetchable: 404' } }], REGIONS)[0];
   assert.equal(plan.status, 'noop');
   assert.equal(plan.plan.statements.length, 0);
+});
+
+// --- Pre-prod-arc S3: environment + rewrite_from_origin (0059/0060) --------------------------------
+test('S3: validateManifest carries environment + rewrite_from_origin through', () => {
+  const src = {
+    ...VALID,
+    monitors: [{ ...VALID.monitors[0], environment: 'staging', target: 'https://preview.commerce.wegmans.com', rewrite_from_origin: 'https://www.wegmans.com' }],
+  };
+  const m = validateManifest(src).monitors[0];
+  assert.equal(m.environment, 'staging');
+  assert.equal(m.rewrite_from_origin, 'https://www.wegmans.com');
+});
+
+test('S3: validateManifest REJECTS a bad environment value', () => {
+  const bad = { ...VALID, monitors: [{ ...VALID.monitors[0], environment: 'production' }] };
+  assert.throws(() => validateManifest(bad), /environment invalid/);
+});
+
+test('S3: validateManifest REJECTS rewrite_from_origin with no target to rewrite TO', () => {
+  const noTarget = { ...VALID, monitors: [{ ...VALID.monitors[0], target: undefined, rewrite_from_origin: 'https://www.wegmans.com' }] };
+  assert.throws(() => validateManifest(noTarget), /rewrite_from_origin set but no target/);
+});
+
+test('S3: validateManifest REJECTS a malformed rewrite_from_origin at parse time (bare host / path)', () => {
+  const bareHost = { ...VALID, monitors: [{ ...VALID.monitors[0], target: 'https://preview.commerce.wegmans.com', rewrite_from_origin: 'www.wegmans.com' }] };
+  assert.throws(() => validateManifest(bareHost), /rewrite_from_origin.*malformed origin/);
+  const withPath = { ...VALID, monitors: [{ ...VALID.monitors[0], target: 'https://preview.commerce.wegmans.com', rewrite_from_origin: 'https://www.wegmans.com/search' }] };
+  assert.throws(() => validateManifest(withPath), /rewrite_from_origin.*carries a path/);
+});
+
+test('S3: buildApplyUpsert seeds environment + rewrite_from_origin (defaults prod/null when omitted)', () => {
+  const staged = buildApplyUpsert(monitor({ environment: 'staging', target: 'https://preview.commerce.wegmans.com', rewrite_from_origin: 'https://www.wegmans.com' }));
+  // environment at index 7, rewrite_from_origin at index 8 (after the redaction pair)
+  assert.equal(staged.values[7], 'staging');
+  assert.equal(staged.values[8], 'https://www.wegmans.com');
+  const prod = buildApplyUpsert(monitor({}));
+  assert.equal(prod.values[7], 'prod');
+  assert.equal(prod.values[8], null);
+});
+
+test('S3: computeDrift flags a CHANGED on environment / rewrite_from_origin (manifest is source of truth)', () => {
+  const m = monitor({ environment: 'staging', target: 'https://preview.commerce.wegmans.com', rewrite_from_origin: 'https://www.wegmans.com' });
+  // live row is still prod / no-rewrite (e.g. materialized before S3)
+  const live = managed({ target_url: 'https://preview.commerce.wegmans.com', environment: 'prod', rewrite_from_origin: null });
+  const rows = computeDrift([m], [live], runnable(SPEC));
+  const changed = rows.find((r) => r.drift_type === 'changed');
+  assert.ok(changed, 'expected a changed row');
+  const fields = (changed!.detail as { fields: Record<string, unknown> }).fields;
+  assert.deepEqual(fields.environment, { git: 'staging', live: 'prod' });
+  assert.deepEqual(fields.rewrite_from_origin, { git: 'https://www.wegmans.com', live: null });
 });
