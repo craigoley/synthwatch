@@ -2,21 +2,24 @@
 // Render-check / styling playground for the alert email template (alertEmail.ts).
 //
 //   npm run build && node scripts/preview-email.mjs
-//   open /tmp/synthwatch-email-samples/open-with-rca.html   (macOS)
+//   open "$(...)/open-with-rca.html"   (macOS) — the script PRINTS the output dir on exit
 //
-// Writes the four sample alert emails (open with/without RCA, resolved, warning) to
-// /tmp/synthwatch-email-samples/*.{html,txt} so you can eyeball them in a browser while
-// tweaking the palette/copy in alertEmail.ts. Pure render — sends nothing.
-import { writeFileSync, mkdirSync } from 'node:fs';
+// Writes the four sample alert emails (open with/without RCA, resolved, warning) into a private,
+// per-run temp directory (printed on exit) so you can eyeball them in a browser while tweaking the
+// palette/copy in alertEmail.ts. Pure render — sends nothing.
+import { writeFileSync, mkdtempSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { tmpdir } from 'node:os';
 
 process.env.DASHBOARD_URL ??= 'https://synthwatch.example.com';
 const here = dirname(fileURLToPath(import.meta.url));
 const { buildAlertEmail } = await import(join(here, '../dist/alertEmail.js'));
 
-const OUT = '/tmp/synthwatch-email-samples';
-mkdirSync(OUT, { recursive: true });
+// Create a PRIVATE, randomized temp dir (mkdtemp → mode 0700, unique suffix) rather than a
+// predictable /tmp/synthwatch-email-samples path. A fixed name in the world-writable temp dir is the
+// symlink/clobber race CodeQL js/insecure-temporary-file flags (alerts #4, #5); mkdtemp closes it.
+const OUT = mkdtempSync(join(tmpdir(), 'synthwatch-email-samples-'));
 
 const incident = (over) => ({
   incidentId: 25,
