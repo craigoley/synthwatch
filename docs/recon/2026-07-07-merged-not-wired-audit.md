@@ -17,7 +17,7 @@ is always `NULL` (S2 host-rewrite stays inert even after #216 wired the *read* p
 |---|-----------|---------|
 | 2 | `checks.environment` — read (api exclude), **never written** | **LIVE-RISK** |
 | 2 | `checks.rewrite_from_origin` — read (runner #216), **never written** | **LIVE-RISK** |
-| 3 | manifest can't declare `environment`/`rewrite_from_origin` (monitors ajv `additionalProperties:false`) | **LIVE-RISK** (same arc) |
+| 3 | ~~manifest can't declare `environment`/`rewrite_from_origin`~~ **CORRECTED: monitors #54 added them** | RESOLVED (see §3) |
 | 1 | reconcile field-split APPLY engine (`buildApplyUpsert`/`buildChangedUpdate`) built+tested, **gated off** | LIVE-RISK-by-design (documented) |
 | 1 | ~70 other "orphan" exports | BENIGN (internal helpers / test-surface) |
 | 4 | env read-not-in-bicep | BENIGN (optionals w/ defaults; the marker-class was fixed #201/#202) |
@@ -78,14 +78,18 @@ open.)*
 
 ## §3 — manifest/spec fields declarable vs mapped
 
-`environment` + `rewrite_from_origin` are now **mapped** in the runner reconcile (`Monitor` interface +
-`validateManifest`, #216) — but **NOT declarable** via the published manifest: synthwatch-monitors
-`manifest.schema.json` has `"additionalProperties": false` (`:14`) and no `environment`/`rewrite_from_origin`
-property, so the monitors-repo ajv gate (#44) would **reject** a manifest that includes them. Net: the
-runner would accept the fields, but they can't be committed to the manifest that feeds it. (The inverse
-gap from the header recon still holds too: `request_headers`/`auth` are DB columns with **no** manifest
-field — dashboard/seed-only.) **One-line gap:** add both properties to `manifest.schema.json`. **BENIGN
-in isolation, but part of the §2 LIVE-RISK arc** — it's the declare side of the same dead pipe.
+**★ CORRECTION (this doc's own first grep read a STALE monitors checkout — the plan-reconciliation
+caught it).** `environment` + `rewrite_from_origin` **ARE now declarable**: synthwatch-monitors **#54**
+(merged 2026-07-07T20:25Z) added both properties to `manifest.schema.json` (with the
+rewrite-requires-`target` ajv guard) **and** shipped the first pre-prod monitor
+(`wegmans-search-product-preview`, DISABLED). So the ajv gate (#44) accepts them, and the runner
+reconcile already maps them (#216). **The declare side is DONE.**
+
+This does **not** rescue the arc — it **sharpens §2**: the manifest can now declare a `staging` +
+re-pointed monitor, but the reconcile **apply is gated**, so that declaration is detected as `new`
+drift and **never materialized into a `checks` row**. Declare-wired + read-wired + still-never-written.
+(The header-recon inverse gap does persist separately: `request_headers`/`auth` are DB columns with no
+manifest field — dashboard/seed-only.) **The one live gap is §2's write path, not this.**
 
 ---
 
