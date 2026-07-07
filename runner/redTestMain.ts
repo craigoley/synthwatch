@@ -1,5 +1,6 @@
-// Entry point for the red-test harness sub-command (mirrors rollupMain / reconcileMain). PR 1: PRINTS the
-// result (no persistence — PR 2 adds the red_tests table + INSERT + API read). Not cron-wired; run on demand.
+// Entry point for the red-test harness sub-command (mirrors rollupMain / reconcileMain). Executes the
+// red-fixture proof, PRINTS the result, AND persists a red_tests row via persistRedTest (honesty-guarded:
+// only a CONFIRMED outcome='red' is written; #177, see :88). Not cron-wired; run on demand.
 //
 //   node dist/redTestMain.js <check_id> --fault=bad-url:<url>          # HTTP monitor: point target at a wrong url
 //   node dist/redTestMain.js <check_id> --fault=route-block:<pattern>  # browser monitor: abort the anchor request
