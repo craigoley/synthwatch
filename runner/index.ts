@@ -34,6 +34,7 @@ import { loadFlow, type Flow } from './checks/index.js';
 import { getCompiledSpecFromPool, sha256 } from './specfetch/specCache.js';
 import { loadCompiledSpec } from './specfetch/compileSpec.js';
 import { specToFlow } from './specfetch/specShim.js';
+import { compileHostRewrite, resolveRewrite, type HostRewrite } from './specfetch/hostRewrite.js';
 import { syncFlowManifest } from './flowManifest.js';
 import { drainTestSends } from './testSend.js';
 import {
@@ -841,7 +842,16 @@ async function executeBrowser(
   // regardless. Decided upstream in runOne (throttled by the monitor's success_trace_at) so a
   // healthy frequent monitor doesn't serialize+upload a multi-MB trace every tick.
   captureSuccessTrace: boolean,
+  // ★ S2 pre-prod-arc primitive (INERT by default). When set, every request whose origin matches
+  // hostRewrite.fromOrigin is re-pointed to hostRewrite.toOrigin at the route layer (host+port only;
+  // path/query/protocol preserved), so a spec hardcoding its prod host can run against staging/dev
+  // WITHOUT editing the spec or forking the shared spec_cache. undefined → NO rewrite (byte-identical
+  // to before). No caller sets this yet; S3 wires it when a pre-prod check exists.
+  hostRewrite?: HostRewrite,
 ): Promise<Outcome> {
+  // FAIL-LOUD before opening a browser: a malformed origin pair REFUSES the run rather than silently
+  // running the spec against its hardcoded PROD host (a false-green against prod). Compiled once here.
+  const compiledRewrite = hostRewrite ? compileHostRewrite(hostRewrite) : null;
   // Resolve the flow source BEFORE opening a browser. A Git-managed check (spec_path set) FETCHES
   // its Playwright spec from synthwatch-monitors via the durable cache (#101-#104): 304-reuse /
   // 200-recompile / fallback-to-last-known-good / infra-error. A legacy/dashboard check (no
@@ -901,12 +911,19 @@ async function executeBrowser(
   // beyond the match).
   const customHeaders = check.request_headers ?? {};
   await context.route('**/*', async (route) => {
-    const additions = browserHeaderAdditions(route.request().url(), customHeaders);
-    if (additions === null) {
+    const reqUrl = route.request().url();
+    const additions = browserHeaderAdditions(reqUrl, customHeaders);
+    // S2: re-point the primary origin (host+port) when a rewrite is compiled; null (inert) otherwise.
+    // Third-party origins never match → resolveRewrite returns null → they pass through untouched.
+    const rewrittenUrl = resolveRewrite(reqUrl, compiledRewrite);
+    if (additions === null && rewrittenUrl === null) {
       await route.continue();
       return;
     }
-    await route.continue({ headers: { ...route.request().headers(), ...additions } });
+    await route.continue({
+      ...(additions !== null && { headers: { ...route.request().headers(), ...additions } }),
+      ...(rewrittenUrl !== null && { url: rewrittenUrl }),
+    });
   });
 
   const page = await context.newPage();
