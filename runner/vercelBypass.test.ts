@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 
 import {
   BYPASS_HEADER,
+  SET_BYPASS_COOKIE_HEADER,
+  SET_BYPASS_COOKIE_VALUE,
   PROTECTED_BYPASS_HOSTS,
   isProtectedHost,
   bypassHeaderFor,
@@ -61,22 +63,38 @@ test('HTTP: a malformed url → NO header, no throw', () => {
 });
 
 // ── Browser path (browserHeaderAdditions) ────────────────────────────────────────────────────────────────
-test('browser: protected-host request → request_headers merged AND the bypass token added', () => {
+test('browser: protected-host request → request_headers merged AND the bypass token + set-bypass-cookie added', () => {
   withToken(TOKEN, () => {
     const add = browserHeaderAdditions(PROTECTED, { 'x-monitor': 'synthwatch' });
-    assert.deepEqual(add, { 'x-monitor': 'synthwatch', [BYPASS_HEADER]: TOKEN });
+    assert.deepEqual(add, {
+      'x-monitor': 'synthwatch',
+      [BYPASS_HEADER]: TOKEN,
+      [SET_BYPASS_COOKIE_HEADER]: SET_BYPASS_COOKIE_VALUE,
+    });
+    assert.equal(SET_BYPASS_COOKIE_VALUE, 'true'); // Vercel docs: value is 'true' for direct in-browser testing
+  });
+});
+
+test('browser: the Vercel PREVIEW host (S3 pre-prod target) is protected → gets the token + set-bypass-cookie', () => {
+  withToken(TOKEN, () => {
+    assert.equal(isProtectedHost('preview.commerce.wegmans.com'), true);
+    const add = browserHeaderAdditions('https://preview.commerce.wegmans.com/checkout', {});
+    assert.deepEqual(add, { [BYPASS_HEADER]: TOKEN, [SET_BYPASS_COOKIE_HEADER]: SET_BYPASS_COOKIE_VALUE });
   });
 });
 
 // ★★ THE ANTI-LEAK MUST-GO-RED: a request to a NON-protected host (a third-party subresource) NEVER carries
 // the bypass token — proving host-scoping holds and the secret does not spray. This is the reason the browser
 // path uses per-request matching instead of context-wide extraHTTPHeaders.
-test('★ browser ANTI-LEAK: a THIRD-PARTY request never carries the bypass token (only request_headers, if any)', () => {
+test('★ browser ANTI-LEAK: a THIRD-PARTY request never carries the bypass token NOR set-bypass-cookie (only request_headers, if any)', () => {
   withToken(TOKEN, () => {
     // request_headers still merge for all hosts (the non-secret gap-fix)…
     const withCustom = browserHeaderAdditions(THIRD_PARTY, { 'x-monitor': 'synthwatch' });
     assert.deepEqual(withCustom, { 'x-monitor': 'synthwatch' });
     assert.equal(Object.prototype.hasOwnProperty.call(withCustom, BYPASS_HEADER), false, 'token must NOT be on a third-party request');
+    // ★ MUST-GO-RED: set-bypass-cookie is gated on the token (`if (bypass)`). Ungate it (add it for every
+    // request) and this assertion fails — a third-party host would be told to set the bypass cookie.
+    assert.equal(Object.prototype.hasOwnProperty.call(withCustom, SET_BYPASS_COOKIE_HEADER), false, 'set-bypass-cookie must NOT be on a third-party request');
     // …and with no custom headers, a third-party request gets NOTHING (route.continue untouched).
     assert.equal(browserHeaderAdditions(THIRD_PARTY, {}), null);
   });
@@ -93,8 +111,13 @@ test('browser: no custom headers + non-protected host → null (nothing to injec
   withToken(TOKEN, () => assert.equal(browserHeaderAdditions(THIRD_PARTY, {}), null));
 });
 
-test('browser: no custom headers + protected host + token → only the bypass header', () => {
-  withToken(TOKEN, () => assert.deepEqual(browserHeaderAdditions(PROTECTED, {}), { [BYPASS_HEADER]: TOKEN }));
+test('browser: no custom headers + protected host + token → the bypass header + set-bypass-cookie', () => {
+  withToken(TOKEN, () =>
+    assert.deepEqual(browserHeaderAdditions(PROTECTED, {}), {
+      [BYPASS_HEADER]: TOKEN,
+      [SET_BYPASS_COOKIE_HEADER]: SET_BYPASS_COOKIE_VALUE,
+    }),
+  );
 });
 
 test('the allow-set constant is a Set of lowercased hostnames (editable, host-matched)', () => {

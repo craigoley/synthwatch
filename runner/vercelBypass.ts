@@ -17,14 +17,31 @@ import { hostOf } from './deploys.js';
 
 export const BYPASS_HEADER = 'x-vercel-protection-bypass';
 
+// ★ Companion header for IN-BROWSER testing (Vercel Deployment Protection). Value 'true'. Vercel docs
+// (deployment-protection/…/protection-bypass-automation): "To bypass authorization on follow-up requests
+// (e.g. for in-browser testing) you can set an additional header … x-vercel-set-bypass-cookie with the
+// value true. This will set the authorization bypass as a cookie using a redirect with a Set-Cookie
+// header." So the FIRST navigation (carrying the token + this header) redirects with a Set-Cookie; the
+// browser context RETAINS that cookie, and subsequent navigations carry the bypass via the cookie. The
+// runner opens ONE browser context per run (index.ts newContext, no clearCookies/storageState reset), so
+// retention holds for the run's lifetime. Non-secret (a literal 'true'); browser-path ONLY (a single HTTP
+// fetch has no follow-up navigation to carry a cookie). ('samesitenone' is the iframe variant; the runner
+// navigates directly, so 'true' is correct.)
+export const SET_BYPASS_COOKIE_HEADER = 'x-vercel-set-bypass-cookie';
+export const SET_BYPASS_COOKIE_VALUE = 'true';
+
 // ★ The Vercel-protected hostnames (Deployment Protection). Host-matched (lowercased, as hostOf returns).
 // CLEARLY EDITABLE — this is the allow-set. NOT derived from target_url, NOT per-check. ★ CONFIRM with Craig
 // the exact set (amore/nextdoor are NOT Vercel-protected per current recon; add here if that changes).
+// preview.commerce.wegmans.com is the S3 pre-prod PREVIEW deployment — a Vercel preview behind the same
+// Deployment Protection, so it needs the bypass (the B2C-gap lesson: a monitored host that needs the header
+// MUST be in this set or the request hits the protection wall).
 export const PROTECTED_BYPASS_HOSTS = new Set<string>([
   'www.wegmans.com',
   'wegmans.com',
   'www.meals2go.com',
   'meals2go.com',
+  'preview.commerce.wegmans.com',
 ]);
 
 /** True iff `host` (a lowercased hostname from hostOf) is a Vercel-protected property needing the bypass header. */
@@ -63,6 +80,13 @@ export function browserHeaderAdditions(
 ): Record<string, string> | null {
   const additions: Record<string, string> = { ...customHeaders };
   const bypass = bypassHeaderFor(url);
-  if (bypass) additions[bypass[0]] = bypass[1];
+  if (bypass) {
+    additions[bypass[0]] = bypass[1];
+    // ★ Alongside the token (and ONLY then — gated on `bypass`, so a third-party host never receives it),
+    // ask Vercel to set the bypass as a cookie so follow-up navigations carry it. Same host-scope + anti-leak
+    // invariant as the token. Browser-path only (this fn is the browser path; the HTTP fetch path does not
+    // call it). The cookie the response Set-Cookies is retained by the run's single browser context.
+    additions[SET_BYPASS_COOKIE_HEADER] = SET_BYPASS_COOKIE_VALUE;
+  }
   return Object.keys(additions).length > 0 ? additions : null;
 }
