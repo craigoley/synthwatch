@@ -33,14 +33,25 @@ test('(3b) marker must be EXACTLY "1" — a stray truthy value does not read as 
   assert.equal(v.allowed, false);
 });
 
-test('(3c) the RETIRED signals no longer pass — closes #196\'s named falsifier', () => {
-  // SYNTHWATCH_LOCATION alone (a local shell testing multi-region logic) used to bypass; no more.
+test('(3c) SYNTHWATCH_LOCATION alone still does NOT pass — #196\'s named falsifier stays closed', () => {
+  // We restored ONLY CONTAINER_APP_JOB_NAME (platform-injected), NOT LOCATION (user-settable on the
+  // 3 mains) — a local shell exporting LOCATION to test multi-region logic must remain refused.
   assert.equal(prodGuardVerdict({ DATABASE_URL: PROD_URL, SYNTHWATCH_LOCATION: 'eastus2' }).allowed, false);
-  // CONTAINER_APP_JOB_NAME (never doc-verified) is no longer a signal either.
-  assert.equal(
-    prodGuardVerdict({ DATABASE_URL: PROD_URL, CONTAINER_APP_JOB_NAME: 'synthwatch-runner-job' }).allowed,
-    false,
-  );
+});
+
+test('(3d) FALLBACK: prod host + CONTAINER_APP_JOB_NAME but NO marker → allowed (survives the 2026-07-06 marker desync)', () => {
+  // The outage shape: a real ACA job whose SYNTHWATCH_DEPLOYED got dropped by a deploy. The
+  // platform-injected job name is the second, independent signal → the job still starts.
+  // ★ MUST-GO-RED: delete the `|| inAcaJob` branch in prodGuard.ts and this assertion fails
+  // (verdict flips to local-prod-refused) — i.e. the fleet would refuse again.
+  const v = prodGuardVerdict({ DATABASE_URL: PROD_URL, CONTAINER_APP_JOB_NAME: 'synthwatch-runner-job' });
+  assert.deepEqual(v, { allowed: true, reason: 'deployed' });
+});
+
+test('(3e) fallback is PRESENCE, not a specific value — any non-empty CONTAINER_APP_JOB_NAME passes; empty does not', () => {
+  assert.equal(prodGuardVerdict({ DATABASE_URL: PROD_URL, CONTAINER_APP_JOB_NAME: 'synthwatch-retention-job' }).allowed, true);
+  // An empty string is NOT "present" — a bare local shell with the var exported-but-empty stays refused.
+  assert.equal(prodGuardVerdict({ DATABASE_URL: PROD_URL, CONTAINER_APP_JOB_NAME: '' }).allowed, false);
 });
 
 test('(4) local context + LOCAL DATABASE_URL → allowed (must NOT overblock normal local dev)', () => {

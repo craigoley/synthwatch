@@ -16,22 +16,33 @@
 //        this project's only Azure PG is prod (infra/main.bicep:84 postgresServerName =
 //        'synthwatch-pg-e2'; every job's database-url is built from its FQDN). Local dev DBs are
 //        localhost/docker and never match.
-//     2. The deployed-environment marker is absent: SYNTHWATCH_DEPLOYED === '1' — the UNIVERSAL
-//        marker infra/main.bicep (#197) declares on ALL EIGHT container-app jobs (the 3 mains AND
-//        migrate/rollup/narrative/reconcile/retention), verified live on all 8 post-deploy
-//        (July 4 gate). Template-owned (re-asserted by every deploy); a plain Mac shell never has
-//        it. ONE marker, ONE invariant, every entrypoint — this replaced #196's
-//        SYNTHWATCH_LOCATION ∨ CONTAINER_APP_JOB_NAME check: LOCATION exists only on the 3 mains
-//        (would have blocked the deployed aux fleet), and dropping it as a signal CLOSES #196's
-//        named falsifier (a local shell exporting LOCATION to test multi-region logic no longer
-//        bypasses the guard). CONTAINER_APP_JOB_NAME was never doc-verified and is now redundant.
+//     2. NEITHER deployed-environment signal is present. There are TWO independent ones —
+//        belt-and-suspenders — and EITHER suffices to pass:
+//        • SYNTHWATCH_DEPLOYED === '1' — the UNIVERSAL marker infra/main.bicep (#197) declares on
+//          ALL EIGHT container-app jobs (the 3 mains AND migrate/rollup/narrative/reconcile/
+//          retention) and #201 bakes into the runner IMAGE so it rides every deploy. Template/
+//          image-owned; a plain Mac shell never has it.
+//        • CONTAINER_APP_JOB_NAME present — ACA PLATFORM-INJECTED job metadata. Azure primary docs
+//          (learn.microsoft.com/azure/container-apps/environment-variables, "Built-in environment
+//          variables → Jobs"): "Azure Container Apps automatically adds environment variables that
+//          your apps and jobs can use to obtain platform metadata at run-time"; CONTAINER_APP_JOB_NAME
+//          = "The name of the job". So it is present on EVERY real Container Apps job execution,
+//          absent in a local shell / bare `docker run`, and NOT settable or strippable by a deploy
+//          env-op — the second signal SURVIVES a marker desync.
+//        ★ WHY two signals (the 2026-07-06 outage): #198 had reduced this to the marker ALONE. When a
+//        deploy left SYNTHWATCH_DEPLOYED off the running jobs, ALL of them refused to start for ~23h
+//        (self-alerting was down too). This platform-injected fallback means a real ACA job passes
+//        even if the marker desyncs, while a local run — which has NEITHER — is still refused.
+//        NOTE we restore ONLY CONTAINER_APP_JOB_NAME, NOT #196's SYNTHWATCH_LOCATION: LOCATION was a
+//        user-settable var on only the 3 mains, and a local shell exporting it bypassed the guard
+//        (#196's named falsifier) — CONTAINER_APP_JOB_NAME has neither flaw (platform-injected, all jobs).
 //   ESCAPE HATCH: SYNTHWATCH_ALLOW_PROD=1 — a deliberate local-against-prod run (cache warming,
 //   controlled diagnostics, an intentional local redTestMain) states its intent and proceeds.
 //
-// FALSIFIER (named, accepted): a non-template deployment (e.g. a bare `docker run` on a VM)
-// without the marker is wrongly blocked — the hatch is the remedy and the error says so. A local
-// shell that deliberately exports SYNTHWATCH_DEPLOYED=1 bypasses — spoofing, not the accident
-// class; the June incident ran with a bare sourced ~/.synthwatch.env and IS caught.
+// FALSIFIER (named, accepted): a non-template deployment (e.g. a bare `docker run` on a VM) has
+// NEITHER signal and is wrongly blocked — the hatch is the remedy and the error says so. A local
+// shell that deliberately exports SYNTHWATCH_DEPLOYED=1 or CONTAINER_APP_JOB_NAME bypasses — spoofing,
+// not the accident class; the June incident ran with a bare sourced ~/.synthwatch.env and IS caught.
 //
 // ★ REFUSAL IS log + process.exit(1), NOT a throw: a throw at main() top would route through
 // main().catch → recordFatal → an INSERT into runner_errors ON THE PROD DB — the exact write
@@ -65,10 +76,15 @@ export function prodGuardVerdict(env: NodeJS.ProcessEnv = process.env): GuardVer
   if (!host.endsWith(PROD_PG_HOST_SUFFIX)) return { allowed: true, reason: 'non-prod-host' };
 
   if (env.SYNTHWATCH_ALLOW_PROD === '1') return { allowed: true, reason: 'allow-prod-hatch' };
-  // The ONE deployed invariant — the universal #197 marker, exactly '1' (mirrors the hatch's
-  // exactness; pins the bicep contract). See the module header for why LOCATION and
-  // CONTAINER_APP_JOB_NAME are deliberately NOT signals anymore.
-  if (env.SYNTHWATCH_DEPLOYED === '1') {
+  // TWO independent deployed-environment signals, EITHER suffices (belt-and-suspenders — see header
+  // for the 2026-07-06 marker-desync outage that motivates the second one):
+  //  (1) SYNTHWATCH_DEPLOYED === '1' — the universal #197 marker (exact '1', mirrors the hatch's
+  //      exactness; pins the bicep/image contract).
+  //  (2) CONTAINER_APP_JOB_NAME present — ACA platform-injected job metadata (Azure docs), on every
+  //      real Container Apps job execution, absent locally, unstrippable by a deploy env-op. Presence
+  //      (any non-empty name), not an exact value — the platform sets the job's actual name.
+  const inAcaJob = (env.CONTAINER_APP_JOB_NAME ?? '') !== '';
+  if (env.SYNTHWATCH_DEPLOYED === '1' || inAcaJob) {
     return { allowed: true, reason: 'deployed' };
   }
   return { allowed: false, reason: 'local-prod-refused' };
@@ -84,10 +100,11 @@ export function enforceProdGuard(env: NodeJS.ProcessEnv = process.env): void {
   if (verdict.allowed) return;
   console.error(
     `[runner] REFUSING TO START: DATABASE_URL points at the prod-class Postgres ` +
-      `(*${PROD_PG_HOST_SUFFIX}) but the deployed-environment marker is absent ` +
-      `(SYNTHWATCH_DEPLOYED != '1' — bicep sets it on every deployed job) — this looks like a ` +
-      `LOCAL process about to write prod (the June 25–26 check-74 incident). If this ` +
-      `local-against-prod run is DELIBERATE, set SYNTHWATCH_ALLOW_PROD=1 and re-run.`,
+      `(*${PROD_PG_HOST_SUFFIX}) but NEITHER deployed-environment signal is present ` +
+      `(no SYNTHWATCH_DEPLOYED=1 marker AND no CONTAINER_APP_JOB_NAME — the ACA platform sets the ` +
+      `latter on every real job) — this looks like a LOCAL process about to write prod (the ` +
+      `June 25–26 check-74 incident). If this local-against-prod run is DELIBERATE, set ` +
+      `SYNTHWATCH_ALLOW_PROD=1 and re-run.`,
   );
   process.exit(1);
 }
