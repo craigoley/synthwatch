@@ -855,3 +855,18 @@ export async function maybeBurnAlert(check: Check): Promise<void> {
     );
   }
 }
+
+/**
+ * Apply a finished run's PROD-FACING side-effects: incident open/resolve + alert dispatch (evaluate) and
+ * SLO burn-rate paging (maybeBurnAlert). ★ SANDBOX (0064): a sandbox run of a PAUSED monitor SKIPS ALL of
+ * these — the run row + trace are already persisted (inspectable), but no incident opens, no alert/page
+ * fires, no SLO burn alert, and checks.enabled is never touched. This is the load-bearing option-A guard
+ * (without the skip a paused monitor would page — the "C" failure). Extracted from runOneInner so the skip
+ * is UNIT-TESTABLE: index.ts runs main() on import (house convention), so runOneInner itself isn't; this
+ * wrapper is the exact seam runOneInner calls, and the sandbox test asserts on it directly.
+ */
+export async function applyRunSideEffects(check: Check, run: RunRecord, sandbox: boolean): Promise<void> {
+  if (sandbox) return; // paused-monitor sandbox run: persist the run only, no incident/alert/SLO.
+  await evaluate(check, run);
+  await maybeBurnAlert(check);
+}

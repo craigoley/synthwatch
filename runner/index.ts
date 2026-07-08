@@ -51,8 +51,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { unlink } from 'node:fs/promises';
 import {
-  evaluate,
-  maybeBurnAlert,
+  applyRunSideEffects,
   perfBudgetVerdict,
   budgetedMetricCaptureFailed,
   hasOpenIncident,
@@ -343,17 +342,19 @@ async function drainRunRequests(): Promise<number> {
   // each — so a runner that can't run a check (not assigned here / disabled) would CONSUME the request
   // without running it (a lost on-demand run for any check not assigned to whichever location ticked
   // first). Filtering to runnable-here requests first means a runner only ever claims what it can execute.
-  const { rows: pending } = await pool.query<{ id: number; check_id: number }>(
-    `SELECT rr.id, rr.check_id
+  // ★ SANDBOX (0064): the `AND c.enabled` gate is relaxed to `(c.enabled OR rr.sandbox)` so a SANDBOX-flagged
+  // request may claim a PAUSED check — a NORMAL request (sandbox=false) still requires enabled (unchanged).
+  const { rows: pending } = await pool.query<{ id: number; check_id: number; sandbox: boolean }>(
+    `SELECT rr.id, rr.check_id, rr.sandbox
        FROM run_requests rr
        JOIN check_locations cl ON cl.check_id = rr.check_id AND cl.location = $1
-       JOIN checks c           ON c.id = rr.check_id AND c.enabled
+       JOIN checks c           ON c.id = rr.check_id AND (c.enabled OR rr.sandbox)
       WHERE rr.status = 'pending'
       ORDER BY rr.requested_at`,
     [LOCATION],
   );
   let ran = 0;
-  for (const { id, check_id } of pending) {
+  for (const { id, check_id, sandbox } of pending) {
     // Atomically claim THIS request — only one tick/replica wins (a concurrent claim updates 0 rows).
     // We claim only AFTER confirming (above) this runner can run it, so a claimed row always runs here.
     const { rowCount: won } = await pool.query(
@@ -377,9 +378,9 @@ async function drainRunRequests(): Promise<number> {
 
     // Force-run: advance last_run_at unconditionally (so this tick's due-loop + other replicas skip it)
     // and run it. Null only on a tiny race (disabled between the SELECT and now) — already consumed, fine.
-    const check = await forceClaim(check_id);
+    const check = await forceClaim(check_id, sandbox);
     if (!check) continue;
-    console.log(`[run-now] force-running check ${check.id} "${check.name}" (on-demand)`);
+    console.log(`[run-now] force-running check ${check.id} "${check.name}" (on-demand${sandbox ? ', SANDBOX — paused, evaluate() skipped' : ''})`);
     // ★ B5: per-iteration try/catch — a throw on ONE on-demand run must NOT abort the remaining drains.
     // Previously a runOne throw propagated out of the loop (caught only at the main-level .catch), dropping
     // every still-pending request this tick. The request was claimed 'done' atomically above (the race-
@@ -387,7 +388,7 @@ async function drainRunRequests(): Promise<number> {
     // so a failed run stays consumed and the check re-runs on its normal cron cadence; the failure is
     // logged here rather than silently aborting the siblings.
     try {
-      await runOne(check);
+      await runOne(check, sandbox);
       ran++;
     } catch (err) {
       // ★ Mirror the due-loop (#162): record to the QUERYABLE runner_errors sink, not stdout-only. An
@@ -406,25 +407,28 @@ async function drainRunRequests(): Promise<number> {
  * for (check, $LOCATION) so the normal due-loop and concurrent replicas treat it as just-run, and
  * returns the check row if it's enabled AND assigned to this location (else null).
  */
-async function forceClaim(id: number): Promise<Check | null> {
+async function forceClaim(id: number, sandbox = false): Promise<Check | null> {
+  // ★ SANDBOX (0064): `AND c.enabled` becomes `AND (c.enabled OR $3)` so a sandbox force-claim runs a PAUSED
+  // check; $3=false (a normal on-demand run) keeps the enabled requirement. last_run_at still advances (the
+  // check WAS run at this location), harmless for a paused check the due-loop ignores anyway.
   const { rows } = await pool.query<Check>(
     `WITH claimed AS (
        UPDATE check_locations cl
           SET last_run_at = now()
          FROM checks c
-        WHERE cl.check_id = $1 AND cl.location = $2 AND c.id = cl.check_id AND c.enabled
+        WHERE cl.check_id = $1 AND cl.location = $2 AND c.id = cl.check_id AND (c.enabled OR $3)
        RETURNING cl.check_id
      ),
      mirror AS (
        UPDATE checks SET last_run_at = now() WHERE id = (SELECT check_id FROM claimed)
      )
      SELECT c.* FROM checks c JOIN claimed ON claimed.check_id = c.id`,
-    [id, LOCATION],
+    [id, LOCATION, sandbox],
   );
   return rows[0] ?? null;
 }
 
-async function runOne(check: Check): Promise<void> {
+async function runOne(check: Check, sandbox = false): Promise<void> {
   // Insert the run row as 'running' (in-flight) so the StepRecorder has a run_id
   // to attach steps to, and the SLA "exclude running" clause has real data. A
   // hard crash before the terminal update is reaped to 'error' (see main()).
@@ -440,7 +444,7 @@ async function runOne(check: Check): Promise<void> {
   // guarantees a throw BEFORE that write doesn't strand the row in 'running' ~30 min until the reaper.
   const state = { finalized: false };
   try {
-    await runOneInner(check, runId, state);
+    await runOneInner(check, runId, state, sandbox);
   } finally {
     // No double-write: state.finalized + `WHERE status='running'` make this a NO-OP once the terminal
     // write ran. Best-effort + own-catch — a finally that throws would hide the original error.
@@ -461,6 +465,7 @@ async function runOneInner(
   check: Check,
   runId: number,
   state: { finalized: boolean },
+  sandbox = false,
 ): Promise<void> {
   const errorOutcome = (msg: string): Outcome => ({
     status: 'error',
@@ -673,12 +678,13 @@ async function runOneInner(
     screenshot_url: screenshotUrl,
     location: LOCATION,
   };
-  await evaluate(check, run);
-
-  // SLO error-budget burn-rate alerting (opt-in; no-op unless the check has an
-  // slo_target). Self-guards: skipped if an incident is already open, in a
-  // maintenance window, or debounced. Non-fatal.
-  await maybeBurnAlert(check);
+  // ★ SANDBOX (0064): the run row + trace are already persisted above (inspectable). applyRunSideEffects
+  // runs evaluate() (incident open/resolve + dispatchAlerts) + maybeBurnAlert() (SLO burn paging) — UNLESS
+  // this is a sandbox run of a PAUSED monitor, in which case it SKIPS them all (the load-bearing option-A
+  // guard: without it a paused monitor pages — the "C" failure). Nothing flips checks.enabled either. (OTel
+  // below is telemetry, not an alert/incident/SLO write — left on.) SLO rollups don't see this run: the
+  // paused check is excluded by the reports' `WHERE c.enabled` filter (and #188 excludes staging).
+  await applyRunSideEffects(check, run, sandbox);
 
   console.log(
     `[runner] check ${check.id} "${check.name}" -> ${status}` +

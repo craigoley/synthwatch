@@ -532,7 +532,12 @@ CREATE TABLE run_requests (
     status       TEXT        NOT NULL DEFAULT 'pending'
                              CHECK (status IN ('pending', 'done')),
     requested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    completed_at TIMESTAMPTZ
+    completed_at TIMESTAMPTZ,
+    -- SANDBOX run of a PAUSED monitor (migration 0064). true → the runner claims + runs this request even
+    -- though the check is disabled, writing a visible runs row + trace but SKIPPING evaluate() (no incident/
+    -- alert/SLO) and never resuming the check. DEFAULT false = a normal request (still rejected for a
+    -- disabled check by the `AND c.enabled` claim gates).
+    sandbox      BOOLEAN     NOT NULL DEFAULT false
 );
 CREATE INDEX run_requests_pending_idx ON run_requests (requested_at) WHERE status = 'pending';
 -- Idempotency: at most one pending request per check (re-clicks coalesce).
