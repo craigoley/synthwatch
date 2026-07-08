@@ -780,6 +780,11 @@ AS $$
            ON r.check_id   = c.id
           AND r.started_at >= p_from
           AND r.started_at <  p_to
+          -- SANDBOX EXCLUSION (migration 0066): a paused monitor's on-demand validation persists a runs
+          -- row but skipped evaluate() — it is NOT a scheduled health signal, so it must never move
+          -- availability. In the JOIN (not a WHERE) so a check whose only runs are sandbox keeps its
+          -- LEFT-JOIN null-run row (availability NULL) rather than being dropped.
+          AND NOT r.sandbox
     -- MAINTENANCE-WINDOW EXCLUSION (additive anti-join, mirrors 0004): drop runs
     -- that fall inside an active window for this check (check_id = c.id) OR a
     -- fleet-wide window (check_id IS NULL). Uncovered runs keep mw.id NULL and
@@ -793,7 +798,7 @@ AS $$
 $$;
 
 COMMENT ON FUNCTION sla_availability(timestamptz, timestamptz) IS
-    'Per-check availability over [p_from, p_to). up=(pass,warn) / completed=(pass,warn,fail,error); running excluded. On-demand, index-assisted.';
+    'Per-check availability over [p_from, p_to). up=(pass,warn) / completed=(pass,warn,fail,error); running + sandbox excluded. On-demand, index-assisted.';
 
 CREATE OR REPLACE VIEW sla_availability_24h AS
     SELECT * FROM sla_availability(now() - interval '24 hours', now());

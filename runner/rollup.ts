@@ -47,6 +47,10 @@ export async function computeRollupForDay(checkId: number, day: string): Promise
           -- (up/down counts already use explicit pass|warn / fail|error lists; this keeps it
           -- out of any total/row selection too.)
           AND r.status NOT IN ('running', 'infra_error')
+          -- sandbox excluded (migration 0066): a paused monitor's on-demand validation is not a
+          -- scheduled health signal, so it never enters the daily availability/latency rollup —
+          -- mirrors the same exclusion in the sla_availability() function.
+          AND NOT r.sandbox
           AND NOT EXISTS (
             SELECT 1 FROM maintenance_windows mw
              WHERE (mw.check_id = r.check_id OR mw.check_id IS NULL)
