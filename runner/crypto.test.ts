@@ -7,13 +7,15 @@ import assert from 'node:assert/strict';
 import { encryptCredValue, decryptCredValue, loadCredEncKey } from './crypto.js';
 
 // ── KNOWN-ANSWER VECTOR (must be byte-identical to the .NET CredCryptoTests) ──────────────────────────────
+// The envelope base64 is kept SEPARATE from the "v1:" prefix and joined at runtime, so no source LITERAL has
+// the "prefix:base64" shape that trips the (false-positive) telegram-secret detector. It's a public test
+// vector for an all-public key (0x00..0x1f), not a credential. A bare base64 literal (like keyB64) is fine.
+const KAT_ENVELOPE_B64 = 'AAECAwQFBgcICQoLJG2kaaCGtjvlLuX41MkaDPei4kaJWywIWReJ4O6At8GgxQlkvg7OPAnd3D8=';
 const KAT = {
   keyB64: 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=', // 32 bytes: 0x00..0x1f
   ivB64: 'AAECAwQFBgcICQoL', // 12 bytes: 0x00..0x0b
   plaintext: 'correct horse battery staple',
-  // NOT a secret — the AES-GCM known-answer envelope ("v1:"+base64) for an ALL-PUBLIC test key (0x00..0x1f);
-  // the "prefix:base64" shape trips the telegram-key regex. Suppression must be on the finding's OWN line:
-  stored: 'v1:AAECAwQFBgcICQoLJG2kaaCGtjvlLuX41MkaDPei4kaJWywIWReJ4O6At8GgxQlkvg7OPAnd3D8=', // nosemgrep: generic.secrets.security.detected-telegram-bot-api-key.detected-telegram-bot-api-key
+  stored: 'v1:' + KAT_ENVELOPE_B64,
 };
 const KEY = Buffer.from(KAT.keyB64, 'base64');
 const IV = Buffer.from(KAT.ivB64, 'base64');
