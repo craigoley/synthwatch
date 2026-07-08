@@ -1,26 +1,24 @@
-// Per-monitor LOGIN CREDENTIALS — references-only (mirrors checks.secret_headers / checks.auth's *_env model).
+// Per-monitor LOGIN CREDENTIALS — model B: ENCRYPTED VALUES stored in the DB (was: env-var references).
 //
-// checks.login_credentials is { credentialRole -> ENV_VAR_NAME } (e.g. { username: 'B2C_TEST_USER',
-// password: 'B2C_TEST_PASS' }): the runner resolves process.env[ENV_VAR_NAME] at RUN time and exposes the
-// value to the browser spec under a GENERIC role name — never the env-var name, never a hardcoded secret in
-// the spec. The stored map is NON-secret (role names + env-var names — the same references-only shape as
-// `secret_headers`/`auth`). The resolved VALUE is used ONLY to fill the login form:
-//   • NEVER logged        — the resolver's warn (on a missing env var) names the role + ENV_VAR only.
-//   • NEVER in a DTO       — the api maps only the REFERENCE names (role -> env-var-name), never the value.
-//   • NEVER in trace_signals — the trace extractor captures no request headers / form values (audit #219).
+// checks.login_credentials is { credentialRole -> CIPHERTEXT } (e.g. { username: 'v1:…', password: 'v1:…' }):
+// the api ENCRYPTS the value on write (CredCrypto v1); the runner DECRYPTS it at RUN time (crypto.ts) and
+// exposes the plaintext to the browser spec under a GENERIC role name via the SW_CRED_<ROLE> one-run env
+// (applyLoginCredentials + the shim's credential()). The stored leaf is CIPHERTEXT — the plaintext value:
+//   • NEVER logged        — a decrypt failure names the role, never the value/ciphertext.
+//   • NEVER in a DTO       — the api read DTO returns masked ("set"/role name), never plaintext OR ciphertext.
+//   • NEVER in trace_signals — the extractor captures no form values (audit #219); + it's a registered
+//                              escaped-literal redact rule (#232), so a leak into console/error is scrubbed.
 //
-// ★ WHY NOT the secret_headers mechanism verbatim: secret_headers resolves at the NETWORK layer and injects
-//   a request header — the value never reaches the spec's JS. A login credential must be TYPED into a form
-//   field by the spec, so the value has to reach spec scope. It's exposed via a per-run env convention
-//   (SW_CRED_<ROLE>, set by applyLoginCredentials + read by the shim's credential()) — set right before the
-//   flow runs and CLEARED right after, so it can't linger or bleed across the serially-run checks in a tick.
-//   The per-monitor role→env-var mapping stays in the check (declared in the manifest), not in the spec.
+// ★ FAIL-CLOSED: a leaf that doesn't decrypt (bad key / corrupt / a legacy env-var-ref-name that isn't "v1:"
+//   ciphertext) THROWS — the run fails closed (runOne's B2 wrapper records 'error'). NEVER fall back to
+//   treating the leaf as a raw/plaintext value. Until an encrypted value is seeded, the monitor has no creds.
 //
-// ★ PROVISIONING CEILING (honest limit): each ENV_VAR_NAME must be an ACA job env var (like B2C_TEST_USER) —
-//   there is no per-monitor secret vault. Same ceiling as secret_headers.
+// ★ PROVISIONING CEILING: values are set via the editor/write-endpoint (encrypted with CRED_ENC_KEY) — there
+//   is still no per-monitor secret vault; the single symmetric key gates all of them.
+import { loadCredEncKey, decryptCredValue } from './crypto.js';
 
-/** credentialRole -> ENV_VAR_NAME. Both non-secret; only the resolved env value is secret. */
-export type LoginCredentialRefs = Record<string, string>;
+/** credentialRole -> CIPHERTEXT ("v1:…", CredCrypto v1). Only the DECRYPTED value is secret. */
+export type LoginCredentialValues = Record<string, string>;
 
 /** The env-var name the shim's credential(role) reads: SW_CRED_<ROLE>, ROLE upper-cased. */
 export function credentialEnvKey(role: string): string {
@@ -28,24 +26,22 @@ export function credentialEnvKey(role: string): string {
 }
 
 /**
- * Resolve a monitor's login credentials to { role: value } for each ref whose ENV_VAR is set.
- *
- * FAIL-SOFT: a ref whose env var is unset/empty is SKIPPED (with a NAME-only warn) — a missing credential
- * must not crash the run; the monitor's own login assertion then goes red, which is the correct signal.
- *
- * ★ The resolved VALUE appears ONLY in the returned map. It is NEVER logged.
+ * DECRYPT a monitor's login credentials to { role: plaintext }. Loads CRED_ENC_KEY once (only when there ARE
+ * values — a monitor with none needs no key). FAIL-CLOSED: a missing/invalid key or any leaf that doesn't
+ * decrypt (corrupt ciphertext / wrong key / a legacy ref-name) THROWS — the run fails closed rather than
+ * running with a wrong or absent credential. The plaintext appears ONLY in the returned map; never logged.
  */
-export function resolveLoginCredentials(refs: LoginCredentialRefs | null | undefined): Record<string, string> {
-  if (!refs) return {};
+export function resolveLoginCredentials(enc: LoginCredentialValues | null | undefined): Record<string, string> {
+  if (!enc || Object.keys(enc).length === 0) return {};
+  const key = loadCredEncKey(); // fail-closed if CRED_ENC_KEY absent/invalid
   const out: Record<string, string> = {};
-  for (const [role, envName] of Object.entries(refs)) {
-    const value = process.env[envName];
-    if (value === undefined || value.length === 0) {
-      // NAME-only — never the (absent) value.
-      console.warn(`[login-creds] role "${role}" -> env var "${envName}" not set — credential skipped (fail-soft)`);
-      continue;
+  for (const [role, ciphertext] of Object.entries(enc)) {
+    try {
+      out[role] = decryptCredValue(ciphertext, key);
+    } catch {
+      // NAME-only — never the value/ciphertext. Re-throw so the run fails closed (no partial/empty creds).
+      throw new Error(`[login-creds] role "${role}" did not decrypt (corrupt ciphertext, wrong key, or a legacy ref-name) — failing closed`);
     }
-    out[role] = value;
   }
   return out;
 }
@@ -59,13 +55,13 @@ export interface CredEnvHandle {
 }
 
 /**
- * Resolve + PUBLISH a monitor's login credentials for its (about-to-run) browser spec: sets
- * process.env[SW_CRED_<ROLE>] = value for each resolved role, and returns a handle per key (with the prior
- * value) so the caller can restore them in a finally. Values already live in process.env under their own
- * ENV_VAR names (ACA secrets), so the generic-role copy is no new exposure class — but it is short-lived.
+ * DECRYPT + PUBLISH a monitor's login credentials for its (about-to-run) browser spec: sets
+ * process.env[SW_CRED_<ROLE>] = plaintext for each role, and returns a handle per key (with the prior value)
+ * so the caller can restore them in a finally. The plaintext lives in process.env only for this one run
+ * (cleared in the executeBrowser finally). FAIL-CLOSED via resolveLoginCredentials (a bad leaf throws).
  */
-export function applyLoginCredentials(refs: LoginCredentialRefs | null | undefined): CredEnvHandle[] {
-  const resolved = resolveLoginCredentials(refs);
+export function applyLoginCredentials(enc: LoginCredentialValues | null | undefined): CredEnvHandle[] {
+  const resolved = resolveLoginCredentials(enc);
   const handles: CredEnvHandle[] = [];
   for (const [role, value] of Object.entries(resolved)) {
     const key = credentialEnvKey(role);
