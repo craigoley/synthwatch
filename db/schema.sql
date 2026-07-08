@@ -287,7 +287,12 @@ CREATE TABLE runs (
     location       TEXT NOT NULL DEFAULT 'default',
     -- The PUBLIC egress IP the runner left from (static-egress-IP Phase 0; mirrors 0054_runs_egress_ip.sql).
     -- Best-effort/fail-soft (NULL when the reflector was unreachable); NOT sensitive (our own infra IP).
-    egress_ip      TEXT
+    egress_ip      TEXT,
+    -- Sandbox run (mirrors 0065_runs_sandbox.sql): true when this row was written by a PAUSED-monitor
+    -- on-demand validation run (skips evaluate() — no incident/alert/SLO). Stamps the run so a resumed
+    -- monitor's historical sandbox runs stay distinguishable (badge + optional SLO exclusion). DEFAULT
+    -- false = a normal run.
+    sandbox        BOOLEAN NOT NULL DEFAULT false
 );
 
 -- Hot path: "latest N runs for this check, newest first" (status pages, the
