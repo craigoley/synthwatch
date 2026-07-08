@@ -11,6 +11,7 @@ import {
   fetchManifest,
   computeDrift,
   b10FieldUpdates,
+  redtestAnchorUpdates,
   computeApplyPlan,
   manifestUrl,
   type Monitor,
@@ -37,7 +38,7 @@ async function loadManagedChecks(): Promise<ManagedCheck[]> {
   // SYNC WITH the ManagedCheck interface in reconcile.ts.
   const { rows } = await pool.query<ManagedCheck>(
     `SELECT source_key, name, kind, target_url, flow_name, sensitive, redact_patterns,
-            environment, rewrite_from_origin
+            environment, rewrite_from_origin, redtest_anchor
        FROM checks
       WHERE source_key IS NOT NULL`,
   );
@@ -231,6 +232,19 @@ async function main(): Promise<void> {
       ? '[reconcile] B10 sync: all checks already match the manifest (no sensitive/redact_patterns drift).'
       : `[reconcile] B10 sync: corrected ${b10.length} check(s); refused ${blockedStrips.length} redaction-strip(s).`,
   );
+
+  // ★ SCOPED redtest_anchor SYNC (recon #55 gap A) — mirrors the B10 sync: a targeted UPDATE of exactly the
+  // redtest_anchor column for each check whose manifest value diverges. DELIBERATELY NOT via buildApplyUpsert
+  // (redtest_anchor is not Git-authoritative / not in the positional plan tuple), so it can't shift the
+  // #216-fragile materialize contract and it syncs while the field-split apply stays gated.
+  const anchorUpdates = redtestAnchorUpdates(manifest.monitors, managed);
+  for (const u of anchorUpdates) {
+    await pool.query(`UPDATE checks SET redtest_anchor = $2 WHERE source_key = $1`, [u.source_key, u.redtest_anchor]);
+    console.log(`[reconcile] redtest_anchor sync: ${u.source_key} -> ${u.redtest_anchor ?? 'NULL'}`);
+  }
+  if (anchorUpdates.length === 0) {
+    console.log('[reconcile] redtest_anchor sync: all checks already match the manifest (no anchor drift).');
+  }
 
   // Snapshot the full manifest (every spec + its probe result) for the read-only catalog
   // (GET /api/specs). Reuses the probe just computed — no second fetch/compile.
