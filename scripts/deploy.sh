@@ -59,6 +59,7 @@ readonly EXPECTED_API_VERSION='2025-04-01-preview'   # the #93/#94 fix — must 
 readonly ACS_SECRET_REF='acs-email-conn'             # the runner ACS env's secretRef — the wipe canary
 readonly B2C_USER_SECRET_REF='b2c-test-user'         # B2C_TEST_USER secretRef — the b2c-login-test wipe canary
 readonly B2C_PASS_SECRET_REF='b2c-test-pass'         # B2C_TEST_PASS secretRef
+readonly CRED_ENC_KEY_SECRET_REF='cred-enc-key'      # CRED_ENC_KEY secretRef — model-B value crypto (runner decrypt)
 readonly API_HEALTH_URL='https://synthwatch-api.azurewebsites.net/api/checks'
 
 # The runner-image jobs (RUNNER_JOB, CENTRALUS_RUNNER_JOB, WESTUS2_RUNNER_JOB, NARRATIVE_JOB, ROLLUP_JOB,
@@ -417,6 +418,7 @@ run_whatif() {
         alertRecipientEmail="${ALERT_RECIPIENT_EMAIL}" \
         b2cTestUser="${B2C_TEST_USER:-}" \
         b2cTestPass="${B2C_TEST_PASS:-}" \
+        credEncKey="${CRED_ENC_KEY:?CRED_ENC_KEY must be set in ~/.synthwatch.env before deploy (base64 of 32 random bytes; an empty ACA secret is rejected and the runner cannot decrypt credential values)}" \
         runnerImage="${RUNNER_IMG}" \
         migrateImage="${MIGRATE_IMG}" \
     > "${WHATIF_JSON}" 2>/dev/null \
@@ -482,6 +484,7 @@ do_deploy() {
         alertRecipientEmail="${ALERT_RECIPIENT_EMAIL}" \
         b2cTestUser="${B2C_TEST_USER:-}" \
         b2cTestPass="${B2C_TEST_PASS:-}" \
+        credEncKey="${CRED_ENC_KEY:?CRED_ENC_KEY must be set in ~/.synthwatch.env before deploy (base64 of 32 random bytes; an empty ACA secret is rejected and the runner cannot decrypt credential values)}" \
         runnerImage="${RUNNER_IMG}" \
         migrateImage="${MIGRATE_IMG}" \
     -o none
@@ -564,6 +567,13 @@ verify() {
   v="$(job_env_secretref "${RUNNER_JOB}" B2C_TEST_PASS)"
   [[ "${v}" == "${B2C_PASS_SECRET_REF}" ]] && ok=1 || ok=0
   check "${ok}" "${RUNNER_JOB} B2C_TEST_PASS secretRef='${v}' (expect ${B2C_PASS_SECRET_REF})"
+
+  # CRED_ENC_KEY secretRef PLUMBING present on the runner job (model-B value crypto — the decrypt canary).
+  # Asserts the env→secretRef mapping is intact (not the value). A future deploy that drops it → runner
+  # can't decrypt credential values → login monitors fail closed; caught here.
+  v="$(job_env_secretref "${RUNNER_JOB}" CRED_ENC_KEY)"
+  [[ "${v}" == "${CRED_ENC_KEY_SECRET_REF}" ]] && ok=1 || ok=0
+  check "${ok}" "${RUNNER_JOB} CRED_ENC_KEY secretRef='${v}' (expect ${CRED_ENC_KEY_SECRET_REF})"
 
   # AZURE_CLIENT_ID present where expected (MI pin; #90).
   local j
