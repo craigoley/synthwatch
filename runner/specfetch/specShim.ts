@@ -27,7 +27,6 @@ import type { Flow } from '../checks/index.js';
 // Runtime import (a value): the SAME class the runner classifies on. isExpectationError also
 // matches by `.name`, so classification survives the esbuild bundle boundary regardless.
 import { ExpectationError } from '../errors.js';
-import { credentialEnvKey } from '../loginCredentials.js';
 
 // ---------------------------------------------------------------------------
 // test() — capture registry. Shared because the compiled spec imports THIS module
@@ -73,18 +72,16 @@ export function specToFlow(fn: (args: { page: Page }) => Promise<void>, page: Pa
 }
 
 /**
- * Per-monitor LOGIN CREDENTIAL accessor for specs (references-only model — runner/loginCredentials.ts).
- * A spec reads `credential('username')` instead of hardcoding an env-var name; the runner has already
- * resolved the monitor's declared { role -> ENV_VAR_NAME } and PUBLISHED the value as process.env[SW_CRED_
- * <ROLE>] for the duration of this run (applyLoginCredentials → cleared in the executeBrowser finally).
- *
- * Fail-CLOSED: an undeclared/unresolved role throws (like the old requireSecret) so a mis-declared login
- * monitor fails loudly rather than silently submitting an empty credential. The NAME is safe to surface;
- * the value is never logged. This export is OUTSIDE the lib/flow↔specShim parity-hashed block (it's a thin
- * env read, identical to the authoring lib/flow copy), so it adds no LIBFLOW-VENDOR-SHA churn.
+ * Per-monitor LOGIN CREDENTIAL accessor. A spec reads `credential('username')` instead of hardcoding an
+ * env-var name; the runner resolves the monitor's declared { role -> ENV_VAR_NAME } and publishes the value
+ * as process.env[SW_CRED_<ROLE>] for the life of this run (cleared after — see runner/loginCredentials.ts).
+ * Fail-CLOSED: an undeclared/unresolved role throws, so a mis-wired login monitor fails loudly instead of
+ * submitting an empty credential. IN THE PARITY-HASHED BLOCK on purpose — a security-relevant, spec-reachable
+ * accessor whose authoring (here) and runtime (specShim) copies must never silently drift. The env-var format
+ * `SW_CRED_<ROLE>` must stay in lockstep with runner/loginCredentials.ts credentialEnvKey.
  */
 export function credential(role: string): string {
-  const value = process.env[credentialEnvKey(role)];
+  const value = process.env[`SW_CRED_${role.toUpperCase()}`];
   if (value === undefined || value.length === 0) {
     throw new Error(
       `credential("${role}") is not available — the monitor must declare login_credentials.${role} ` +
@@ -208,7 +205,7 @@ export function expect(target: unknown, message?: string): SpecExpect {
 // hashes lib/flow.ts's SHARED block and compares it to LIBFLOW-VENDOR-SHA below. When lib/flow.ts's
 // shared helpers change, that check FAILS until you mirror the change into the functions below AND
 // update this sha to the value the check prints. (Single-source refactor — option b — is a follow-up.)
-// LIBFLOW-VENDOR-SHA: c28d4f84d56d329ae91e5ee0f204251855b55bc23ff6a9ac1400a59b4463a539
+// LIBFLOW-VENDOR-SHA: c915affc731a26fb30d561c47a3426894a2bb6a5835318dbc0fbe6603b7b6824
 // ---------------------------------------------------------------------------
 export async function assertLoaded(
   page: Page,
