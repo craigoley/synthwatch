@@ -19,7 +19,12 @@ import { noteDeployMarker, hostOf } from './deploys.js';
 import { captureMainDocHeaders } from './browserMarker.js';
 import { browserHeaderAdditions } from './vercelBypass.js';
 import { resolveSecretHeaders } from './secretHeaders.js';
-import { applyLoginCredentials, clearLoginCredentials, resolveLoginCredentials } from './loginCredentials.js';
+import {
+  applyLoginCredentials,
+  clearLoginCredentials,
+  resolveLoginCredentials,
+  type CredEnvHandle,
+} from './loginCredentials.js';
 import { runSslCheck } from './sslCheck.js';
 import { runDnsCheck, runTcpCheck, runPingCheck } from './netChecks.js';
 import { runMultistepChain } from './multistep.js';
@@ -1016,7 +1021,7 @@ async function executeBrowser(
   // process.env[SW_CRED_<ROLE>] so the spec's credential(role) can read them. Set for the life of THIS run
   // only and cleared in the finally — so a resolved secret can't linger or bleed across the tick's other
   // (serially-run) checks. No-op ([]) for a monitor with no login_credentials. Never logged.
-  let credKeys: string[] = [];
+  let credKeys: CredEnvHandle[] = [];
 
   try {
     credKeys = applyLoginCredentials(check.login_credentials);

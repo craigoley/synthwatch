@@ -50,24 +50,36 @@ export function resolveLoginCredentials(refs: LoginCredentialRefs | null | undef
   return out;
 }
 
-/**
- * Resolve + PUBLISH a monitor's login credentials for its (about-to-run) browser spec: sets
- * process.env[SW_CRED_<ROLE>] = value for each resolved role, and returns the env keys it set so the
- * caller can clear them in a finally. Values already live in process.env under their own ENV_VAR names
- * (ACA secrets), so the generic-role copy is no new exposure class — but it is short-lived by design.
- */
-export function applyLoginCredentials(refs: LoginCredentialRefs | null | undefined): string[] {
-  const resolved = resolveLoginCredentials(refs);
-  const keys: string[] = [];
-  for (const [role, value] of Object.entries(resolved)) {
-    const key = credentialEnvKey(role);
-    process.env[key] = value;
-    keys.push(key);
-  }
-  return keys;
+/** A published SW_CRED_<ROLE> env var + the value it had BEFORE publish (undefined = didn't exist), so the
+ *  cleanup can RESTORE the prior value rather than blindly deleting — defensive if the reserved SW_CRED_*
+ *  namespace ever collides with a pre-existing job env var. */
+export interface CredEnvHandle {
+  key: string;
+  prior: string | undefined;
 }
 
-/** Delete the SW_CRED_<ROLE> env vars applyLoginCredentials set — call in a finally after the spec runs. */
-export function clearLoginCredentials(keys: string[]): void {
-  for (const key of keys) delete process.env[key];
+/**
+ * Resolve + PUBLISH a monitor's login credentials for its (about-to-run) browser spec: sets
+ * process.env[SW_CRED_<ROLE>] = value for each resolved role, and returns a handle per key (with the prior
+ * value) so the caller can restore them in a finally. Values already live in process.env under their own
+ * ENV_VAR names (ACA secrets), so the generic-role copy is no new exposure class — but it is short-lived.
+ */
+export function applyLoginCredentials(refs: LoginCredentialRefs | null | undefined): CredEnvHandle[] {
+  const resolved = resolveLoginCredentials(refs);
+  const handles: CredEnvHandle[] = [];
+  for (const [role, value] of Object.entries(resolved)) {
+    const key = credentialEnvKey(role);
+    handles.push({ key, prior: process.env[key] }); // capture prior BEFORE overwrite
+    process.env[key] = value;
+  }
+  return handles;
+}
+
+/** RESTORE the SW_CRED_<ROLE> env vars applyLoginCredentials set — call in a finally after the spec runs.
+ *  Deletes a key that didn't exist before; restores one that did (so a collision leaves env as it found it). */
+export function clearLoginCredentials(handles: CredEnvHandle[]): void {
+  for (const { key, prior } of handles) {
+    if (prior === undefined) delete process.env[key];
+    else process.env[key] = prior;
+  }
 }

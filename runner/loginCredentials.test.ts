@@ -65,12 +65,12 @@ test('applyLoginCredentials publishes SW_CRED_<ROLE>; clearLoginCredentials remo
   try {
     process.env.B2C_TEST_USER = 'alice@test';
     process.env.B2C_TEST_PASS = 'hunter2';
-    const keys = applyLoginCredentials({ username: 'B2C_TEST_USER', password: 'B2C_TEST_PASS' });
-    assert.deepEqual(keys.sort(), ['SW_CRED_PASSWORD', 'SW_CRED_USERNAME']);
+    const handles = applyLoginCredentials({ username: 'B2C_TEST_USER', password: 'B2C_TEST_PASS' });
+    assert.deepEqual(handles.map((h) => h.key).sort(), ['SW_CRED_PASSWORD', 'SW_CRED_USERNAME']);
     assert.equal(process.env.SW_CRED_USERNAME, 'alice@test');
     assert.equal(process.env.SW_CRED_PASSWORD, 'hunter2');
     // ★ cleared → a resolved secret never lingers in process.env past the run
-    clearLoginCredentials(keys);
+    clearLoginCredentials(handles);
     assert.equal(process.env.SW_CRED_USERNAME, undefined);
     assert.equal(process.env.SW_CRED_PASSWORD, undefined);
   } finally {
@@ -80,6 +80,20 @@ test('applyLoginCredentials publishes SW_CRED_<ROLE>; clearLoginCredentials remo
 
 test('applyLoginCredentials: no refs -> sets nothing, returns []', () => {
   assert.deepEqual(applyLoginCredentials(null), []);
+});
+
+test('clearLoginCredentials RESTORES a pre-existing SW_CRED_ value (not a blind delete)', () => {
+  const saved = snapshot();
+  try {
+    process.env.B2C_TEST_USER = 'alice@test';
+    process.env.SW_CRED_USERNAME = 'preexisting'; // reserved-namespace collision (documented off-limits)
+    const handles = applyLoginCredentials({ username: 'B2C_TEST_USER' });
+    assert.equal(process.env.SW_CRED_USERNAME, 'alice@test'); // overwritten for the run
+    clearLoginCredentials(handles);
+    assert.equal(process.env.SW_CRED_USERNAME, 'preexisting'); // ★ restored, not deleted
+  } finally {
+    restoreEnv(saved);
+  }
 });
 
 // The spec-facing accessor: reads the published value, fail-CLOSED on an undeclared/unresolved role.
