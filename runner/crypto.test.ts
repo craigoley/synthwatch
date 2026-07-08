@@ -11,6 +11,7 @@ const KAT = {
   keyB64: 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=', // 32 bytes: 0x00..0x1f
   ivB64: 'AAECAwQFBgcICQoL', // 12 bytes: 0x00..0x0b
   plaintext: 'correct horse battery staple',
+  // nosemgrep: generic.secrets.security.detected-telegram-bot-api-key.detected-telegram-bot-api-key -- NOT a secret: this is the AES-GCM known-answer envelope ("v1:"+base64) for an all-public test key (0x00..0x1f); the "prefix:base64" shape trips the telegram-key regex.
   stored: 'v1:AAECAwQFBgcICQoLJG2kaaCGtjvlLuX41MkaDPei4kaJWywIWReJ4O6At8GgxQlkvg7OPAnd3D8=',
 };
 const KEY = Buffer.from(KAT.keyB64, 'base64');
@@ -62,6 +63,9 @@ test('loadCredEncKey: absent / bad-length → throws; NAME only, never the value
   assert.throws(() => loadCredEncKey({ CRED_ENC_KEY: '' }), /CRED_ENC_KEY is not set/);
   assert.throws(() => loadCredEncKey({}), /CRED_ENC_KEY is not set/);
   assert.throws(() => loadCredEncKey({ CRED_ENC_KEY: Buffer.alloc(16).toString('base64') }), /must decode to 32 bytes/);
+  // ★ strict base64: a string Node would LENIENTLY accept but .NET rejects is refused here (cross-repo parity).
+  // "…!…" is non-base64; Node's Buffer.from would silently drop it, .NET throws — so we reject up front.
+  assert.throws(() => loadCredEncKey({ CRED_ENC_KEY: 'AAECAwQFBgcICQoLDA0OD!AREhMUFRYXGBkaGxwdHh8=' }), /not valid base64/);
   // a valid 32-byte key loads
   assert.equal(loadCredEncKey({ CRED_ENC_KEY: KAT.keyB64 }).length, 32);
   // the error text never contains the (bad) key value

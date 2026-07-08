@@ -28,12 +28,14 @@ export function loadCredEncKey(env: NodeJS.ProcessEnv = process.env): Buffer {
   if (!raw || raw.length === 0) {
     throw new Error('CRED_ENC_KEY is not set — cannot encrypt/decrypt credential values (fail-closed)');
   }
-  let key: Buffer;
-  try {
-    key = Buffer.from(raw, 'base64');
-  } catch {
+  // STRICT base64 validation BEFORE decode. Node's Buffer.from(…, 'base64') is lenient (silently drops
+  // invalid chars / stops at bad padding), so a malformed key that happens to decode to 32 bytes would be
+  // ACCEPTED here but REJECTED by .NET's strict Convert.FromBase64String — a cross-repo divergence. Reject
+  // anything that isn't canonical base64 (length %4, valid alphabet, ≤2 '=' pad) so both sides agree.
+  if (raw.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(raw)) {
     throw new Error('CRED_ENC_KEY is not valid base64 (fail-closed)');
   }
+  const key = Buffer.from(raw, 'base64');
   if (key.length !== KEY_LEN) {
     throw new Error(`CRED_ENC_KEY must decode to ${KEY_LEN} bytes (AES-256); got ${key.length} (fail-closed)`);
   }
@@ -47,7 +49,7 @@ export function loadCredEncKey(env: NodeJS.ProcessEnv = process.env): Buffer {
 export function encryptCredValue(plaintext: string, key: Buffer, ivOverride?: Buffer): string {
   const iv = ivOverride ?? randomBytes(IV_LEN);
   if (iv.length !== IV_LEN) throw new Error(`IV must be ${IV_LEN} bytes`);
-  const cipher = createCipheriv('aes-256-gcm', key, iv);
+  const cipher = createCipheriv('aes-256-gcm', key, iv, { authTagLength: TAG_LEN });
   const ct = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
   const tag = cipher.getAuthTag(); // 16 bytes
   return `${CRED_CRYPTO_VERSION}:${Buffer.concat([iv, ct, tag]).toString('base64')}`;
@@ -73,7 +75,8 @@ export function decryptCredValue(stored: string, key: Buffer): string {
   const iv = buf.subarray(0, IV_LEN);
   const tag = buf.subarray(buf.length - TAG_LEN);
   const ct = buf.subarray(IV_LEN, buf.length - TAG_LEN);
-  const decipher = createDecipheriv('aes-256-gcm', key, iv);
+  // authTagLength pins the expected tag to 16 bytes — reject a truncated tag (GCM forgery hardening).
+  const decipher = createDecipheriv('aes-256-gcm', key, iv, { authTagLength: TAG_LEN });
   decipher.setAuthTag(tag);
   // .final() throws if the tag doesn't verify — authenticated encryption catches tamper / wrong key.
   return Buffer.concat([decipher.update(ct), decipher.final()]).toString('utf8');
