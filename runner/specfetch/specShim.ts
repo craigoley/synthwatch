@@ -71,6 +71,26 @@ export function specToFlow(fn: (args: { page: Page }) => Promise<void>, page: Pa
   return (rec) => recorderStore.run(rec, () => fn({ page }));
 }
 
+/**
+ * Per-monitor LOGIN CREDENTIAL accessor. A spec reads `credential('username')` instead of hardcoding an
+ * env-var name; the runner resolves the monitor's declared { role -> ENV_VAR_NAME } and publishes the value
+ * as process.env[SW_CRED_<ROLE>] for the life of this run (cleared after — see runner/loginCredentials.ts).
+ * Fail-CLOSED: an undeclared/unresolved role throws, so a mis-wired login monitor fails loudly instead of
+ * submitting an empty credential. IN THE PARITY-HASHED BLOCK on purpose — a security-relevant, spec-reachable
+ * accessor whose authoring (here) and runtime (specShim) copies must never silently drift. The env-var format
+ * `SW_CRED_<ROLE>` must stay in lockstep with runner/loginCredentials.ts credentialEnvKey.
+ */
+export function credential(role: string): string {
+  const value = process.env[`SW_CRED_${role.toUpperCase()}`];
+  if (value === undefined || value.length === 0) {
+    throw new Error(
+      `credential("${role}") is not available — the monitor must declare login_credentials.${role} ` +
+        `(role -> ENV_VAR_NAME) and that env var must be set on the runner`,
+    );
+  }
+  return value;
+}
+
 // ---------------------------------------------------------------------------
 // expect() — the mini-matcher shim. lib/flow re-exports the REAL @playwright/test expect (all matchers)
 // for local `playwright test`; this is the RUNTIME stand-in the runner substitutes. They can't be
@@ -185,7 +205,7 @@ export function expect(target: unknown, message?: string): SpecExpect {
 // hashes lib/flow.ts's SHARED block and compares it to LIBFLOW-VENDOR-SHA below. When lib/flow.ts's
 // shared helpers change, that check FAILS until you mirror the change into the functions below AND
 // update this sha to the value the check prints. (Single-source refactor — option b — is a follow-up.)
-// LIBFLOW-VENDOR-SHA: c28d4f84d56d329ae91e5ee0f204251855b55bc23ff6a9ac1400a59b4463a539
+// LIBFLOW-VENDOR-SHA: c915affc731a26fb30d561c47a3426894a2bb6a5835318dbc0fbe6603b7b6824
 // ---------------------------------------------------------------------------
 export async function assertLoaded(
   page: Page,
