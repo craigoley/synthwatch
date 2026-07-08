@@ -61,6 +61,7 @@ readonly B2C_USER_SECRET_REF='b2c-test-user'         # B2C_TEST_USER secretRef �
 readonly B2C_PASS_SECRET_REF='b2c-test-pass'         # B2C_TEST_PASS secretRef
 readonly CRED_ENC_KEY_SECRET_REF='cred-enc-key'      # CRED_ENC_KEY secretRef — model-B value crypto (runner decrypt)
 readonly API_HEALTH_URL='https://synthwatch-api.azurewebsites.net/api/checks'
+readonly API_CRED_FP_URL='https://synthwatch-api.azurewebsites.net/api/cred-key/fingerprint'  # model-B key drift-check
 
 # The runner-image jobs (RUNNER_JOB, CENTRALUS_RUNNER_JOB, WESTUS2_RUNNER_JOB, NARRATIVE_JOB, ROLLUP_JOB,
 # RECONCILE_JOB) + the RUNNER_IMAGE_JOBS array now live in scripts/lib/deploy-lib.sh — the SINGLE SOURCE OF
@@ -630,6 +631,21 @@ verify() {
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "${API_HEALTH_URL}" 2>/dev/null || true)"
   [[ "${code}" == "200" ]] && ok=1 || ok=0
   check "${ok}" "API ${API_HEALTH_URL} -> '${code}' (expect 200)"
+
+  # ★ CRED_ENC_KEY DRIFT-CHECK (model-B single-source safety net). The runner secret was set from
+  # ~/.synthwatch.env's CRED_ENC_KEY (the create step above); the API must hold the SAME key or the runner
+  # can't decrypt api-written ciphertext (silent prod failure). Compare the NON-SECRET fingerprint each side
+  # derives — sha256("CRED_ENC_KEY_FP_v1:"+key), first 16 hex (CredCrypto.Fingerprint ↔ this bash). A
+  # mismatch (or the api 503'ing = no/invalid key) fails the deploy. Only the 16-hex fingerprint is printed,
+  # NEVER the key.
+  local fp_local fp_api
+  fp_local="$(printf 'CRED_ENC_KEY_FP_v1:%s' "${CRED_ENC_KEY:-}" | openssl dgst -sha256 -hex | awk '{print $NF}' | cut -c1-16)"
+  fp_api="$(curl -s --max-time 15 "${API_CRED_FP_URL}" 2>/dev/null | jq -r '.fingerprint // empty' 2>/dev/null || true)"
+  if [[ -n "${fp_api}" && "${fp_local}" == "${fp_api}" ]]; then
+    pass "CRED_ENC_KEY matches API (fingerprint ${fp_local}) — runner can decrypt api ciphertext"
+  else
+    flunk "CRED_ENC_KEY DRIFT: runner fp=${fp_local} != api fp='${fp_api:-<none / api 503: key absent>}' — the runner CANNOT decrypt api-written credentials. Re-deploy the API with credEncKey=\"\$CRED_ENC_KEY\" from ~/.synthwatch.env (synthwatch-api/scripts/deploy.sh)."
+  fi
 
   # ★ BUG 3: if the deploy shipped migration(s), CONFIRM each is recorded in
   # schema_migrations (the migrate job ran them). This is what turns "migrate job exited 0"
