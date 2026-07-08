@@ -11,8 +11,9 @@ const KAT = {
   keyB64: 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=', // 32 bytes: 0x00..0x1f
   ivB64: 'AAECAwQFBgcICQoL', // 12 bytes: 0x00..0x0b
   plaintext: 'correct horse battery staple',
-  // nosemgrep: generic.secrets.security.detected-telegram-bot-api-key.detected-telegram-bot-api-key -- NOT a secret: this is the AES-GCM known-answer envelope ("v1:"+base64) for an all-public test key (0x00..0x1f); the "prefix:base64" shape trips the telegram-key regex.
-  stored: 'v1:AAECAwQFBgcICQoLJG2kaaCGtjvlLuX41MkaDPei4kaJWywIWReJ4O6At8GgxQlkvg7OPAnd3D8=',
+  // NOT a secret — the AES-GCM known-answer envelope ("v1:"+base64) for an ALL-PUBLIC test key (0x00..0x1f);
+  // the "prefix:base64" shape trips the telegram-key regex. Suppression must be on the finding's OWN line:
+  stored: 'v1:AAECAwQFBgcICQoLJG2kaaCGtjvlLuX41MkaDPei4kaJWywIWReJ4O6At8GgxQlkvg7OPAnd3D8=', // nosemgrep: generic.secrets.security.detected-telegram-bot-api-key.detected-telegram-bot-api-key
 };
 const KEY = Buffer.from(KAT.keyB64, 'base64');
 const IV = Buffer.from(KAT.ivB64, 'base64');
