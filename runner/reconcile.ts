@@ -41,6 +41,10 @@ export interface Monitor {
   // reused prod spec at its own `target` (the preview env). Omitted => prod check, no rewrite.
   environment?: 'prod' | 'staging' | 'dev';
   rewrite_from_origin?: string;
+  // Recon #55 gap A: the browser red-test route-block pattern (the request glob the red-test aborts).
+  // Manifest-declared + scoped-synced (redtestAnchorUpdates) — NOT Git-authoritative / not in the apply
+  // plan tuple, so it can't shift the #216-fragile positional materialize. Omitted => no anchor.
+  redtest_anchor?: string;
 }
 
 export interface Manifest {
@@ -63,6 +67,8 @@ export interface ManagedCheck {
   // Pre-prod-arc S3 (0059/0060): read so drift on the environment label / rewrite origin is detectable.
   environment: string;
   rewrite_from_origin: string | null;
+  // Recon #55 gap A (0063): read so the scoped redtest_anchor sync can detect divergence from the manifest.
+  redtest_anchor: string | null;
 }
 
 // 'redaction_mismatch' (0049): a sensitive/redact_patterns divergence — kept SEPARATE from generic
@@ -239,6 +245,11 @@ export function validateManifest(raw: unknown): Manifest {
         throw new Error(`${where}.rewrite_from_origin set but no target to rewrite TO — declare target (the pre-prod origin).`);
       }
     }
+    // Recon #55 gap A: the browser red-test route-block pattern (a non-empty request glob). Free-form
+    // (validated as a route pattern at red-test time), so parse-time we only assert it's a non-empty string.
+    if (e.redtest_anchor !== undefined && (typeof e.redtest_anchor !== 'string' || e.redtest_anchor.length === 0)) {
+      throw new Error(`${where}.redtest_anchor invalid (non-empty string)`);
+    }
 
     return {
       id: e.id,
@@ -254,6 +265,7 @@ export function validateManifest(raw: unknown): Manifest {
       redact_patterns: e.redact_patterns as string[] | undefined,
       environment: e.environment as 'prod' | 'staging' | 'dev' | undefined,
       rewrite_from_origin: e.rewrite_from_origin as string | undefined,
+      redtest_anchor: e.redtest_anchor as string | undefined,
     };
   });
 
@@ -608,6 +620,33 @@ export function b10FieldUpdates(monitors: Monitor[], managed: ManagedCheck[]): B
     });
   }
   return { updates, blockedStrips };
+}
+
+/** One scoped redtest_anchor sync (recon #55 gap A). Written by a targeted UPDATE, not the apply plan. */
+export interface RedtestAnchorUpdate {
+  source_key: string;
+  redtest_anchor: string | null;
+}
+
+/**
+ * ★ SCOPED SYNC (recon #55 gap A) — MIRRORS b10FieldUpdates: for each managed check whose live
+ * redtest_anchor diverges from the manifest, emit a targeted update. reconcileMain runs these as
+ * `UPDATE checks SET redtest_anchor = $2 WHERE source_key = $1` — DELIBERATELY OUTSIDE the field-split
+ * apply plan. redtest_anchor is NOT in GIT_AUTHORITATIVE_COLUMNS / buildApplyUpsert, so it never enters
+ * the positional materialize tuple (the #216 desync class) and it syncs even while the apply stays gated.
+ * Only touches checks that already exist (a NEW check's materialize is the separate, gated concern).
+ */
+export function redtestAnchorUpdates(monitors: Monitor[], managed: ManagedCheck[]): RedtestAnchorUpdate[] {
+  const byKey = new Map(managed.map((c) => [c.source_key, c]));
+  const updates: RedtestAnchorUpdate[] = [];
+  for (const m of monitors) {
+    const existing = byKey.get(m.id);
+    if (!existing) continue;
+    const want = m.redtest_anchor ?? null;
+    if ((existing.redtest_anchor ?? null) === want) continue; // already in sync
+    updates.push({ source_key: m.id, redtest_anchor: want });
+  }
+  return updates;
 }
 
 // ---------------------------------------------------------------------------

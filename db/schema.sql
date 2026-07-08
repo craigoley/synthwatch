@@ -43,6 +43,10 @@ CREATE TABLE checks (
     request_headers    JSONB,
     request_body       TEXT,
     auth               JSONB,
+    -- Per-monitor SECRET request headers (mirrors 0061). References-only: { headerName -> ENV_VAR_NAME };
+    -- the runner resolves process.env[ENV_VAR_NAME] at request time (secretHeaders.ts). Value is never
+    -- persisted/logged/DTO'd/traced (audit #219). Like `auth`, it stores a reference, never a credential.
+    secret_headers     JSONB,
 
     -- Per-kind config for dns/tcp/ping checks (mirrors 0011_network_checks.sql).
     -- dns: {recordType, expectedValue}; tcp/ping: {port}. Host is from target_url.
@@ -167,6 +171,12 @@ CREATE TABLE checks (
     -- the runner rewrites requests whose origin == this to the check's OWN target_url origin (the preview
     -- env), so a pre-prod check reuses a prod spec WITHOUT editing it. NULL = no rewrite (S2 inert).
     rewrite_from_origin TEXT,
+
+    -- Browser red-test route-block pattern (mirrors 0063_checks_redtest_anchor.sql, recon #55 gap A). The
+    -- request glob the browser red-test aborts to prove the monitor goes RED. NULL = no browser red-test
+    -- anchor. Manifest-declared + SCOPED-SYNCED (like sensitive/redact) — deliberately NOT in the positional
+    -- reconcile-apply plan tuple (avoids the #216 materialize desync).
+    redtest_anchor     TEXT,
 
     -- A browser check is meaningless without a flow to run.
     CONSTRAINT browser_needs_flow

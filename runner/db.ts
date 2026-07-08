@@ -88,6 +88,10 @@ export interface Check {
   // legacy expected_status/body_must_contain. auth is a secret reference.
   assertions: Assertion[];
   request_headers: Record<string, string> | null;
+  // Per-monitor SECRET request headers (0061), references-only: { headerName -> ENV_VAR_NAME }. The
+  // runner resolves process.env[ENV_VAR_NAME] at request time (secretHeaders.ts); the value is never
+  // stored/logged/exposed. Mirrors `auth`'s *_env model. null = none.
+  secret_headers: Record<string, string> | null;
   request_body: string | null;
   auth: AuthConfig | null;
   // Per-kind config for dns/tcp/ping checks (host comes from target_url).
@@ -152,6 +156,9 @@ export interface Check {
   // S2 host-rewrite FROM origin (0060). When non-null, executeBrowser re-points requests from this
   // origin to the check's target_url origin (the preview env). null => no rewrite (S2 inert).
   rewrite_from_origin: string | null;
+  // Browser red-test route-block pattern (0063, recon #55 gap A). The request glob the browser red-test
+  // aborts to prove the monitor reds. Read by the red-test harness; null => no browser red-test anchor.
+  redtest_anchor: string | null;
 }
 
 /** A row from the `runs` table after we've finished executing a check. */

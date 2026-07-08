@@ -13,8 +13,9 @@ import {
   type Assertion,
   type ResponseFacets,
 } from './assertions.js';
-import { noteDeployMarker } from './deploys.js';
+import { noteDeployMarker, hostOf } from './deploys.js';
 import { bypassHeaderFor } from './vercelBypass.js';
+import { resolveSecretHeaders } from './secretHeaders.js';
 
 export interface HttpResult {
   // 'pass'  = all assertions met.
@@ -83,6 +84,14 @@ export async function runHttpCheck(check: Check): Promise<HttpResult> {
       return { verdict: 'error', httpStatus: null, durationMs: Date.now() - start, error: auth.error };
     }
     if (auth.header) headers.set(auth.header[0], auth.header[1]);
+
+    // Per-monitor SECRET headers (references-only): resolve process.env[ENV_VAR] per ref and set on the
+    // request. A single fetch to target_url, so it's inherently first-party (host-scoped by construction).
+    for (const [h, v] of Object.entries(
+      resolveSecretHeaders(check.secret_headers, check.target_url, hostOf(check.target_url)),
+    )) {
+      headers.set(h, v);
+    }
 
     // Vercel Deployment Protection: add the bypass token ONLY when target_url is a protected host AND the
     // fleet secret is set (host-scoped + fail-soft — see vercelBypass.ts). A single fetch to target_url, so
