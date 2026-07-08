@@ -88,6 +88,10 @@ export interface Check {
   // legacy expected_status/body_must_contain. auth is a secret reference.
   assertions: Assertion[];
   request_headers: Record<string, string> | null;
+  // Per-monitor SECRET request headers (0061), references-only: { headerName -> ENV_VAR_NAME }. The
+  // runner resolves process.env[ENV_VAR_NAME] at request time (secretHeaders.ts); the value is never
+  // stored/logged/exposed. Mirrors `auth`'s *_env model. null = none.
+  secret_headers: Record<string, string> | null;
   request_body: string | null;
   auth: AuthConfig | null;
   // Per-kind config for dns/tcp/ping checks (host comes from target_url).

@@ -43,6 +43,10 @@ CREATE TABLE checks (
     request_headers    JSONB,
     request_body       TEXT,
     auth               JSONB,
+    -- Per-monitor SECRET request headers (mirrors 0061). References-only: { headerName -> ENV_VAR_NAME };
+    -- the runner resolves process.env[ENV_VAR_NAME] at request time (secretHeaders.ts). Value is never
+    -- persisted/logged/DTO'd/traced (audit #219). Like `auth`, it stores a reference, never a credential.
+    secret_headers     JSONB,
 
     -- Per-kind config for dns/tcp/ping checks (mirrors 0011_network_checks.sql).
     -- dns: {recordType, expectedValue}; tcp/ping: {port}. Host is from target_url.
