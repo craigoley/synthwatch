@@ -85,6 +85,10 @@ param b2cTestUser string = ''
 @secure()
 param b2cTestPass string = ''
 
+@description('Model-B credential-value encryption key (env CRED_ENC_KEY) — base64 of 32 random bytes (AES-256). The api ENCRYPTS secret_headers/login_credentials values before store; the runner DECRYPTS them at run time (runner/crypto.ts ↔ synthwatch-api CredCrypto.cs). Secret — supplied at deploy from ~/.synthwatch.env, EXACTLY like b2cTestUser (deploy.sh passes it inline; a redeploy re-asserts it → never dropped). Default \'\' → the runner fail-CLOSES on decrypt (login monitors go red) until set. ★ Craig MUST set a real key in ~/.synthwatch.env BEFORE deploy. NEVER commit a value.')
+@secure()
+param credEncKey string = ''
+
 @description('Log Analytics workspace name (live stack uses the -e2 name).')
 param logAnalyticsName string = 'synthwatch-logs-e2'
 
@@ -517,6 +521,13 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
           name: 'b2c-test-pass'
           value: b2cTestPass
         }
+        {
+          // Model-B credential encryption key (CRED_ENC_KEY). Bicep-owned (value from the @secure param →
+          // re-asserted every deploy from ~/.synthwatch.env). '' when unset → the runner fail-CLOSES on
+          // decrypt. Craig supplies a real base64(32-byte) key in ~/.synthwatch.env; NEVER committed.
+          name: 'cred-enc-key'
+          value: credEncKey
+        }
       ]
     }
     template: {
@@ -623,6 +634,12 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
               name: 'B2C_TEST_PASS'
               secretRef: 'b2c-test-pass'
             }
+            {
+              // Model-B credential encryption key → process.env for runner/crypto.ts decrypt-on-read.
+              // From the bicep-owned secret above (preserved across redeploys); unset/'' → decrypt fail-closes.
+              name: 'CRED_ENC_KEY'
+              secretRef: 'cred-enc-key'
+            }
             // STILL out-of-band (NOT owned here) — a redeploy will NOT restore them:
             // the webhook channel (ALERT_WEBHOOK_URL[/_AUTH_HEADER]) + DASHBOARD_URL + OTel
             // (OTEL_EXPORTER_OTLP_*). Unset => those channels don't deliver. (ACS_EMAIL_CONNECTION_STRING
@@ -719,6 +736,13 @@ resource centralusJob 'Microsoft.App/jobs@2024-03-01' = {
           name: 'b2c-test-pass'
           value: b2cTestPass
         }
+        {
+          // Model-B credential encryption key (CRED_ENC_KEY). Bicep-owned (value from the @secure param →
+          // re-asserted every deploy from ~/.synthwatch.env). '' when unset → the runner fail-CLOSES on
+          // decrypt. Craig supplies a real base64(32-byte) key in ~/.synthwatch.env; NEVER committed.
+          name: 'cred-enc-key'
+          value: credEncKey
+        }
       ]
     }
     template: {
@@ -811,6 +835,12 @@ resource centralusJob 'Microsoft.App/jobs@2024-03-01' = {
               name: 'B2C_TEST_PASS'
               secretRef: 'b2c-test-pass'
             }
+            {
+              // Model-B credential encryption key → process.env for runner/crypto.ts decrypt-on-read.
+              // From the bicep-owned secret above (preserved across redeploys); unset/'' → decrypt fail-closes.
+              name: 'CRED_ENC_KEY'
+              secretRef: 'cred-enc-key'
+            }
           ]
         }
       ]
@@ -902,6 +932,13 @@ resource westus2Job 'Microsoft.App/jobs@2024-03-01' = {
           name: 'b2c-test-pass'
           value: b2cTestPass
         }
+        {
+          // Model-B credential encryption key (CRED_ENC_KEY). Bicep-owned (value from the @secure param →
+          // re-asserted every deploy from ~/.synthwatch.env). '' when unset → the runner fail-CLOSES on
+          // decrypt. Craig supplies a real base64(32-byte) key in ~/.synthwatch.env; NEVER committed.
+          name: 'cred-enc-key'
+          value: credEncKey
+        }
       ]
     }
     template: {
@@ -987,6 +1024,12 @@ resource westus2Job 'Microsoft.App/jobs@2024-03-01' = {
             {
               name: 'B2C_TEST_PASS'
               secretRef: 'b2c-test-pass'
+            }
+            {
+              // Model-B credential encryption key → process.env for runner/crypto.ts decrypt-on-read.
+              // From the bicep-owned secret above (preserved across redeploys); unset/'' → decrypt fail-closes.
+              name: 'CRED_ENC_KEY'
+              secretRef: 'cred-enc-key'
             }
           ]
         }
