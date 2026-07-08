@@ -27,6 +27,7 @@ import type { Flow } from '../checks/index.js';
 // Runtime import (a value): the SAME class the runner classifies on. isExpectationError also
 // matches by `.name`, so classification survives the esbuild bundle boundary regardless.
 import { ExpectationError } from '../errors.js';
+import { credentialEnvKey } from '../loginCredentials.js';
 
 // ---------------------------------------------------------------------------
 // test() — capture registry. Shared because the compiled spec imports THIS module
@@ -69,6 +70,28 @@ export async function step<T>(name: string, body: () => Promise<T>): Promise<T> 
  */
 export function specToFlow(fn: (args: { page: Page }) => Promise<void>, page: Page): Flow {
   return (rec) => recorderStore.run(rec, () => fn({ page }));
+}
+
+/**
+ * Per-monitor LOGIN CREDENTIAL accessor for specs (references-only model — runner/loginCredentials.ts).
+ * A spec reads `credential('username')` instead of hardcoding an env-var name; the runner has already
+ * resolved the monitor's declared { role -> ENV_VAR_NAME } and PUBLISHED the value as process.env[SW_CRED_
+ * <ROLE>] for the duration of this run (applyLoginCredentials → cleared in the executeBrowser finally).
+ *
+ * Fail-CLOSED: an undeclared/unresolved role throws (like the old requireSecret) so a mis-declared login
+ * monitor fails loudly rather than silently submitting an empty credential. The NAME is safe to surface;
+ * the value is never logged. This export is OUTSIDE the lib/flow↔specShim parity-hashed block (it's a thin
+ * env read, identical to the authoring lib/flow copy), so it adds no LIBFLOW-VENDOR-SHA churn.
+ */
+export function credential(role: string): string {
+  const value = process.env[credentialEnvKey(role)];
+  if (value === undefined || value.length === 0) {
+    throw new Error(
+      `credential("${role}") is not available — the monitor must declare login_credentials.${role} ` +
+        `(role -> ENV_VAR_NAME) and that env var must be set on the runner`,
+    );
+  }
+  return value;
 }
 
 // ---------------------------------------------------------------------------

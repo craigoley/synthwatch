@@ -19,6 +19,7 @@ import { noteDeployMarker, hostOf } from './deploys.js';
 import { captureMainDocHeaders } from './browserMarker.js';
 import { browserHeaderAdditions } from './vercelBypass.js';
 import { resolveSecretHeaders } from './secretHeaders.js';
+import { applyLoginCredentials, clearLoginCredentials } from './loginCredentials.js';
 import { runSslCheck } from './sslCheck.js';
 import { runDnsCheck, runTcpCheck, runPingCheck } from './netChecks.js';
 import { runMultistepChain } from './multistep.js';
@@ -1000,8 +1001,14 @@ async function executeBrowser(
   let tracePath: string | null = null;
   let failed = false;
   let baselineScreenshot: Buffer | null = null;
+  // Per-monitor login credentials (0067): resolve the declared { role -> ENV_VAR } refs and PUBLISH them as
+  // process.env[SW_CRED_<ROLE>] so the spec's credential(role) can read them. Set for the life of THIS run
+  // only and cleared in the finally — so a resolved secret can't linger or bleed across the tick's other
+  // (serially-run) checks. No-op ([]) for a monitor with no login_credentials. Never logged.
+  let credKeys: string[] = [];
 
   try {
+    credKeys = applyLoginCredentials(check.login_credentials);
     // B10: pass the monitor's REDACTOR so a sensitive monitor's per-step error_message is SCRUBBED (values
     // gone, diagnostic kept) in run_steps — not blanket-replaced. Non-sensitive → identity (unchanged).
     const stepRedact = check.sensitive ? makeRedactor(check.redact_patterns) : IDENTITY_REDACTOR;
@@ -1050,6 +1057,9 @@ async function executeBrowser(
       screenshot = await page.screenshot().catch(() => null);
     }
   } finally {
+    // ★ Clear the per-run login credentials (0067) FIRST — before any teardown — so a resolved secret never
+    // outlives the run in process.env, even if tracing-stop/metrics below throw. No-op when none were set.
+    clearLoginCredentials(credKeys);
     // Stop tracing BEFORE closing the context. Write the trace.zip to a temp file (which runOne
     // uploads — to the per-run key on failure, or the per-monitor baseline key on success) when we
     // want to keep it: ALWAYS on failure, and on a pass only when captureSuccessTrace says the

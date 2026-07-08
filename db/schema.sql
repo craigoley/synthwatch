@@ -47,6 +47,12 @@ CREATE TABLE checks (
     -- the runner resolves process.env[ENV_VAR_NAME] at request time (secretHeaders.ts). Value is never
     -- persisted/logged/DTO'd/traced (audit #219). Like `auth`, it stores a reference, never a credential.
     secret_headers     JSONB,
+    -- Per-monitor LOGIN CREDENTIALS (mirrors 0067). References-only: { credentialRole -> ENV_VAR_NAME }
+    -- (e.g. { username -> B2C_TEST_USER, password -> B2C_TEST_PASS }); the runner resolves
+    -- process.env[ENV_VAR_NAME] at run time and exposes it to the browser spec as credential(role)
+    -- (loginCredentials.ts). Value is never persisted/logged/traced; the api DTO maps only the REFERENCE
+    -- names, never the value (audit #219). Like `secret_headers`/`auth`, stores a reference, not a credential.
+    login_credentials  JSONB,
 
     -- Per-kind config for dns/tcp/ping checks (mirrors 0011_network_checks.sql).
     -- dns: {recordType, expectedValue}; tcp/ping: {port}. Host is from target_url.
