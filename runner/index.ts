@@ -18,7 +18,7 @@ import { runHttpCheck } from './httpCheck.js';
 import { noteDeployMarker, hostOf } from './deploys.js';
 import { captureMainDocHeaders } from './browserMarker.js';
 import { browserHeaderAdditions } from './vercelBypass.js';
-import { resolveSecretHeaders } from './secretHeaders.js';
+import { decryptSecretHeaders, firstPartyHeaders } from './secretHeaders.js';
 import {
   applyLoginCredentials,
   clearLoginCredentials,
@@ -950,12 +950,14 @@ async function executeBrowser(
   const customHeaders = check.request_headers ?? {};
   // Per-monitor SECRET headers (references-only): resolved per request, host-scoped to the check's target
   // host so a secret credential never sprays to a third-party subresource (anti-leak, like the bypass token).
-  const secretRefs = check.secret_headers;
+  // DECRYPT the secret headers ONCE up front (model B) — fail-closed on a bad key/leaf BEFORE routing, so a
+  // decrypt error surfaces as a clean run error (never a throw inside the route handler). Empty when none.
+  const secretHeaderValues = decryptSecretHeaders(check.secret_headers);
   const targetHost = hostOf(check.target_url);
   await context.route('**/*', async (route) => {
     const reqUrl = route.request().url();
     const additions = browserHeaderAdditions(reqUrl, customHeaders);
-    const secretAdds = resolveSecretHeaders(secretRefs, reqUrl, targetHost); // host-scoped; resolved values
+    const secretAdds = firstPartyHeaders(secretHeaderValues, reqUrl, targetHost); // host-scoped (no decrypt here)
     const hasSecret = Object.keys(secretAdds).length > 0;
     // S2: re-point the primary origin (host+port) when a rewrite is compiled; null (inert) otherwise.
     // Third-party origins never match → resolveRewrite returns null → they pass through untouched.

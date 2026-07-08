@@ -43,15 +43,16 @@ CREATE TABLE checks (
     request_headers    JSONB,
     request_body       TEXT,
     auth               JSONB,
-    -- Per-monitor SECRET request headers (mirrors 0061). References-only: { headerName -> ENV_VAR_NAME };
-    -- the runner resolves process.env[ENV_VAR_NAME] at request time (secretHeaders.ts). Value is never
-    -- persisted/logged/DTO'd/traced (audit #219). Like `auth`, it stores a reference, never a credential.
+    -- Per-monitor SECRET request headers — model B (0068): ENCRYPTED VALUES. { headerName -> CIPHERTEXT
+    -- ("v1:…", CredCrypto v1) }. The api ENCRYPTS on write (editor-gated); the runner DECRYPTS once per run
+    -- (secretHeaders.ts) and injects the plaintext per FIRST-PARTY request. WRITE-ONLY: the read DTO returns
+    -- masked, never plaintext OR ciphertext. Value never logged/traced (audit #219). Fail-CLOSED on decrypt.
     secret_headers     JSONB,
-    -- Per-monitor LOGIN CREDENTIALS (mirrors 0067). References-only: { credentialRole -> ENV_VAR_NAME }
-    -- (e.g. { username -> B2C_TEST_USER, password -> B2C_TEST_PASS }); the runner resolves
-    -- process.env[ENV_VAR_NAME] at run time and exposes it to the browser spec as credential(role)
-    -- (loginCredentials.ts). Value is never persisted/logged/traced; the api DTO maps only the REFERENCE
-    -- names, never the value (audit #219). Like `secret_headers`/`auth`, stores a reference, not a credential.
+    -- Per-monitor LOGIN CREDENTIALS — model B (0068): ENCRYPTED VALUES. { credentialRole -> CIPHERTEXT }
+    -- (e.g. { username -> 'v1:…', password -> 'v1:…' }). The api ENCRYPTS on write; the runner DECRYPTS at
+    -- run time (loginCredentials.ts) → the SW_CRED_<ROLE> one-run publish → credential(role) in the spec.
+    -- WRITE-ONLY read DTO (masked). Value never logged/traced; a registered redact rule scrubs any text leak.
+    -- Fail-CLOSED on decrypt (a legacy env-var-ref-name is NOT "v1:" ciphertext → run errors until re-seeded).
     login_credentials  JSONB,
 
     -- Per-kind config for dns/tcp/ping checks (mirrors 0011_network_checks.sql).

@@ -13,9 +13,9 @@ import {
   type Assertion,
   type ResponseFacets,
 } from './assertions.js';
-import { noteDeployMarker, hostOf } from './deploys.js';
+import { noteDeployMarker } from './deploys.js';
 import { bypassHeaderFor } from './vercelBypass.js';
-import { resolveSecretHeaders } from './secretHeaders.js';
+import { decryptSecretHeaders } from './secretHeaders.js';
 
 export interface HttpResult {
   // 'pass'  = all assertions met.
@@ -85,11 +85,10 @@ export async function runHttpCheck(check: Check): Promise<HttpResult> {
     }
     if (auth.header) headers.set(auth.header[0], auth.header[1]);
 
-    // Per-monitor SECRET headers (references-only): resolve process.env[ENV_VAR] per ref and set on the
-    // request. A single fetch to target_url, so it's inherently first-party (host-scoped by construction).
-    for (const [h, v] of Object.entries(
-      resolveSecretHeaders(check.secret_headers, check.target_url, hostOf(check.target_url)),
-    )) {
+    // Per-monitor SECRET headers (model B): DECRYPT the ciphertext values (fail-closed on a bad key/leaf) and
+    // set them on the request. A single fetch to target_url, so it's inherently first-party (host-scoped by
+    // construction — no per-request filter needed, unlike the browser path's many subresource requests).
+    for (const [h, v] of Object.entries(decryptSecretHeaders(check.secret_headers))) {
       headers.set(h, v);
     }
 
