@@ -15,9 +15,10 @@
 import { chromium, type Browser } from 'playwright';
 import { pool, type Check, type RunRecord, type TerminalStatus } from './db.js';
 import { runHttpCheck } from './httpCheck.js';
-import { noteDeployMarker } from './deploys.js';
+import { noteDeployMarker, hostOf } from './deploys.js';
 import { captureMainDocHeaders } from './browserMarker.js';
 import { browserHeaderAdditions } from './vercelBypass.js';
+import { resolveSecretHeaders } from './secretHeaders.js';
 import { runSslCheck } from './sslCheck.js';
 import { runDnsCheck, runTcpCheck, runPingCheck } from './netChecks.js';
 import { runMultistepChain } from './multistep.js';
@@ -916,18 +917,26 @@ async function executeBrowser(
   // protected properties. route.continue() untouched when there's nothing to add (no interception overhead cost
   // beyond the match).
   const customHeaders = check.request_headers ?? {};
+  // Per-monitor SECRET headers (references-only): resolved per request, host-scoped to the check's target
+  // host so a secret credential never sprays to a third-party subresource (anti-leak, like the bypass token).
+  const secretRefs = check.secret_headers;
+  const targetHost = hostOf(check.target_url);
   await context.route('**/*', async (route) => {
     const reqUrl = route.request().url();
     const additions = browserHeaderAdditions(reqUrl, customHeaders);
+    const secretAdds = resolveSecretHeaders(secretRefs, reqUrl, targetHost); // host-scoped; resolved values
+    const hasSecret = Object.keys(secretAdds).length > 0;
     // S2: re-point the primary origin (host+port) when a rewrite is compiled; null (inert) otherwise.
     // Third-party origins never match → resolveRewrite returns null → they pass through untouched.
     const rewrittenUrl = resolveRewrite(reqUrl, compiledRewrite);
-    if (additions === null && rewrittenUrl === null) {
+    if (additions === null && !hasSecret && rewrittenUrl === null) {
       await route.continue();
       return;
     }
     await route.continue({
-      ...(additions !== null && { headers: { ...route.request().headers(), ...additions } }),
+      ...((additions !== null || hasSecret) && {
+        headers: { ...route.request().headers(), ...(additions ?? {}), ...secretAdds },
+      }),
       ...(rewrittenUrl !== null && { url: rewrittenUrl }),
     });
   });
