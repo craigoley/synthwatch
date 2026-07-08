@@ -433,8 +433,10 @@ async function runOne(check: Check, sandbox = false): Promise<void> {
   // to attach steps to, and the SLA "exclude running" clause has real data. A
   // hard crash before the terminal update is reaped to 'error' (see main()).
   const { rows } = await pool.query<{ id: number }>(
-    `INSERT INTO runs (check_id, started_at, status, location) VALUES ($1, now(), 'running', $2) RETURNING id`,
-    [check.id, LOCATION],
+    // ★ sandbox (0065): stamp the row so a paused-monitor validation run stays distinguishable from a real
+    // run after the monitor is resumed (badge + optional SLO exclusion). Normal runs → false (unchanged).
+    `INSERT INTO runs (check_id, started_at, status, location, sandbox) VALUES ($1, now(), 'running', $2, $3) RETURNING id`,
+    [check.id, LOCATION, sandbox],
   );
   const runId = rows[0].id;
   // Best-effort context for the global handler: a fatal during this run is attributed to (check, run).
