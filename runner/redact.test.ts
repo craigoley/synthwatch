@@ -42,6 +42,30 @@ test('an INVALID declared regex is skipped (non-fatal), the rest still apply', (
   assert.equal(r('a secretword b'), 'a <redacted> b');
 });
 
+// ── #232 defect-2: KNOWN VALUES registered as escaped-literal rules (the bare typed credential) ──────
+test('redactor scrubs a registered known VALUE wherever it appears (bare, not just key=value)', () => {
+  const r = makeRedactor(null, ['hunter2pass', 'alice@test.com']);
+  // bare in an error_message / console line — what the declared session-token patterns MISS
+  assert.equal(r('TimeoutError: expected input to equal hunter2pass'), 'TimeoutError: expected input to equal <redacted>');
+  assert.equal(r('login as alice@test.com failed'), 'login as <redacted> failed');
+});
+
+test('known-value registration escapes regex-special chars (no pattern injection / no crash)', () => {
+  const r = makeRedactor(null, ['a.b*c(d)']); // regex-special value must match literally
+  assert.equal(r('got a.b*c(d) here'), 'got <redacted> here');
+  assert.equal(r('got aXbYcZdZ here'), 'got aXbYcZdZ here'); // NOT treated as a regex
+});
+
+test('known values: empty/short (<3) are skipped so a stray char cannot over-redact', () => {
+  const r = makeRedactor(null, ['', 'ab', 'realvalue']);
+  assert.equal(r('ab realvalue ab'), 'ab <redacted> ab'); // 'ab' (len 2) not registered; 'realvalue' is
+});
+
+test('known values compose with declared patterns + denylist', () => {
+  const r = makeRedactor(['member-\\d+'], ['topsecret']);
+  assert.equal(r('member-7 typed topsecret with ?token=X'), '<redacted> typed <redacted> with ?token=<redacted>');
+});
+
 test('IDENTITY_REDACTOR is a no-op (non-sensitive monitors are byte-for-byte unchanged)', () => {
   const s = 'https://x.com/cart?session=abc123&token=zzz';
   assert.equal(IDENTITY_REDACTOR(s), s);

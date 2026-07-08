@@ -29,12 +29,28 @@ export type Redactor = (s: string) => string;
 /** No-op redactor for non-sensitive monitors — keeps the extraction hot path byte-for-byte identical. */
 export const IDENTITY_REDACTOR: Redactor = (s) => s;
 
+/** Escape a literal string so its regex-special chars are matched verbatim (RE2-safe subset). */
+export function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 /**
  * Build a redactor for a SENSITIVE monitor: the built-in denylist + the monitor's declared regex
- * patterns. An invalid declared pattern is skipped (non-fatal — a bad manifest regex must never crash
- * trace extraction, which is itself non-fatal).
+ * patterns + any KNOWN SECRET VALUES (registered as escaped-literal rules). An invalid declared pattern
+ * is skipped (non-fatal — a bad manifest regex must never crash trace extraction, which is itself non-fatal).
+ *
+ * ★ VALUE registration (login-credentials, #232 defect-2 fix): the declared patterns scrub session TOKENS
+ * and form-encoded `password=VALUE`, but NOT the bare typed credential value in console/error/trace text.
+ * So the run's RESOLVED credential values are passed here and each becomes an escaped-literal rule — the
+ * exact value is scrubbed wherever it appears, independent of what patterns the monitor declared. Values
+ * are registered for the life of ONE run (same lifecycle as the SW_CRED_<ROLE> publish/clear). Empty/short
+ * values are skipped (a 1-2 char "value" would over-redact the whole trace). NOTE: this covers TEXT channels
+ * only — it CANNOT scrub a DOM value baked into a raw trace/screenshot (PR 1b), which stays view-gated.
  */
-export function makeRedactor(declaredPatterns: string[] | null | undefined): Redactor {
+export function makeRedactor(
+  declaredPatterns: string[] | null | undefined,
+  knownValues?: readonly string[],
+): Redactor {
   const rules: Array<[RegExp, string]> = [...BUILTIN];
   for (const p of declaredPatterns ?? []) {
     try {
@@ -42,6 +58,11 @@ export function makeRedactor(declaredPatterns: string[] | null | undefined): Red
     } catch {
       console.warn(`[redact] skipping invalid redact_pattern: ${p}`);
     }
+  }
+  // ★ known secret values → escaped-literal rules. Longest-first so a value that contains another
+  // (e.g. password ⊃ username substring) is redacted before its substring can partially match.
+  for (const v of [...(knownValues ?? [])].filter((v) => v && v.length >= 3).sort((a, b) => b.length - a.length)) {
+    rules.push([new RegExp(escapeRegExp(v), 'g'), REDACTED]);
   }
   return (s) => {
     let out = s;
