@@ -12,6 +12,7 @@ import {
   buildApplyUpsert,
   isResolvableSpec,
   b10FieldUpdates,
+  redtestAnchorUpdates,
   isRedactionStrip,
   computeApplyPlan,
   fetchManifest,
@@ -117,6 +118,7 @@ const managed = (over: Partial<ManagedCheck> = {}): ManagedCheck => ({
   redact_patterns: null,
   environment: 'prod',
   rewrite_from_origin: null,
+  redtest_anchor: null,
   ...over,
 });
 
@@ -669,4 +671,38 @@ test('S3: computeDrift flags a CHANGED on environment / rewrite_from_origin (man
   const fields = (changed!.detail as { fields: Record<string, unknown> }).fields;
   assert.deepEqual(fields.environment, { git: 'staging', live: 'prod' });
   assert.deepEqual(fields.rewrite_from_origin, { git: 'https://www.wegmans.com', live: null });
+});
+
+// --- Recon #55 gap A: redtest_anchor (scoped-synced, NOT in the positional apply plan) --------------
+test('redtest_anchor: validateManifest carries it through', () => {
+  const src = { ...VALID, monitors: [{ ...VALID.monitors[0], redtest_anchor: '**/opentable.com/**' }] };
+  assert.equal(validateManifest(src).monitors[0].redtest_anchor, '**/opentable.com/**');
+});
+
+test('redtest_anchor: validateManifest REJECTS an empty string', () => {
+  const bad = { ...VALID, monitors: [{ ...VALID.monitors[0], redtest_anchor: '' }] };
+  assert.throws(() => validateManifest(bad), /redtest_anchor invalid/);
+});
+
+test('★ redtest_anchor is NOT in the apply plan tuple (the #216 trap avoided)', () => {
+  // buildApplyUpsert's positional values must NOT include redtest_anchor — that would shift the API
+  // materialize indices again. It is scoped-synced instead, so the plan tuple is unchanged.
+  assert.equal((GIT_AUTHORITATIVE_COLUMNS as readonly string[]).includes('redtest_anchor'), false);
+  const { insertColumns } = buildApplyUpsert(monitor({ redtest_anchor: '**/x/**' }));
+  assert.equal(insertColumns.includes('redtest_anchor'), false, 'redtest_anchor must not enter the materialize tuple');
+});
+
+test('redtestAnchorUpdates: emits a targeted update when the live anchor diverges; skips when in sync', () => {
+  // manifest sets the anchor, live row is NULL -> one update
+  const diverged = redtestAnchorUpdates([monitor({ redtest_anchor: '**/opentable.com/**' })], [managed({ redtest_anchor: null })]);
+  assert.deepEqual(diverged, [{ source_key: 'wegmans-search-product', redtest_anchor: '**/opentable.com/**' }]);
+  // already in sync -> no update
+  assert.deepEqual(
+    redtestAnchorUpdates([monitor({ redtest_anchor: '**/opentable.com/**' })], [managed({ redtest_anchor: '**/opentable.com/**' })]),
+    [],
+  );
+  // manifest omits it, live NULL -> in sync, no update
+  assert.deepEqual(redtestAnchorUpdates([monitor({})], [managed({ redtest_anchor: null })]), []);
+  // no live check (not yet materialized) -> skipped (materialize is the separate gated concern)
+  assert.deepEqual(redtestAnchorUpdates([monitor({ redtest_anchor: '**/x/**' })], []), []);
 });

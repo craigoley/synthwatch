@@ -172,6 +172,12 @@ CREATE TABLE checks (
     -- env), so a pre-prod check reuses a prod spec WITHOUT editing it. NULL = no rewrite (S2 inert).
     rewrite_from_origin TEXT,
 
+    -- Browser red-test route-block pattern (mirrors 0063_checks_redtest_anchor.sql, recon #55 gap A). The
+    -- request glob the browser red-test aborts to prove the monitor goes RED. NULL = no browser red-test
+    -- anchor. Manifest-declared + SCOPED-SYNCED (like sensitive/redact) — deliberately NOT in the positional
+    -- reconcile-apply plan tuple (avoids the #216 materialize desync).
+    redtest_anchor     TEXT,
+
     -- A browser check is meaningless without a flow to run.
     CONSTRAINT browser_needs_flow
         CHECK (kind <> 'browser' OR flow_name IS NOT NULL)

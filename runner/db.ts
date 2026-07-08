@@ -156,6 +156,9 @@ export interface Check {
   // S2 host-rewrite FROM origin (0060). When non-null, executeBrowser re-points requests from this
   // origin to the check's target_url origin (the preview env). null => no rewrite (S2 inert).
   rewrite_from_origin: string | null;
+  // Browser red-test route-block pattern (0063, recon #55 gap A). The request glob the browser red-test
+  // aborts to prove the monitor reds. Read by the red-test harness; null => no browser red-test anchor.
+  redtest_anchor: string | null;
 }
 
 /** A row from the `runs` table after we've finished executing a check. */
