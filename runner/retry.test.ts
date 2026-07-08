@@ -107,6 +107,20 @@ test('effectiveRetries: retries=0 stays 0 either way (retry already disabled)', 
   assert.equal(effectiveRetries(0, true), 0);
 });
 
+// ── sandbox: an on-demand validation of a PAUSED monitor does ONE attempt (true first-attempt state).
+// evaluate() is skipped (no page to confirm), and retry would smooth away the very transient/bot-block
+// signal the validation asks about — so sandbox forces 0 retries regardless of the check's `retries`.
+test('effectiveRetries: sandbox forces 0 retries (single attempt, healthy monitor)', () => {
+  assert.equal(effectiveRetries(2, false, true), 0); // sandbox validation → 1 attempt, not 3
+});
+test('effectiveRetries: sandbox forces 0 even if also already-failing', () => {
+  assert.equal(effectiveRetries(2, true, true), 0);
+});
+test('effectiveRetries: non-sandbox is UNCHANGED (default arg = full retry preserved)', () => {
+  assert.equal(effectiveRetries(2, false), 2); // the fix must not touch normal scheduled runs
+  assert.equal(effectiveRetries(2, false, false), 2);
+});
+
 // ── retry_count telemetry (0048): `attempts` = how many tries to reach the verdict ──────────────
 test('attempts=1 when the run passes first try', async () => {
   const { execute } = scripted(['pass']);

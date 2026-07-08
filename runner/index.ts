@@ -500,9 +500,15 @@ async function runOneInner(
   // monitor still gets full retry (no incident yet); only SUBSEQUENT failures while the incident is
   // open skip it; on recovery evaluate() resolves the incident, so the next fresh failure retries again.
   const alreadyFailing = await hasOpenIncident(check.id);
-  const retries = effectiveRetries(check.retries, alreadyFailing);
+  // ★ sandbox suppresses fast-retry too: a paused-monitor validation wants the TRUE first-attempt
+  // outcome (evaluate() is skipped, so there's no page to confirm) — see effectiveRetries.
+  const retries = effectiveRetries(check.retries, alreadyFailing, sandbox);
   const maxAttempts = retries + 1;
-  if (alreadyFailing && check.retries > 0) {
+  if (sandbox && check.retries > 0) {
+    console.log(
+      `[runner] check ${check.id} "${check.name}" SANDBOX validation — single attempt (fast-retry skipped, true first-attempt state).`,
+    );
+  } else if (alreadyFailing && check.retries > 0) {
     console.log(
       `[runner] check ${check.id} "${check.name}" already has an open incident — skipping fast-retry (1 attempt).`,
     );

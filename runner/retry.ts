@@ -25,9 +25,19 @@ function isRetryable(status: string): boolean {
  * is still retried to confirm it's real before paging (the transient-absorption that prevents a false
  * page). Pairs with failure_threshold=1: first failure retries→confirms→opens incident; subsequent
  * failures while it's open skip retry; on recovery the incident resolves and full retry returns.
+ *
+ * ★ SANDBOX (0064/0065): a sandbox run is an ON-DEMAND validation of a PAUSED monitor — it skips
+ * evaluate() (no incident/alert/SLO — option A), so the reason fast-retry exists (confirm a failure
+ * before paging) doesn't apply. A "does this work" validation wants the TRUE first-attempt state, not
+ * the retry-smoothed one: retry takes the LAST attempt as the verdict, so on a browser flow it would
+ * pass on a warmed 2nd/3rd attempt (cookies/session set) where a COLD first contact was blocked —
+ * masking exactly the bot-detection/OTP signal the validation is asking about. So sandbox → 0 retries
+ * (one honest attempt). Harmless downside: a genuine transient blip shows as fail — but a sandbox fail
+ * pages nothing, and Craig just re-fires. (Also stops a hard-failing validation running 4× — cf. the
+ * b2c stale-selector run that hit retry_count=3.)
  */
-export function effectiveRetries(retries: number, alreadyFailing: boolean): number {
-  return alreadyFailing ? 0 : retries;
+export function effectiveRetries(retries: number, alreadyFailing: boolean, sandbox = false): number {
+  return alreadyFailing || sandbox ? 0 : retries;
 }
 
 export async function runWithRetry<T extends { status: string }>(
