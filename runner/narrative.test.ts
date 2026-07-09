@@ -123,6 +123,40 @@ test('missingFigures: figure in body with empty highlights still PASSES (per-mon
   assert.deepEqual(missingFigures(n, factPack()), []);
 });
 
+// ── ★ CASE 2 (2026-07-09 fleet fallback AFTER #244's scope fix): the model wrote a genuinely HOLISTIC,
+//    finish_reason=stop narrative but reported the fleet metric only as its WoW DELTA ("+11.36 pts w/w")
+//    + per-monitor availabilities — OMITTING the fleet AGGREGATE the guard requires. The remedy is the
+//    SYSTEM_PROMPT (require the literal aggregate); these tests LOCK the guard contract the prompt targets:
+//    the delta must NOT satisfy the aggregate check, a compliant narrative passes, a wrong one fails. ──
+test('missingFigures: delta-only (WoW pts, per-monitor avails) OMITTING the aggregate still FAILS (CASE 2)', () => {
+  // Mirrors the discarded output: delta +11.36, per-monitor 99.46 / 0 — but never the aggregate 95.24.
+  const n = narrH(
+    'rca-demo is unavailable AND over-cost; Meals2Go incidents did not drive fleet spend.',
+    'Availability improved +11.36 pts w/w with no correlated deploy in-window. rca-demo sits at 0 while search holds 99.46.',
+    ['availabilityPts +11.36', 'rca-demo availabilityPct 0', 'search availabilityPct 99.46'],
+  );
+  const missing = missingFigures(n, factPack());
+  assert.ok(missing.some((m) => m.startsWith('availability')), `expected availability missing, got: ${missing.join(',')}`);
+  assert.equal(spotCheck(n, factPack()), false);
+});
+
+test('missingFigures: the AGGREGATE stated literally in any field PASSES (delta may accompany it)', () => {
+  // Same holistic story, but now ALSO anchors the literal aggregate 95.24% (in a highlight) alongside the delta.
+  const n = narrH(
+    'rca-demo is unavailable AND over-cost; fleet availability held at 95.24%.',
+    'Fleet availability 95.24% (+11.36 pts w/w), no correlated deploy in-window. rca-demo at 0, search 99.46.',
+    ['Fleet availability 95.24%', 'availabilityPts +11.36'],
+  );
+  assert.deepEqual(missingFigures(n, factPack()), []);
+  assert.equal(spotCheck(n, factPack()), true);
+});
+
+test('missingFigures: a WRONG fleet aggregate (85% not 95.24%) still FAILS (teeth intact)', () => {
+  const n = narrH('Fleet availability was 85% this week.', '2 incidents, no correlated deploy.', ['Fleet availability 85%']);
+  const missing = missingFigures(n, factPack());
+  assert.ok(missing.some((m) => m.startsWith('availability')), `expected availability missing, got: ${missing.join(',')}`);
+});
+
 // ── fallback: cite cost/deploy when present, omit gracefully when absent ──
 test('buildFallback: cites fleet cost + the divergent monitor + deploy count when present', () => {
   const fb = buildFallback(factPack());
