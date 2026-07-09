@@ -71,7 +71,11 @@ const STRUCTURAL: Array<[RegExp, string]> = [
   [new RegExp(`("[\\w-]*${AUTHISH}[\\w-]*"\\s*:\\s*")${JSON_STR}(")`, 'gi'), `$1${REDACTED}$2`],
   // 3) Raw header-text form — "Set-Cookie: session=…" inlined in console/snapshot text. Stops at a
   //    quote so an occurrence embedded in a JSON string keeps that string's closing quote intact.
-  [/((?:^|[\s"'])(?:cookie|set-cookie|authorization|proxy-authorization)\s*:\s*)[^"'\r\n]+/gi, `$1${REDACTED}`],
+  //    Escape-aware (matching rules 1-2's JSON_STR): a JSON-escaped quote (\") inside the value is
+  //    consumed via `\\.` as part of the value rather than terminating the match early — otherwise
+  //    the trailing `\` was eaten, the now-bare `"` closed the JSON string, and the NDJSON line the
+  //    trace viewer parses per-line became invalid (the event was silently dropped).
+  [/((?:^|[\s"'])(?:cookie|set-cookie|authorization|proxy-authorization)\s*:\s*)(?:\\.|[^"'\r\n\\])+/gi, `$1${REDACTED}`],
 ];
 
 /** How buildRedactedTraceZip treats a zip entry. Exported so the drop-by-default policy is pinnable. */

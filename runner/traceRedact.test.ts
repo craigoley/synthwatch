@@ -163,6 +163,50 @@ test('scrubTraceText: diagnostic console text SURVIVES while values are scrubbed
   for (const line of out.split('\n')) JSON.parse(line); // every NDJSON line still parses
 });
 
+// ── ★ escape-awareness: a header VALUE containing a JSON-escaped quote must not break the line ─────
+// The trace viewer JSON.parses every NDJSON line, so a rewrite that leaves an unescaped " corrupts
+// the line and the event is silently dropped (the #232 "Could not load trace" root cause). Rules 1-2
+// were already escape-aware (JSON_STR); rule 3 (the raw inline "set-cookie: …" form) was the outlier.
+
+test('★ rule 3 must-go-red: a raw inline set-cookie value with an ESCAPED QUOTE stays VALID JSON', () => {
+  // Inside a JSON string, a literal " is escaped as \". The runner-side string below therefore has \\"
+  // so the ON-DISK NDJSON line contains set-cookie: sess=a\"b; path=/ — a valid JSON string.
+  const line = JSON.stringify({ type: 'console', text: 'resp header set-cookie: sess=a"b; path=/' });
+  assert.doesNotThrow(() => JSON.parse(line), 'precondition: input line is valid JSON');
+  assert.ok(line.includes('\\"'), 'precondition: the value carries a JSON-escaped quote');
+
+  const out = scrubTraceText(line, IDENTITY_REDACTOR); // isolate the structural rules
+
+  // THE crux — revert rule 3 to [^"'\r\n]+ and this line becomes {"…set-cookie: <redacted>"b; path=/"}
+  // (the escaping backslash eaten, the bare " closes the string early) → JSON.parse throws.
+  let parsed: { text: string };
+  assert.doesNotThrow(() => {
+    parsed = JSON.parse(out) as { text: string };
+  }, 'redacted NDJSON line must remain valid JSON (viewer JSON.parses every line)');
+
+  // escape-aware ≠ under-redaction: the whole cookie value (through the escaped quote) is gone.
+  assert.match(parsed!.text, /set-cookie: <redacted>$/, 'value redacted, up to the closing quote');
+  assert.doesNotMatch(parsed!.text, /sess=a/, 'the raw cookie value must not survive');
+});
+
+test('rule 3 regression: a normal inline header value (no escaped quote) still redacts, JSON valid', () => {
+  const line = JSON.stringify({ type: 'console', text: 'resp header set-cookie: session=PLAINABC123; path=/' });
+  const out = scrubTraceText(line, IDENTITY_REDACTOR);
+  const parsed = JSON.parse(out) as { text: string };
+  assert.match(parsed.text, /set-cookie: <redacted>/);
+  assert.doesNotMatch(parsed.text, /PLAINABC123/);
+});
+
+test('rules 1-2 escape-aware: HAR pair + auth-ish JSON key with escaped quotes stay valid, values gone', () => {
+  const har = JSON.stringify({ name: 'set-cookie', value: 'sid=x"y; Secure' });
+  const key = JSON.stringify({ access_token: 'ab"cd.ef' });
+  const outHar = JSON.parse(scrubTraceText(har, IDENTITY_REDACTOR)) as { name: string; value: string };
+  const outKey = JSON.parse(scrubTraceText(key, IDENTITY_REDACTOR)) as { access_token: string };
+  assert.equal(outHar.value, '<redacted>');
+  assert.equal(outHar.name, 'set-cookie', 'header name preserved');
+  assert.equal(outKey.access_token, '<redacted>');
+});
+
 test('★ buildRedactedTraceZip: binary entries dropped, text kept, and NO planted secret survives ANYWHERE', () => {
   const dir = tmpDir();
   try {
