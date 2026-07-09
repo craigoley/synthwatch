@@ -397,6 +397,13 @@ const SYSTEM_PROMPT =
   `classification. Reference the connections (the anomaly's cost, the change's deploy-timing) — sections ` +
   `must interlock, not stand alone.\n` +
   `- If cost is null or deployMarkers is empty, simply omit that dimension — do NOT fabricate $ or a deploy.\n` +
+  `- ★ ABSOLUTE FIGURES, NOT JUST DELTAS: you MUST state the scope's current.availabilityPct as a LITERAL ` +
+  `percentage (e.g. "93.33%") somewhere — headline, body, OR a highlight — and, when current.incidents > 0, ` +
+  `the literal incident COUNT. A week-over-week delta ("+11.36 pts w/w") COMPLEMENTS the aggregate, it never ` +
+  `REPLACES it: reporting only the delta, or only per-monitor availabilities, is INCOMPLETE — the reader must ` +
+  `see the actual current availability number. This does NOT dilute the holistic style: still lead with the ` +
+  `story and weave signals, then anchor it to the real aggregate figure (copy the number from the fact pack ` +
+  `verbatim — do not round or restate it).\n` +
   `- BAN filler: no greetings, no "in conclusion", no "all systems nominal". Every line carries a cited ` +
   `signal; if truly nothing notable changed, say that in one sentence.\n` +
   `Respond ONLY as JSON: {"headline": "<=1 sentence, the top item", "body": "2-6 sentences, markdown, ` +
