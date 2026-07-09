@@ -74,22 +74,34 @@ export function makeRedactor(
 // ── B10 artifact-persistence policy (pure + testable) ────────────────────────────────────────────
 import type { TerminalStatus } from './db.js';
 
-/** Which trace artifacts this run may persist. A SENSITIVE monitor persists NONE of them (no
- *  session-bearing zip, no PII screenshot); a non-sensitive monitor follows the normal status rules. */
+/** How the per-run failure trace zip is persisted: the raw capture, a redacted/reduced copy
+ *  (traceRedact.ts), or not at all. A string mode (not a boolean) so every consumer is forced to say
+ *  which one it means — `if (mode)` would treat 'none' as truthy. */
+export type FailureTraceMode = 'raw' | 'redacted' | 'none';
+
+/** Which trace artifacts this run may persist. A SENSITIVE monitor stores NO raw artifacts (no
+ *  session-bearing zip, no PII screenshot, no permanent baseline) — but a FAILED sensitive run now
+ *  persists a REDACTED, REDUCED trace zip (see traceRedact.ts) so credentialed monitors are
+ *  debuggable; a non-sensitive monitor follows the normal status rules. */
 export interface TracePersistPlan {
-  failureTrace: boolean; // the per-run failure trace zip (runs.trace_url)
+  failureTraceMode: FailureTraceMode; // the per-run failure trace zip (runs.trace_url)
   successBaseline: boolean; // the permanent success-trace baseline zip (checks.success_trace_url)
   failureScreenshot: boolean; // the failure screenshot (runs.screenshot_url)
   baselineScreenshot: boolean; // the RCA visual-diff baseline screenshot (checks.baseline_screenshot_url)
 }
 
 export function tracePersistPlan(sensitive: boolean, status: TerminalStatus): TracePersistPlan {
-  if (sensitive) {
-    return { failureTrace: false, successBaseline: false, failureScreenshot: false, baselineScreenshot: false };
-  }
   const down = status === 'fail' || status === 'error';
+  if (sensitive) {
+    // Failure → the REDACTED/REDUCED zip (the B10 revision: a failed credentialed run must be
+    // debuggable). Green stays fully discarded — the permanent success-baseline slot is purge-EXEMPT
+    // and a standing logged-in capture is exactly what B10 exists to prevent; a redacted copy there
+    // would also break the baseline↔failure diff's like-for-like premise. Screenshots stay off: a
+    // rendered logged-in page cannot be text-scrubbed.
+    return { failureTraceMode: down ? 'redacted' : 'none', successBaseline: false, failureScreenshot: false, baselineScreenshot: false };
+  }
   const up = status === 'pass' || status === 'warn';
-  return { failureTrace: down, successBaseline: up, failureScreenshot: down, baselineScreenshot: status === 'pass' };
+  return { failureTraceMode: down ? 'raw' : 'none', successBaseline: up, failureScreenshot: down, baselineScreenshot: status === 'pass' };
 }
 
 /** Generic error_message for a sensitive monitor — the fallback when scrubbing leaves nothing readable.
