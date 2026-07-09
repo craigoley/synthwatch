@@ -470,7 +470,15 @@ function validShape(o: unknown): o is Narrative {
  * The guardrail still fires on filler (no real availability/incident figures -> missing).
  */
 export function missingFigures(n: Narrative, fp: FactPack): string[] {
-  const prose = `${n.headline} ${n.body}`;
+  // ★ SEARCH THE WHOLE NARRATIVE — headline + body + HIGHLIGHTS. `highlights` is a first-class model
+  // output field (validShape requires it; SYSTEM_PROMPT asks for `"highlights": ["short cited string"]`;
+  // upsert() persists it and the dashboard renders it), so it is exactly where a HOLISTIC fleet narrative
+  // (the #241 rewrite) parks a bare cited figure while the body carries the cross-signal STORY. Searching
+  // only headline+body false-rejected such a narrative even though it cited the figure verbatim in a
+  // highlight — that is what fell back the 2026-07-09 fleet run (`missing: availability(93.33%)` while the
+  // model finished clean, finish_reason=stop, 1894 chars). Including highlights also closes a latent hole:
+  // an invented $ or unsupported deploy-sha in a highlight (shown to the user) now trips the guard too.
+  const prose = [n.headline, n.body, ...n.highlights].join(' ');
   const missing: string[] = [];
   const pct = fp.current.availabilityPct;
   if (pct != null) {
@@ -546,7 +554,15 @@ export async function narrate(fp: FactPack): Promise<{ narrative: Narrative; mod
         };
         const missing = missingFigures(n, fp);
         if (missing.length === 0) return { narrative: n, model: DEFAULT_DEPLOYMENT ?? 'aoai' };
-        console.warn(`[narrative] model output failed spot-check (missing: ${missing.join(', ')}) — fallback`);
+        // meta-lesson A: the DISCARDED output was previously invisible (only the fallback was stored), so a
+        // spot-check false-rejection was un-diagnosable without re-deriving. Log the full discarded narrative
+        // (non-sensitive fleet stats) + the exact figure it wanted, so the NEXT failure is one-glance:
+        // "rephrased/omitted (CASE 1/2)" vs "cited-but-in-a-field-we-don't-search (CASE 3)".
+        console.warn(
+          `[narrative] ${fp.scopeType}:${fp.scopeKey || 'fleet'} model output failed spot-check ` +
+            `(missing: ${missing.join(', ')}) — fallback. DISCARDED output below (searched headline+body+highlights):\n` +
+            `  headline: ${n.headline}\n  body: ${n.body}\n  highlights: ${JSON.stringify(n.highlights)}`,
+        );
       } else {
         console.warn('[narrative] model output off-shape — fallback');
       }

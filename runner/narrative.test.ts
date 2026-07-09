@@ -32,6 +32,7 @@ function factPack(over: Partial<FactPack> = {}): FactPack {
   };
 }
 const narr = (headline: string, body: string): Narrative => ({ headline, body, highlights: [] });
+const narrH = (headline: string, body: string, highlights: string[]): Narrative => ({ headline, body, highlights });
 
 // ── the guard must PASS a faithful holistic narrative ──
 test('missingFigures: passes prose citing real pack cost + a real deploy sha', () => {
@@ -68,6 +69,58 @@ test('missingFigures: still rejects filler missing availability + incidents', ()
   const missing = missingFigures(n, factPack());
   assert.ok(missing.some((m) => m.startsWith('availability')));
   assert.ok(missing.some((m) => m.startsWith('incidents')));
+});
+
+// ── ★ THE FIX (must-go-red): a HOLISTIC fleet narrative that cites the figures in HIGHLIGHTS (not the
+//    headline/body, which carry the qualitative cross-signal story) PASSES. This is the 2026-07-09 fleet
+//    false-rejection: the model finished clean and cited 95.24% + 2 incidents verbatim in highlights, but
+//    the old guard searched only headline+body → `missing: availability(...)` → wrongful fallback.
+//    Fails on origin/main (highlights not searched), passes after the search-scope fix.
+test('missingFigures: figure cited ONLY in highlights PASSES (holistic fleet narrative)', () => {
+  const n = narrH(
+    'Reliability-and-cost: the worst monitor bleeds on both axes.', // no "95", no "2"
+    'Availability slipped week-over-week, led by the least reliable monitor which also tops projected spend.',
+    ['Fleet availability 95.24%', '2 incidents opened'],
+  );
+  assert.deepEqual(missingFigures(n, factPack()), []);
+  assert.equal(spotCheck(n, factPack()), true);
+});
+
+// ── ★ teeth intact (must-go-red the other way): OMITTING the figure from EVERY field (headline, body,
+//    AND highlights) still FAILS — the fix widens the search, it does not neuter the guard. ──
+test('missingFigures: figure absent from headline+body+highlights still FAILS', () => {
+  const n = narrH(
+    'Reliability-and-cost: the worst monitor bleeds on both axes.',
+    'Availability slipped week-over-week, led by the least reliable monitor which also tops projected spend.',
+    ['worst monitor drives spend'], // figure nowhere
+  );
+  const missing = missingFigures(n, factPack());
+  assert.ok(missing.some((m) => m.startsWith('availability')), missing.join(','));
+  assert.ok(missing.some((m) => m.startsWith('incidents')), missing.join(','));
+  assert.equal(spotCheck(n, factPack()), false);
+});
+
+// ── ★ a WRONG availability number still FAILS (the guard checks for the CORRECT figure's presence, so an
+//    incorrect one — even placed prominently in a highlight — does not satisfy it). ──
+test('missingFigures: a WRONG availability figure (in a highlight) still FAILS', () => {
+  const n = narrH('Fleet reliability report.', 'The fleet had a rough week.', ['Fleet availability 88.10%', '2 incidents']);
+  const missing = missingFigures(n, factPack());
+  assert.ok(missing.some((m) => m.startsWith('availability')), missing.join(','));
+});
+
+// ── ★ closing the latent hole: an invented $ figure hidden in a HIGHLIGHT (shown to the user) is now caught.
+//    Before the fix, highlights escaped the anti-hallucination scan entirely. ──
+test('missingFigures: an invented $ in a HIGHLIGHT is now rejected', () => {
+  const n = narrH('Fleet 95.24% available, 2 incidents.', 'Nothing else notable.', ['Fleet spend $999/mo']);
+  const missing = missingFigures(n, factPack());
+  assert.ok(missing.some((m) => m.includes('invented-cost($999')), missing.join(','));
+});
+
+// ── no regression on the 31 per-monitor narratives: a figure cited in the BODY with empty highlights
+//    (the shape that already passes today) still passes. ──
+test('missingFigures: figure in body with empty highlights still PASSES (per-monitor shape)', () => {
+  const n = narr('search-autocomplete 95.24% available this week.', '2 incidents, both resolved.');
+  assert.deepEqual(missingFigures(n, factPack()), []);
 });
 
 // ── fallback: cite cost/deploy when present, omit gracefully when absent ──
