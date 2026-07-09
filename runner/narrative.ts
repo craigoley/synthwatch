@@ -40,6 +40,36 @@ export interface IncidentFact {
   summary: string | null;
 }
 
+/** One monitor's estimated monthly cost — from the SHARED cost_projection() SQL fn, so these MATCH
+ *  /reports/cost by construction. divergence = measured/projected (null when projected 0). */
+export interface CostFact {
+  name: string;
+  projected: number;
+  measured: number;
+  divergence: number | null;
+  divergenceFlag: boolean; // divergence > 1.5 — retries/slowdowns inflating cost (a LEADING indicator)
+  availabilityPct: number | null; // this window, so the model can spot unreliable-AND-expensive intersections
+}
+
+/** Fleet cost roll-up + the monitors worth naming (expensive / divergent / unreliable). Null when the
+ *  cost_projection() fn is unavailable (e.g. migration 0069 not yet applied) — never fabricated. */
+export interface CostFacts {
+  fleetProjected: number;
+  fleetMeasured: number;
+  fleetDivergence: number | null;
+  topDrivers: Array<{ name: string; projected: number }>; // top by projected $
+  notable: CostFact[]; // expensive OR divergent OR low-availability — the cross-signal candidates
+}
+
+/** A deploy in the window (from the `deploys` table). The model correlates incident timing to deployedAt —
+ *  "incident began N min after deploy <sha>" — instead of guessing "check recent deployments". */
+export interface DeployMarker {
+  deployedAt: string; // ISO — checkable against incident.openedAt
+  targetHost: string;
+  source: string;
+  sha: string | null; // short (12) — null for non-sha markers (etag)
+}
+
 export interface FactPack {
   scopeType: 'fleet' | 'monitor';
   scopeKey: string;
@@ -55,6 +85,8 @@ export interface FactPack {
   };
   incidentList: IncidentFact[];
   anomalies: string[];
+  cost: CostFacts | null; // fleet+notable cost (fleet scope) or this monitor's cost (monitor scope); null if unavailable
+  deployMarkers: DeployMarker[]; // deploys in the window, for incident↔deploy correlation
 }
 
 export interface Narrative {
@@ -141,6 +173,96 @@ async function periodFacts(
 }
 
 /** Compute the full deterministic fact pack for a scope as of `asOf` (UTC midnight end). */
+const r2 = (n: number) => Math.round(n * 100) / 100;
+const r3 = (n: number) => Math.round(n * 1000) / 1000;
+
+/** The $/vCPU-second rate — the SAME config var the api's CostRate reads, same default (0.00003), so the
+ *  runner's cost facts and /reports/cost use ONE rate source. ★ If the rate is ever overridden, set
+ *  COST_RATE_PER_VCPU_SECOND on BOTH the api app and the runner jobs, or the two diverge. */
+function costRate(): number {
+  const n = Number(process.env.COST_RATE_PER_VCPU_SECOND);
+  return Number.isFinite(n) && n > 0 ? n : 0.00003;
+}
+
+/** Cost facts from the SHARED cost_projection() fn (figures MATCH /reports/cost by construction). Fleet total
+ *  + notable monitors (fleet scope), or just this monitor's figures (monitor scope). Availability is joined
+ *  from the rollup so the model can find the unreliable-AND-expensive intersection. FAIL-SOFT: if the fn is
+ *  unavailable (0069 not yet applied) → null (never a fabricated $0). */
+async function costFacts(checkId: number | null, startDay: string, endDay: string): Promise<CostFacts | null> {
+  try {
+    const cost = await pool.query<{
+      check_id: string; check_name: string; projected: string; measured: string;
+      divergence: string | null; divergence_flag: boolean; projected_raw: string; measured_raw: string;
+    }>(
+      `SELECT check_id, check_name, projected, measured, divergence, divergence_flag, projected_raw, measured_raw
+         FROM cost_projection($1::numeric)`,
+      [costRate()],
+    );
+    if (cost.rows.length === 0) return null;
+    const av = await pool.query<{ check_id: string; pct: string | null }>(
+      `SELECT check_id, round(100.0*sum(up_count)/nullif(sum(up_count+down_count),0),2) AS pct
+         FROM daily_check_rollup WHERE day >= $1::date AND day < $2::date GROUP BY check_id`,
+      [startDay, endDay],
+    );
+    const availById = new Map(av.rows.map((r) => [r.check_id, r.pct == null ? null : Number(r.pct)]));
+    const all = cost.rows.map((r) => ({
+      id: r.check_id,
+      fact: {
+        name: r.check_name,
+        projected: Number(r.projected),
+        measured: Number(r.measured),
+        divergence: r.divergence == null ? null : Number(r.divergence),
+        divergenceFlag: r.divergence_flag,
+        availabilityPct: availById.get(r.check_id) ?? null,
+      } as CostFact,
+      projRaw: Number(r.projected_raw),
+      measRaw: Number(r.measured_raw),
+    }));
+    const fleetProjected = r2(all.reduce((s, r) => s + r.projRaw, 0));
+    const fleetMeasured = r2(all.reduce((s, r) => s + r.measRaw, 0));
+    const fleetDivergence = fleetProjected > 0 ? r3(fleetMeasured / fleetProjected) : null;
+
+    // Monitor scope: just this check's cost (fleet* = the monitor's own figures; notable = [itself]).
+    if (checkId != null) {
+      const me = all.find((r) => r.id === String(checkId));
+      if (!me) return null;
+      return {
+        fleetProjected: me.fact.projected, fleetMeasured: me.fact.measured, fleetDivergence: me.fact.divergence,
+        topDrivers: [], notable: [me.fact],
+      };
+    }
+    // Fleet scope: top drivers + notable = expensive ∪ divergent ∪ (unreliable AND costing).
+    const byProj = [...all].sort((a, b) => b.projRaw - a.projRaw);
+    const topDrivers = byProj.slice(0, 5).map((r) => ({ name: r.fact.name, projected: r.fact.projected }));
+    const notable = new Map<string, (typeof all)[number]>();
+    for (const r of byProj.slice(0, 8)) notable.set(r.id, r); // most expensive
+    for (const r of all) if (r.fact.divergenceFlag) notable.set(r.id, r); // cost-divergent (leading indicator)
+    for (const r of all) if (r.fact.availabilityPct != null && r.fact.availabilityPct < 100 && r.fact.projected > 0) notable.set(r.id, r); // unreliable AND costing
+    return {
+      fleetProjected, fleetMeasured, fleetDivergence, topDrivers,
+      notable: [...notable.values()].sort((a, b) => b.projRaw - a.projRaw).map((r) => r.fact),
+    };
+  } catch (err) {
+    console.warn('[narrative] cost facts unavailable (cost_projection missing?) — omitting:', err instanceof Error ? err.message : err);
+    return null;
+  }
+}
+
+/** Deploys in the window → the model correlates incident timing to deployedAt. Empty when none. */
+async function deployMarkersInWindow(startIso: string, endIso: string): Promise<DeployMarker[]> {
+  const { rows } = await pool.query<{ deployed_at: Date; target_host: string; source: string; sha: string | null }>(
+    `SELECT deployed_at, target_host, source, left(sha, 12) AS sha
+       FROM deploys WHERE deployed_at >= $1 AND deployed_at < $2 ORDER BY deployed_at`,
+    [startIso, endIso],
+  );
+  return rows.map((r) => ({
+    deployedAt: new Date(r.deployed_at).toISOString(),
+    targetHost: r.target_host,
+    source: r.source,
+    sha: r.sha,
+  }));
+}
+
 export async function computeFactPack(
   scope: { type: 'fleet' | 'monitor'; checkId: number | null; key: string; name: string },
   asOf: Date = todayUtcMidnight(),
@@ -221,6 +343,10 @@ export async function computeFactPack(
     if (worstLine) anomalies.push(`Lowest-availability monitors: ${worstLine}.`);
   }
 
+  // Cost (shared cost_projection fn — matches /reports/cost) + deploy markers (for incident↔deploy timing).
+  const cost = await costFacts(checkId, isoDay(curStart), isoDay(end));
+  const deployMarkers = await deployMarkersInWindow(curStart.toISOString(), end.toISOString());
+
   return {
     scopeType: scope.type,
     scopeKey: scope.key,
@@ -236,17 +362,36 @@ export async function computeFactPack(
     },
     incidentList,
     anomalies,
+    cost,
+    deployMarkers,
   };
 }
 
 // --- narrate (model only narrates) + deterministic fallback ---------------------------
 const SYSTEM_PROMPT =
-  `You write a terse reliability report for an SRE. Use ONLY the numbers and incidents in ` +
-  `the data — never invent or estimate. Lead with what CHANGED and what's ANOMALOUS; state ` +
-  `specific figures; cite incidents by classification. If nothing notable changed, say so in ` +
-  `one sentence. No greetings, no "in conclusion", no advice unless an incident's RCA implies ` +
-  `a concrete next step. Respond ONLY as JSON: ` +
-  `{"headline": "<=1 sentence", "body": "2-5 sentences, markdown", "highlights": ["short string", ...]}.`;
+  `You are a FinOps/SRE analyst writing a terse, cross-cutting report for an engineer. The JSON data is the ` +
+  `SOLE source of truth: cite ONLY figures present in it — never invent, estimate, or round beyond it. ` +
+  `Prose is INTERPRETATION of those facts, not new facts.\n` +
+  `SYNTHESIZE across signals — do NOT produce three separate lists (reliability, cost, deploys). Weave them:\n` +
+  `- LEAD with the single highest-priority item, ordered by impact.\n` +
+  `- The headline signal is the INTERSECTION: a monitor that is SIMULTANEOUSLY unreliable AND expensive ` +
+  `AND/OR recently-changed. Name it and connect the facts (e.g. "X is <avail>% available AND still ` +
+  `projected $<proj>/mo = wasted spend — fix or retire"). Use cost.notable for these candidates.\n` +
+  `- Treat cost DIVERGENCE (measured >> projected; divergenceFlag) as a LEADING indicator — retries/` +
+  `slowdowns inflating cost before they show as failures. Call it out with the ratio.\n` +
+  `- CORRELATE incident timing with deployMarkers: for an incident, compare its openedAt to each ` +
+  `deployedAt; if one is shortly before, say "began ~N min after the <date> deploy <sha> (<target>)" ` +
+  `using the ACTUAL timestamps. If NO deploy plausibly precedes it, say so explicitly ("no correlated ` +
+  `deploy in-window → likely external/regional"). ★ NEVER assert a correlation the timestamps don't ` +
+  `support — a claimed "after deploy X" must be checkable against that deploy's deployedAt.\n` +
+  `- Speak in deviations-from-normal (week-over-week) where the deltas have them. Cite incidents by ` +
+  `classification. Reference the connections (the anomaly's cost, the change's deploy-timing) — sections ` +
+  `must interlock, not stand alone.\n` +
+  `- If cost is null or deployMarkers is empty, simply omit that dimension — do NOT fabricate $ or a deploy.\n` +
+  `- BAN filler: no greetings, no "in conclusion", no "all systems nominal". Every line carries a cited ` +
+  `signal; if truly nothing notable changed, say that in one sentence.\n` +
+  `Respond ONLY as JSON: {"headline": "<=1 sentence, the top item", "body": "2-6 sentences, markdown, ` +
+  `woven across signals", "highlights": ["short cited string", ...]}.`;
 
 /** Deterministic templated summary from the fact pack — used when the model is off/empty/
  *  filler, so a bad generation NEVER ships mush. Cites the same numbers. */
@@ -267,10 +412,26 @@ export function buildFallback(fp: FactPack): Narrative {
   ];
   if (fp.anomalies.length) bodyParts.push(fp.anomalies.join(' '));
   else bodyParts.push('Nothing notable changed week-over-week.');
+  // Cost — ONLY when present (never a fabricated $0). Names the divergent monitor if one is flagged.
+  const highlights = fp.anomalies.length ? fp.anomalies.slice(0, 5) : [`Availability ${avail}`, `p95 ${p95}`, `${c.incidents} incident(s)`];
+  if (fp.cost) {
+    const fd = fp.cost.fleetDivergence;
+    bodyParts.push(`Projected $${fp.cost.fleetProjected}/mo, measured $${fp.cost.fleetMeasured}/mo${fd != null ? ` (divergence ${fd}×)` : ''}.`);
+    const div = fp.cost.notable.find((m) => m.divergenceFlag);
+    if (div) {
+      bodyParts.push(`${div.name}: $${div.measured}/mo measured vs $${div.projected} projected (${div.divergence}×) — retry/slowdown amplification.`);
+      highlights.push(`${div.name} cost divergence ${div.divergence}×`);
+    }
+  }
+  // Deploys — factual list only; the deterministic fallback does NOT assert correlation (that's the model's job).
+  if (fp.deployMarkers.length) {
+    const shas = fp.deployMarkers.map((d) => d.sha ?? d.source).slice(0, 3).join(', ');
+    bodyParts.push(`${fp.deployMarkers.length} deploy(s) in-window (${shas}).`);
+  }
   return {
     headline,
     body: bodyParts.join(' '),
-    highlights: fp.anomalies.length ? fp.anomalies.slice(0, 5) : [`Availability ${avail}`, `p95 ${p95}`, `${c.incidents} incident(s)`],
+    highlights: highlights.slice(0, 6),
   };
 }
 
@@ -309,6 +470,30 @@ export function missingFigures(n: Narrative, fp: FactPack): string[] {
   }
   if (fp.current.incidents > 0 && !prose.includes(String(fp.current.incidents))) {
     missing.push(`incidents(${fp.current.incidents})`);
+  }
+
+  // ★ ANTI-HALLUCINATION (reinforced for the bigger pack): the prose may cite ONLY figures the pack holds.
+  // (a) COST — every "$<n>" must be near a cost figure the pack carries (fleet + drivers + notable),
+  //     tolerant of rounding to the whole dollar. An out-of-pack $ = an invented number → fallback.
+  const packVals: number[] = [];
+  if (fp.cost) {
+    packVals.push(fp.cost.fleetProjected, fp.cost.fleetMeasured);
+    for (const d of fp.cost.topDrivers) packVals.push(d.projected);
+    for (const c of fp.cost.notable) packVals.push(c.projected, c.measured);
+  }
+  for (const m of prose.matchAll(/\$\s?(\d+(?:\.\d+)?)/g)) {
+    const num = Number(m[1]);
+    if (!packVals.some((v) => Math.abs(v - num) < 0.5)) missing.push(`invented-cost($${m[1]})`);
+  }
+  // (b) DEPLOY — any hex commit-sha cited in a deploy claim must be a REAL in-window marker (prefix-match,
+  //     since the model may cite a shorter prefix). A sha not among deployMarkers = an unsupported
+  //     correlation ("began after deploy <sha>" the timestamps can't back) → fallback.
+  if (/deploy/i.test(prose)) {
+    const packShas = fp.deployMarkers.map((d) => d.sha).filter((s): s is string => !!s).map((s) => s.toLowerCase());
+    for (const m of prose.matchAll(/\b([0-9a-f]{7,40})\b/gi)) {
+      const sha = m[1].toLowerCase();
+      if (!packShas.some((p) => p.startsWith(sha) || sha.startsWith(p))) missing.push(`unsupported-deploy-sha(${sha})`);
+    }
   }
   return missing;
 }
