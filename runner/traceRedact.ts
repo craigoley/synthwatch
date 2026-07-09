@@ -35,11 +35,23 @@ const REDACTED = '<redacted>';
 // Entries we know how to scrub as text. Playwright trace zips hold: trace.trace / trace.network /
 // trace.stacks (NDJSON) + resources/<sha1>.<ext> (network bodies + screencast jpegs). Anything not
 // matched here (images, fonts, unknown extensions) is dropped, not kept — fail-closed by default.
+// ★ Layout verified EMPIRICALLY against playwright@1.61.1 (the pinned version) with the runner's
+// exact tracing options: response bodies DO carry a mime-derived extension — resources/<sha1>.html
+// /.css/.json/.png (trace.network's content._sha1 embeds it) — and screencast frames are
+// resources/page@<hash>-<ts>.jpeg. So text bodies really are scrubbed-and-kept here, and image
+// entries (screencast + body) really are dropped. Re-verify this probe on a Playwright upgrade.
 const TEXT_ENTRY = /\.(trace|network|stacks|html?|js|mjs|css|json|txt|svg|xml|csv|map)$/i;
 
-// Auth-ish name fragment shared by both structural rules (mirrors the redact.ts BUILTIN key list).
+// Auth-ish name fragment shared by both structural rules (mirrors the redact.ts BUILTIN key list —
+// with the two promiscuous fragments ANCHORED, since here they match arbitrary JSON keys, not just
+// `key=` query params: bare `sid` swallowed re[sid]ence/in[sid]e/pre[sid]ent and bare `auth`
+// swallowed [auth]or/[auth]ority, redacting ordinary values and eating the diagnostic signal this
+// module exists to preserve. `\bsid\b` / `\bauth\b` still match sid, x-sid, auth, x-auth-key
+// (`-` is a word boundary; the surrounding [\w-]* covers the rest), `sess[_-]?id` covers
+// sessid/sess_id, and authorization/oauth are explicit. Over-redaction stays acceptable — this only
+// trims matches that were never auth-shaped at all.
 const AUTHISH =
-  '(?:token|session|sid|jwt|bearer|auth|secret|password|passwd|pwd|api[_-]?key|cookie|csrf|xsrf|signature)';
+  '(?:token|session|sess[_-]?id|\\bsid\\b|jwt|bearer|authorization|oauth|\\bauth\\b|secret|password|passwd|pwd|api[_-]?key|cookie|csrf|xsrf|signature)';
 
 // Escape-aware JSON string body: consumes \" and \\ correctly so the rewrite never breaks a line's
 // JSON validity (the trace viewer parses every NDJSON line).
