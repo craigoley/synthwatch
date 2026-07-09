@@ -68,6 +68,7 @@ export interface DeployMarker {
   targetHost: string;
   source: string;
   sha: string | null; // short (12) — null for non-sha markers (etag)
+  isSha: boolean; // a real code RELEASE (weight for correlation) vs a config/etag redeploy (noise)
 }
 
 export interface FactPack {
@@ -248,11 +249,18 @@ async function costFacts(checkId: number | null, startDay: string, endDay: strin
   }
 }
 
-/** Deploys in the window → the model correlates incident timing to deployedAt. Empty when none. */
+/** Deploys in the window → the model correlates incident timing to deployedAt. To keep the input focused
+ *  (the deploys table is dominated by the dashboard's frequent etag/config redeploys), keep EVERY real code
+ *  release (is_sha — the correlation candidates) but only the 10 most-recent config/etag markers. */
 async function deployMarkersInWindow(startIso: string, endIso: string): Promise<DeployMarker[]> {
-  const { rows } = await pool.query<{ deployed_at: Date; target_host: string; source: string; sha: string | null }>(
-    `SELECT deployed_at, target_host, source, left(sha, 12) AS sha
-       FROM deploys WHERE deployed_at >= $1 AND deployed_at < $2 ORDER BY deployed_at`,
+  const { rows } = await pool.query<{ deployed_at: Date; target_host: string; source: string; sha: string | null; is_sha: boolean }>(
+    `(SELECT deployed_at, target_host, source, left(sha, 12) AS sha, is_sha
+        FROM deploys WHERE deployed_at >= $1 AND deployed_at < $2 AND is_sha)
+     UNION ALL
+     (SELECT deployed_at, target_host, source, left(sha, 12) AS sha, is_sha
+        FROM deploys WHERE deployed_at >= $1 AND deployed_at < $2 AND NOT is_sha
+        ORDER BY deployed_at DESC LIMIT 10)
+     ORDER BY deployed_at`,
     [startIso, endIso],
   );
   return rows.map((r) => ({
@@ -260,6 +268,7 @@ async function deployMarkersInWindow(startIso: string, endIso: string): Promise<
     targetHost: r.target_host,
     source: r.source,
     sha: r.sha,
+    isSha: r.is_sha,
   }));
 }
 
@@ -505,11 +514,24 @@ export function spotCheck(n: Narrative, fp: FactPack): boolean {
 
 /** Narrate the fact pack. Returns the narrative + which model produced it (the deployment,
  *  or 'fallback-template'). The model only narrates; on any failure/filler -> fallback. */
+// gpt-5-mini is a REASONING model: max_completion_tokens bounds reasoning + output COMBINED. The old 700
+// was output-sized — low-effort reasoning over the enriched fleet pack (cost + deploys + 34-check data)
+// consumed the whole budget BEFORE any content → finish_reason=length, content_len=0 → fallback. 4000 gives
+// comfortable headroom for the reasoning pass + the ~700-token JSON output (RCA, same model, uses 16000).
+const NARRATIVE_MAX_TOKENS = 4000;
+
 export async function narrate(fp: FactPack): Promise<{ narrative: Narrative; model: string }> {
+  const user = JSON.stringify(fp);
+  // Observability: surface the input size + the budget so a future budget-starve is diagnosable at a glance
+  // (finish_reason=length with a big prompt vs a small max = starved; the log below pairs with it).
+  console.log(
+    `[narrative] ${fp.scopeType}:${fp.scopeKey || 'fleet'} prompt≈${SYSTEM_PROMPT.length + user.length} chars ` +
+      `(~${Math.round((SYSTEM_PROMPT.length + user.length) / 4)} tok in), max_completion_tokens=${NARRATIVE_MAX_TOKENS}`,
+  );
   const content = await chatCompletionContent({
     system: SYSTEM_PROMPT,
-    user: JSON.stringify(fp),
-    maxTokens: 700,
+    user,
+    maxTokens: NARRATIVE_MAX_TOKENS,
     reasoningEffort: 'low',
     logPrefix: '[narrative]',
   });

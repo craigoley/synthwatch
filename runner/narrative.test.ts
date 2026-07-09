@@ -26,7 +26,7 @@ function factPack(over: Partial<FactPack> = {}): FactPack {
       ],
     },
     deployMarkers: [
-      { deployedAt: '2026-07-06T14:00:00.000Z', targetHost: 'wegmans.com', source: 'sentry-release', sha: 'abc123def456' },
+      { deployedAt: '2026-07-06T14:00:00.000Z', targetHost: 'wegmans.com', source: 'sentry-release', sha: 'abc123def456', isSha: true },
     ],
     ...over,
   };
