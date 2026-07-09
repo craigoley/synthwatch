@@ -17,7 +17,10 @@ const BUILTIN: Array<[RegExp, string]> = [
   [
     // A sensitive-looking key=value, whether a URL query param (?token=…&) or an inline assignment in
     // console text (token=…). Keep the key (useful signal), redact the value to the next & # ws or quote.
-    /((?:[?&]|\b)[\w-]*(?:token|session|sid|jwt|bearer|auth|secret|password|passwd|pwd|api[_-]?key|access[_-]?token|id[_-]?token|refresh[_-]?token|csrf|xsrf|signature)[\w-]*=)[^&#\s"']+/gi,
+    // Escape-aware value (matching traceRedact's JSON_STR): a JSON-escaped char (\") inside the value is
+    // consumed via `\\.` rather than truncating the match at the bare `"` — so scrubbing an assignment
+    // embedded in an NDJSON string leaves that string's closing quote intact (valid JSON, same bug class).
+    /((?:[?&]|\b)[\w-]*(?:token|session|sid|jwt|bearer|auth|secret|password|passwd|pwd|api[_-]?key|access[_-]?token|id[_-]?token|refresh[_-]?token|csrf|xsrf|signature)[\w-]*=)(?:\\.|[^&#\s"'\\])+/gi,
     `$1${REDACTED}`,
   ],
   [/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, '<redacted-jwt>'],

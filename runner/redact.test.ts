@@ -21,6 +21,25 @@ test('redactor scrubs the VALUE of auth/session query params (keeps the key)', (
   assert.equal(r('/a?csrf_token=zzz'), '/a?csrf_token=<redacted>');
 });
 
+// ── escape-aware value (same bug class as traceRedact rule 3) ─────────────────────────────────────
+// The built-in query-param rule is applied to trace-derived strings that may be NDJSON — a param
+// value embedded in a JSON string can carry a JSON-escaped quote (\"). The value pattern must consume
+// \" as part of the value instead of truncating at the bare " (which would leave the trailing " and
+// break the enclosing JSON string). Sibling of the traceRedact rule-3 fix; lower-risk but same class.
+test('redactor: query-param value with an escaped quote redacts to STILL-VALID JSON', () => {
+  const r = makeRedactor(null);
+  // ON-DISK NDJSON line: {"text":"go /cb?token=a\"b&next=/home"} — the token value carries \"
+  const line = JSON.stringify({ text: 'go /cb?token=a"b&next=/home' });
+  assert.ok(line.includes('\\"'), 'precondition: the value carries a JSON-escaped quote');
+
+  const out = r(line);
+  // revert to [^&#\s"']+ and the trailing " is orphaned → this line no longer parses
+  const parsed = JSON.parse(out) as { text: string };
+  assert.match(parsed.text, /token=<redacted>/, 'token value redacted');
+  assert.doesNotMatch(parsed.text, /token=a/, 'raw token value gone');
+  assert.match(parsed.text, /next=\/home/, 'the next param (stops at &) is untouched');
+});
+
 test('redactor scrubs a JWT and a Bearer token anywhere', () => {
   const r = makeRedactor(null);
   assert.equal(
