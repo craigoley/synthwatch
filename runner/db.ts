@@ -117,9 +117,11 @@ export interface Check {
   // attempt is the run's verdict; intermediate attempts don't persist. 0 = no retry.
   retries: number;
   // B10 (0046): a cart/auth monitor whose trace can carry session tokens / PII. When true the runner
-  // skips both trace zips, omits + doesn't store RCA screenshots, scrubs trace_signals (denylist +
-  // redact_patterns), and genericises error_message. redact_patterns = declared regex strings (the
-  // built-in denylist applies regardless). DEFAULT false → non-sensitive monitors are unchanged.
+  // stores no RAW artifacts: a FAILED run persists a REDACTED/REDUCED trace zip (traceRedact.ts),
+  // the permanent success-baseline zip + all screenshots are skipped, trace_signals is scrubbed
+  // (denylist + redact_patterns), and error_message is value-scrubbed (diagnostic text kept).
+  // redact_patterns = declared regex strings (the built-in denylist applies regardless).
+  // DEFAULT false → non-sensitive monitors are unchanged.
   sensitive: boolean;
   redact_patterns: string[] | null;
   severity: 'critical' | 'warning';

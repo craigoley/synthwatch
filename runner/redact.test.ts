@@ -71,30 +71,41 @@ test('IDENTITY_REDACTOR is a no-op (non-sensitive monitors are byte-for-byte unc
   assert.equal(IDENTITY_REDACTOR(s), s);
 });
 
-// ── the artifact-persistence plan: a SENSITIVE monitor persists NO trace artifacts ───────────────
-test('tracePersistPlan: a sensitive monitor persists NOTHING, any status', () => {
-  for (const status of ['fail', 'error', 'pass', 'warn'] as const) {
+// ── the artifact-persistence plan (B10, revised): sensitive failure → REDACTED zip; green → nothing ──
+test('★ tracePersistPlan: a sensitive FAILED run persists the REDACTED trace — still no screenshots/baselines', () => {
+  for (const status of ['fail', 'error'] as const) {
     assert.deepEqual(tracePersistPlan(true, status), {
-      failureTrace: false,
+      failureTraceMode: 'redacted',
       successBaseline: false,
       failureScreenshot: false,
       baselineScreenshot: false,
-    }, `sensitive + ${status} → no zips, no screenshots`);
+    }, `sensitive + ${status} → redacted zip only (never raw, never a screenshot)`);
   }
 });
 
-test('tracePersistPlan: a NON-sensitive monitor follows the normal status rules (unchanged)', () => {
+test('★ tracePersistPlan: green-discard HOLDS for sensitive — pass/warn persists nothing at all', () => {
+  for (const status of ['pass', 'warn'] as const) {
+    assert.deepEqual(tracePersistPlan(true, status), {
+      failureTraceMode: 'none',
+      successBaseline: false, // the purge-exempt baseline slot stays OFF for sensitive
+      failureScreenshot: false,
+      baselineScreenshot: false,
+    }, `sensitive + ${status} → fully discarded (no redacted copy either)`);
+  }
+});
+
+test('tracePersistPlan: a NON-sensitive monitor follows the normal status rules (unchanged: raw zip)', () => {
   assert.deepEqual(tracePersistPlan(false, 'fail'), {
-    failureTrace: true, successBaseline: false, failureScreenshot: true, baselineScreenshot: false,
+    failureTraceMode: 'raw', successBaseline: false, failureScreenshot: true, baselineScreenshot: false,
   });
   assert.deepEqual(tracePersistPlan(false, 'error'), {
-    failureTrace: true, successBaseline: false, failureScreenshot: true, baselineScreenshot: false,
+    failureTraceMode: 'raw', successBaseline: false, failureScreenshot: true, baselineScreenshot: false,
   });
   assert.deepEqual(tracePersistPlan(false, 'pass'), {
-    failureTrace: false, successBaseline: true, failureScreenshot: false, baselineScreenshot: true,
+    failureTraceMode: 'none', successBaseline: true, failureScreenshot: false, baselineScreenshot: true,
   });
   assert.deepEqual(tracePersistPlan(false, 'warn'), {
-    failureTrace: false, successBaseline: true, failureScreenshot: false, baselineScreenshot: false,
+    failureTraceMode: 'none', successBaseline: true, failureScreenshot: false, baselineScreenshot: false,
   });
 });
 

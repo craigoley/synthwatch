@@ -51,6 +51,7 @@ import {
   uploadSuccessTrace,
 } from './artifacts.js';
 import { extractTraceSignals } from './traceSignals.js';
+import { buildRedactedTraceZip } from './traceRedact.js';
 import { makeRedactor, IDENTITY_REDACTOR, tracePersistPlan, scrubError } from './redact.js';
 import { captureEgressIp } from './egress.js';
 import os from 'node:os';
@@ -622,12 +623,37 @@ async function runOneInner(
     } catch (err) {
       console.warn(`[runner] run ${runId} trace-signals extraction skipped (non-fatal):`, err);
     }
-    // ★ B10: a sensitive monitor stores NO raw trace zip — neither the per-run failure zip nor the
-    // permanent success-trace baseline (both carry the full session-bearing DOM/network). We keep
-    // ONLY the redacted trace_signals above. (Lost: the 90d failure trace + the baseline diff — an
-    // accepted trade for auth/cart.) Non-sensitive monitors: unchanged.
-    if (persist.failureTrace) {
+    // ★ B10 (revised — failed-run trace visibility): a sensitive monitor still stores NO RAW zip
+    // (the raw capture carries typed credentials, cookies/session tokens, and the logged-in DOM),
+    // but a FAILED run now persists a REDACTED, REDUCED copy (traceRedact.ts): text streams scrubbed
+    // by the monitor's redactor + structural session-material rules, binary entries (screencast
+    // frames — unscrubbable) dropped. Same per-run key + 90d purge as a raw failure trace. FAIL-
+    // CLOSED: if the redacted copy can't be built, nothing is uploaded. Green sensitive runs still
+    // discard everything (no permanent success-baseline — that slot is purge-exempt), and the
+    // screenshot skip above is unchanged. Non-sensitive monitors: unchanged ('raw'/'none').
+    if (persist.failureTraceMode === 'raw') {
       traceUrl = await uploadTrace(runId, outcome.tracePath);
+    } else if (persist.failureTraceMode === 'redacted') {
+      // The zip redactor = the run-level redactor's inputs PLUS the decrypted secret-header VALUES
+      // (the Akamai bypass token rides the trace's network stream as a literal header value, exactly
+      // like the typed credentials ride its DOM/console). A decrypt failure falls back to the
+      // run-level redactor: a value that never decrypted was never injected into this trace either.
+      let zipRedact = redact;
+      try {
+        const secretVals = Object.values(decryptSecretHeaders(check.secret_headers));
+        if (secretVals.length > 0) zipRedact = makeRedactor(check.redact_patterns, [...credValues, ...secretVals]);
+      } catch {
+        // fall back to `redact` (declared patterns + credential values)
+      }
+      const redactedPath = `${outcome.tracePath}.redacted.zip`;
+      if (buildRedactedTraceZip(outcome.tracePath, redactedPath, zipRedact)) {
+        traceUrl = await uploadTrace(runId, redactedPath);
+        await unlink(redactedPath).catch(() => {});
+      } else {
+        console.warn(
+          `[trace] run ${runId} redacted-trace build failed — trace NOT uploaded (fail-closed, non-fatal)`,
+        );
+      }
     } else if (persist.successBaseline) {
       try {
         const url = await uploadSuccessTrace(check.id, outcome.tracePath);
