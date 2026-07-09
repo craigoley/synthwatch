@@ -943,6 +943,61 @@ $$;
 COMMENT ON FUNCTION slo_status(bigint, timestamptz, timestamptz) IS
     'Per-check SLO over [p_from, p_to): target, error-budget (run-weighted), consumed, remaining, burn_rate=(down/total)/(1-target). Zero rows if no slo_target.';
 
+-- cost_projection(rate) — the SINGLE shared cost model (0069) both /reports/cost (api) and the narrative
+-- fact pack (runner) call, so their $ figures are identical by construction. projected = avg_s ×
+-- (2,592,000/interval) × regions × rate; measured = Σsec_7d × rate × 30/7; divergence = measured/projected
+-- (flag > 1.5). Sum projected_raw/measured_raw for the fleet total, then round.
+CREATE OR REPLACE FUNCTION cost_projection(p_rate numeric)
+RETURNS TABLE (
+    check_id         bigint,
+    source_key       text,
+    check_name       text,
+    kind             text,
+    interval_seconds integer,
+    region_count     integer,
+    avg_duration_s   double precision,
+    projected        numeric,
+    measured         numeric,
+    divergence       numeric,
+    divergence_flag  boolean,
+    projected_raw    numeric,
+    measured_raw     numeric
+)
+LANGUAGE sql
+STABLE
+AS $$
+    WITH base AS (
+        SELECT c.id AS check_id, c.source_key, c.name AS check_name, c.kind, c.interval_seconds,
+               (SELECT count(*)::int FROM check_locations cl WHERE cl.check_id = c.id) AS region_count,
+               ((SELECT avg(r.duration_ms) FROM runs r
+                   WHERE r.check_id = c.id AND r.started_at > now() - interval '7 days'
+                     AND r.duration_ms IS NOT NULL) / 1000.0)::float8 AS avg_duration_s,
+               ((SELECT sum(r.duration_ms) FROM runs r
+                   WHERE r.check_id = c.id AND r.started_at > now() - interval '7 days'
+                     AND r.duration_ms IS NOT NULL) / 1000.0)::float8 AS sum_duration_s_7d
+          FROM checks c
+         WHERE c.enabled
+    ),
+    scored AS (
+        SELECT b.*,
+               CASE WHEN b.avg_duration_s IS NOT NULL AND b.interval_seconds > 0
+                    THEN b.avg_duration_s::numeric * (2592000::numeric / b.interval_seconds) * b.region_count * p_rate
+                    ELSE 0 END AS p_raw,
+               CASE WHEN b.sum_duration_s_7d IS NOT NULL
+                    THEN b.sum_duration_s_7d::numeric * p_rate * (30::numeric / 7::numeric)
+                    ELSE 0 END AS m_raw
+          FROM base b
+    )
+    SELECT s.check_id, s.source_key, s.check_name, s.kind, s.interval_seconds, s.region_count, s.avg_duration_s,
+           round(s.p_raw, 2), round(s.m_raw, 2),
+           CASE WHEN s.p_raw > 0 THEN round(s.m_raw / s.p_raw, 3) ELSE NULL END,
+           CASE WHEN s.p_raw > 0 THEN round(s.m_raw / s.p_raw, 3) > 1.5 ELSE false END,
+           s.p_raw, s.m_raw
+      FROM scored s
+$$;
+COMMENT ON FUNCTION cost_projection(numeric) IS
+    'Shared cost model (0069): per-check projected/measured/divergence for a $/vCPU-s rate. Called by /reports/cost (api) + the narrative fact pack (runner) so figures match. Sum projected_raw/measured_raw for the fleet total, then round.';
+
 -- slo_burn_status (0055): the SHARED, location-aware SLO burn STATE — reproduces the runner's
 -- maybeBurnAlert threshold decision EXACTLY (read == page). STATE ONLY (no dispatch suppressors). See
 -- 0055_slo_burn_status.sql for the full contract; the differential red-test proves it matches the TS
