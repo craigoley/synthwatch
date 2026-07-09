@@ -13,7 +13,7 @@ import { writeFileSync, rmSync, mkdtempSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildRedactedTraceZip, classifyEntry, scrubTraceText } from './traceRedact.js';
-import { makeRedactor } from './redact.js';
+import { makeRedactor, IDENTITY_REDACTOR } from './redact.js';
 
 // mkdtemp per test (the secure temp-file pattern used by traceSignals.test.ts).
 function tmpDir(): string {
@@ -108,6 +108,43 @@ test('scrubTraceText: HAR header pair — cookie/set-cookie/authorization VALUES
   // the query-param token (built-in denylist) is gone too, the url path survives
   assert.ok(!out.includes('QUERYTOK99'));
   assert.ok(out.includes('/api/login'));
+});
+
+test('classifyEntry: the REAL playwright@1.61.1 layout (empirical probe) — bodies keep their mime extension', () => {
+  // Observed from an actual trace recorded with the runner's exact tracing options: response bodies
+  // are resources/<sha1>.<mime-ext>; screencast frames are resources/page@<hash>-<ts>.jpeg.
+  assert.equal(classifyEntry('resources/22b046e63a43a269aadb15ac311fcd0f6afc0dcd.html'), 'scrub');
+  assert.equal(classifyEntry('resources/567574ebe23fc34cf3d9ded15e7838d5a087bcf5.css'), 'scrub');
+  assert.equal(classifyEntry('resources/ba78b8520a074ee569ec13d0c5ce12b01d71508c.json'), 'scrub');
+  assert.equal(classifyEntry('resources/4e8639220cd5c5c5c9e8e6bd0153d162f0caf426.png'), 'drop');
+  assert.equal(classifyEntry('resources/page@2cb82aac3db7cd28d24431415a9e3d76-1783616044541.jpeg'), 'drop');
+});
+
+test('★ AUTHISH anchoring: ordinary English keys keep their values; genuinely auth-shaped keys lose them', () => {
+  // IDENTITY monitor redactor isolates the STRUCTURAL rules (rule 2: auth-ish JSON key).
+  const body = JSON.stringify({
+    residence: 'keep-1', // contains "sid" as a substring — must NOT be redacted (was, pre-anchor)
+    consideration: 'keep-2',
+    president: 'keep-3',
+    inside: 'keep-4',
+    author: 'keep-5', // contains "auth" as a substring — must NOT be redacted (was, pre-anchor)
+    authority: 'keep-6',
+    sid: 'gone-1',
+    'x-sid': 'gone-2',
+    sessid: 'gone-3',
+    sessionToken: 'gone-4',
+    authorization: 'gone-5',
+    auth: 'gone-6',
+    'x-auth-key': 'gone-7',
+    oauth_state: 'gone-8', // OAuth state IS a CSRF-class token — deliberately still redacted
+  });
+  const out = JSON.parse(scrubTraceText(body, IDENTITY_REDACTOR)) as Record<string, string>;
+  for (const k of ['residence', 'consideration', 'president', 'inside', 'author', 'authority']) {
+    assert.ok(out[k].startsWith('keep-'), `"${k}" is not auth-shaped — its value must survive (got: ${out[k]})`);
+  }
+  for (const k of ['sid', 'x-sid', 'sessid', 'sessionToken', 'authorization', 'auth', 'x-auth-key', 'oauth_state']) {
+    assert.equal(out[k], '<redacted>', `"${k}" is auth-shaped — its value must be redacted`);
+  }
 });
 
 test('scrubTraceText: auth-ish JSON key in a response body redacted; non-auth fields untouched', () => {
