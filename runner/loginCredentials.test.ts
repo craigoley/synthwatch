@@ -8,9 +8,12 @@ import {
   applyLoginCredentials,
   clearLoginCredentials,
   credentialEnvKey,
+  redactableCredValues,
+  NON_SECRET_CRED_ROLES,
 } from './loginCredentials.js';
 import { credential } from './specfetch/specShim.js';
 import { encryptCredValue, loadCredEncKey } from './crypto.js';
+import { makeRedactor } from './redact.js';
 
 const TEST_KEY_B64 = Buffer.from(Array.from({ length: 32 }, (_, i) => i)).toString('base64');
 const TOUCHED = ['CRED_ENC_KEY', 'SW_CRED_USERNAME', 'SW_CRED_PASSWORD'];
@@ -124,4 +127,48 @@ test('credential(role): returns the published (decrypted) value; throws fail-clo
   } finally {
     restoreEnv(saved);
   }
+});
+
+// ── ★ un-redact the non-secret TEST-ACCOUNT username (was blocking shop-flow login debugging) ──
+// The runner registered ALL resolved credential values into the redactor, so the typed username was scrubbed
+// from traces/logs and Craig couldn't see what username failed to log in. redactableCredValues excludes the
+// 'username' role (a non-secret identifier) while keeping the password (and any other role) redacted.
+
+test('redactableCredValues: EXCLUDES the username value, KEEPS the password value', () => {
+  const vals = redactableCredValues({ username: 'shopflow@wegmans.test', password: 'sup3r-secret-pw' });
+  assert.deepEqual(vals, ['sup3r-secret-pw']); // username dropped, password kept
+});
+
+test('redactableCredValues: username exclusion is case-insensitive; unknown roles stay redacted (fail-closed)', () => {
+  const vals = redactableCredValues({ Username: 'a@test', password: 'pw-secret', totpSecret: 'otp-secret' });
+  assert.ok(!vals.includes('a@test'), 'username (any case) must be excluded');
+  assert.ok(vals.includes('pw-secret'), 'password must stay redactable');
+  assert.ok(vals.includes('otp-secret'), 'an UNKNOWN role must default to redactable (fail-closed)');
+  assert.deepEqual([...NON_SECRET_CRED_ROLES], ['username']); // only username is declared non-secret
+});
+
+test('through makeRedactor: username appears in CLEARTEXT, password is REDACTED (must-go-red both ways)', () => {
+  const resolved = { username: 'shopflow@wegmans.test', password: 'sup3r-secret-pw' };
+  const src = 'shop-flow login: entered username shopflow@wegmans.test with password sup3r-secret-pw';
+
+  // NEW (the fix): only the password value is registered → username survives, password scrubbed.
+  const fixed = makeRedactor(null, redactableCredValues(resolved))(src);
+  assert.match(fixed, /shopflow@wegmans\.test/, 'username MUST be visible (the whole point)');
+  assert.doesNotMatch(fixed, /sup3r-secret-pw/, 'password value MUST still be scrubbed');
+  assert.match(fixed, /<redacted>/, 'the password was replaced by the redaction marker');
+
+  // OLD (Object.values — the bug): ALL values registered → the username was ALSO scrubbed, hiding it from
+  // Craig. This proves the redactor was the mechanism and the role-filter is load-bearing.
+  const old = makeRedactor(null, Object.values(resolved))(src);
+  assert.doesNotMatch(old, /shopflow@wegmans\.test/, 'old behavior wrongly redacted the username');
+});
+
+test('no regression: cookies / authorization / session tokens still redacted (built-in key rules intact)', () => {
+  // The username exclusion only affects the credential-VALUE literal set; the built-in key-shape denylist
+  // (cookie/authorization/token=/session_id=/jwt=…) is untouched.
+  const redact = makeRedactor(null, redactableCredValues({ username: 'shopflow@wegmans.test', password: 'pw-secret' }));
+  const s = redact('set-cookie: session=abc123deadbeef; authorization: Bearer eyJraeReallyLongTokenValue; token=zzz9secret9value');
+  assert.doesNotMatch(s, /abc123deadbeef/, 'session cookie value still redacted');
+  assert.doesNotMatch(s, /eyJraeReallyLongTokenValue/, 'bearer token still redacted');
+  assert.doesNotMatch(s, /zzz9secret9value/, 'token= value still redacted');
 });

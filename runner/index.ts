@@ -23,6 +23,7 @@ import {
   applyLoginCredentials,
   clearLoginCredentials,
   resolveLoginCredentials,
+  redactableCredValues,
   type CredEnvHandle,
 } from './loginCredentials.js';
 import { runSslCheck } from './sslCheck.js';
@@ -530,7 +531,9 @@ async function runOneInner(
   // BOTH redactors (run-level below + the step redactor in executeBrowser) as escaped-literal rules so the
   // bare typed value is scrubbed from console/error/trace_signals. Only for a sensitive monitor (a
   // non-sensitive monitor gets IDENTITY_REDACTOR — no scrubbing — so registering values would be moot).
-  const credValues = check.sensitive ? Object.values(resolveLoginCredentials(check.login_credentials)) : [];
+  // redactableCredValues EXCLUDES the non-secret 'username' role (a test-account identifier), so the typed
+  // username stays visible for login debugging while the password + every other role stay redacted.
+  const credValues = check.sensitive ? redactableCredValues(resolveLoginCredentials(check.login_credentials)) : [];
   // Wall-clock start of the (final) executor attempt — the OTel root span's start.
   let execStartMs = Date.now();
   const { result: outcome, attempts: retryCount } = await runWithRetry<Outcome>(
