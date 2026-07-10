@@ -127,9 +127,17 @@ const RETRY_BACKOFF_MS = 5000;
 // Whole-flow wall-clock ceiling for a BROWSER run (mirrors multistep's MAX_CHAIN_MS — that family
 // fixed this exact class first). page.setDefaultTimeout bounds each ACTION (check.timeout_ms);
 // without a flow ceiling, k slow-but-passing actions could run ~k × timeout_ms and ride into the
-// ACA replicaTimeout (240s) kill — no verdict, a stranded 'running' row, and the rest of the tick's
-// due checks silently deferred. 180s leaves ~60s of the 240s budget for teardown/steps that follow.
-const MAX_FLOW_MS = 180_000;
+// ACA replicaTimeout kill — no verdict, a stranded 'running' row, and the rest of the tick's
+// due checks silently deferred.
+//
+// 600s (10 min): the long authenticated flows (e.g. wegmans-full-shop-flow — login ~40s + ~40-75s
+// per product × 4 products) legitimately need it, and it aligns with the SPEC's own RUN_CAP_MS =
+// 600_000. This ceiling must stay ≤ the ACA replicaTimeout (infra/main.bicep, now 660s on the 3
+// runner jobs): MAX_FLOW_MS above the replicaTimeout would strand the run at the ACA kill with no
+// verdict. 600s leaves ~60s of the 660s replicaTimeout for teardown / trace upload (the same ratio
+// the original 180/240 pair carried). Only the CEILING moves — per-action timeouts (check.timeout_ms,
+// ~30s) are unchanged, so fast checks still fail fast; this only lets a genuinely long flow finish.
+const MAX_FLOW_MS = 600_000;
 
 // How fresh the per-monitor success-trace baseline must be before we SKIP re-uploading it on a pass.
 // Capturing+uploading a multi-MB trace on every successful tick would be wasteful for a healthy 5-min
