@@ -46,6 +46,28 @@ export function resolveLoginCredentials(enc: LoginCredentialValues | null | unde
   return out;
 }
 
+/**
+ * Credential ROLES whose value is a NON-SECRET identifier — safe to appear in CLEARTEXT in traces/logs.
+ * A shop-flow TEST-ACCOUNT username is a login identifier (like a throwaway email), not a secret; redacting
+ * it hid what username was actually typed and blocked debugging the failing shop-flow login. Everything NOT
+ * listed here (password + any future role) STAYS redacted — fail-CLOSED, so a new secret role is never
+ * silently leaked; only an explicitly-declared non-secret role becomes visible. Compared case-insensitively
+ * (roles are upper-cased into SW_CRED_<ROLE>).
+ */
+export const NON_SECRET_CRED_ROLES: ReadonlySet<string> = new Set(['username']);
+
+/**
+ * The subset of resolved credential VALUES that must be scrubbed from traces/logs: every role EXCEPT the
+ * NON_SECRET_CRED_ROLES. So the password (and any unrecognised role) is registered for redaction while the
+ * username identifier is left visible. This feeds ONLY the redactors (run/step/zip) — it is NOT the publish
+ * path, so every role (username included) is still injected to the spec via SW_CRED_<ROLE>.
+ */
+export function redactableCredValues(resolved: Record<string, string>): string[] {
+  return Object.entries(resolved)
+    .filter(([role]) => !NON_SECRET_CRED_ROLES.has(role.toLowerCase()))
+    .map(([, value]) => value);
+}
+
 /** A published SW_CRED_<ROLE> env var + the value it had BEFORE publish (undefined = didn't exist), so the
  *  cleanup can RESTORE the prior value rather than blindly deleting — defensive if the reserved SW_CRED_*
  *  namespace ever collides with a pre-existing job env var. */
