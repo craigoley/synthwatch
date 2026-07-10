@@ -472,7 +472,11 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
     environmentId: managedEnvironment.id
     configuration: {
       triggerType: 'Schedule'
-      replicaTimeout: 240
+      // 660s = the runner's MAX_FLOW_MS (600s, the long authenticated browser flows) + ~60s headroom
+      // for browser teardown / trace upload (the original 180/240 ratio). Must stay ≥ MAX_FLOW_MS or a
+      // long flow is stranded at the ACA kill. Fleet-wide CEILING: applies to every check this job runs,
+      // but per-kind budgets still bound normal checks (multistep 180s, http/net/ssl seconds).
+      replicaTimeout: 660
       replicaRetryLimit: 0
       scheduleTriggerConfig: {
         cronExpression: '*/5 * * * *'
@@ -687,7 +691,8 @@ resource centralusJob 'Microsoft.App/jobs@2024-03-01' = {
     environmentId: centralusEnvironment.id
     configuration: {
       triggerType: 'Schedule'
-      replicaTimeout: 240
+      // 660s: see the primary `job` above — MAX_FLOW_MS (600s) + ~60s teardown headroom.
+      replicaTimeout: 660
       replicaRetryLimit: 0
       scheduleTriggerConfig: {
         cronExpression: '*/5 * * * *'
@@ -884,7 +889,8 @@ resource westus2Job 'Microsoft.App/jobs@2024-03-01' = {
     environmentId: westus2Environment.id
     configuration: {
       triggerType: 'Schedule'
-      replicaTimeout: 240
+      // 660s: see the primary `job` above — MAX_FLOW_MS (600s) + ~60s teardown headroom.
+      replicaTimeout: 660
       replicaRetryLimit: 0
       scheduleTriggerConfig: {
         cronExpression: '*/5 * * * *'

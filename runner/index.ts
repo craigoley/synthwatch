@@ -111,7 +111,7 @@ interface Outcome {
 }
 
 // A 'running' row older than this is assumed orphaned by a hard crash (the ACA
-// replicaTimeout is 240s, so 30 min is comfortably beyond any real run) and is
+// replicaTimeout is 660s, so 30 min is comfortably beyond any real run) and is
 // reaped to 'error' so the failure is visible to SLA/incidents rather than
 // lingering as in-flight forever.
 const STALE_RUNNING = "30 minutes";
@@ -127,9 +127,26 @@ const RETRY_BACKOFF_MS = 5000;
 // Whole-flow wall-clock ceiling for a BROWSER run (mirrors multistep's MAX_CHAIN_MS — that family
 // fixed this exact class first). page.setDefaultTimeout bounds each ACTION (check.timeout_ms);
 // without a flow ceiling, k slow-but-passing actions could run ~k × timeout_ms and ride into the
-// ACA replicaTimeout (240s) kill — no verdict, a stranded 'running' row, and the rest of the tick's
-// due checks silently deferred. 180s leaves ~60s of the 240s budget for teardown/steps that follow.
-const MAX_FLOW_MS = 180_000;
+// ACA replicaTimeout kill — no verdict, a stranded 'running' row, and the rest of the tick's
+// due checks silently deferred.
+//
+// 600s (10 min): the long authenticated flows (e.g. wegmans-full-shop-flow — login ~40s + ~40-75s
+// per product × 4 products) legitimately need it, and it aligns with the SPEC's own RUN_CAP_MS =
+// 600_000. This ceiling must stay ≤ the ACA replicaTimeout (infra/main.bicep, now 660s on the 3
+// runner jobs): MAX_FLOW_MS above the replicaTimeout would strand the run at the ACA kill with no
+// verdict. 600s leaves ~60s of the 660s replicaTimeout for teardown / trace upload (the same ratio
+// the original 180/240 pair carried). Only the CEILING moves — per-action timeouts (check.timeout_ms,
+// ~30s) are unchanged, so fast checks still fail fast; this only lets a genuinely long flow finish.
+const MAX_FLOW_MS = 600_000;
+
+// The ACA replicaTimeout on the 3 runner jobs (infra/main.bicep) — the HARD wall-clock a runner
+// replica can live before ACA kills the process. Any run still 'running' PAST this is dead (killed),
+// not in-flight. HEADER CONTRACT: this lives cross-repo in bicep and can't be type-checked here, so
+// it MUST be raised in lockstep with the bicep replicaTimeout. Used by the run-now dedup below to
+// decide whether an existing 'running' row is a live run to defer to; when it was hardcoded to the
+// old 240s and MAX_FLOW_MS grew past it, a long flow (240s→completion) fell outside the window and a
+// concurrent on-demand forceClaim would start a DUPLICATE run for the same check.
+const ACA_REPLICA_TIMEOUT_S = 660;
 
 // How fresh the per-monitor success-trace baseline must be before we SKIP re-uploading it on a pass.
 // Capturing+uploading a multi-MB trace on every successful tick would be wasteful for a healthy 5-min
@@ -159,7 +176,7 @@ async function main(): Promise<void> {
   enforceProdGuard();
 
   // Tick wall-clock start — the budget denominator for the loop-end summary line below (the ACA
-  // replicaTimeout is 240s; a tick nearing it is about to defer work to the next tick).
+  // replicaTimeout is 660s; a tick nearing it is about to defer work to the next tick).
   const tickStartMs = Date.now();
   // Stamp the per-invocation correlation id on stdout so an ACA log line + a runner_errors row reconcile.
   console.log(`[runner] invocation ${INVOCATION_ID} (location=${LOCATION})`);
@@ -224,7 +241,7 @@ async function main(): Promise<void> {
   }
 
   // Tick-budget telemetry (zero schema change): one greppable line per tick with claimed-vs-due
-  // and wall-time. This is how starvation becomes VISIBLE — a replicaTimeout (240s) kill leaves no
+  // and wall-time. This is how starvation becomes VISIBLE — a replicaTimeout (660s) kill leaves no
   // queryable trace (no SIGTERM handler; the process just dies), so a tick that ran long shows up
   // here as wall-time approaching the budget, and one that was killed shows up as this line MISSING
   // for that invocation (grep the invocation id from the first log line).
@@ -280,7 +297,7 @@ async function reapStaleRunning(): Promise<void> {
  * guard cannot double-fire). Cheap pre-filter; claim() is the real (atomic) gate.
  *
  * ★ ORDER BY last_run_at ASC NULLS FIRST — longest-unserved first (NULL = never ran =
- * most starved). The loop is sequential and the ACA replicaTimeout (240s) can kill a
+ * most starved). The loop is sequential and the ACA replicaTimeout (660s) can kill a
  * tick mid-list; with UNSPECIFIED order (Postgres heap order, ~stable tick-to-tick)
  * the SAME tail checks would starve on every over-budget tick. Oldest-first turns
  * persistent starvation into rotation: whatever was deferred last tick has the oldest
@@ -376,8 +393,8 @@ async function drainRunRequests(): Promise<number> {
     const { rowCount: running } = await pool.query(
       `SELECT 1 FROM runs
         WHERE check_id = $1 AND location = $2 AND status = 'running'
-          AND started_at > now() - make_interval(secs => 240) LIMIT 1`,
-      [check_id, LOCATION],
+          AND started_at > now() - make_interval(secs => $3::int) LIMIT 1`,
+      [check_id, LOCATION, ACA_REPLICA_TIMEOUT_S],
     );
     if (running) {
       console.log(`[run-now] check ${check_id} already running here — request consumed, skipping a duplicate run`);
