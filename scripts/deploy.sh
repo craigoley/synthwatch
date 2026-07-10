@@ -73,7 +73,15 @@ readonly MIGRATE_JOB='synthwatch-migrate-job'
 # Repo root, so the script works from any cwd.
 ROOT="$(git rev-parse --show-toplevel)"
 readonly ROOT
-readonly TEMPLATE="${ROOT}/infra/main.bicep"
+# The infra template is deployed from the TARGET COMMIT (origin/main), NOT the working tree. The tree
+# can be stale/behind — the BENIGN post-squash-merge state this script explicitly permits ("never touch
+# the working tree", sync_target_to_origin) — and compiling ITS bicep would ship a PRE-merge template
+# with the correct POST-merge image. That is the #250 replicaTimeout drift: origin/main=660, a behind
+# working tree=240, `az create` reported success at 240, and the what-if (stale-template 240 vs live 240)
+# showed "clean". TEMPLATE is materialized from the target by materialize_template() (below); the path is
+# the source location WITHIN that commit.
+readonly TEMPLATE_SRC_PATH="infra/main.bicep"
+TEMPLATE=''  # materialized temp file (a real .bicep so az compiles it); set after the target is resolved
 
 WHATIF_ONLY=0
 POST_RECONCILE=0
@@ -100,8 +108,15 @@ source "${ROOT}/scripts/lib/deploy-lib.sh"
 # A temp file for the what-if JSON; cleaned up on exit. (@secure params are redacted by
 # what-if, so this file never contains PG_PW/ACS_CONN — verified — but we still scope it tight.)
 WHATIF_JSON=''
+# Temp DIR holding the materialized target-commit template (a dir so the file keeps its .bicep name,
+# which az needs to compile it as bicep — and so any future sibling module is materialized alongside it).
+TEMPLATE_DIR=''
 # shellcheck disable=SC2329  # invoked indirectly via the EXIT trap
-cleanup() { [[ -n "${WHATIF_JSON}" && -f "${WHATIF_JSON}" ]] && rm -f "${WHATIF_JSON}"; }
+cleanup() {
+  [[ -n "${WHATIF_JSON}" && -f "${WHATIF_JSON}" ]] && rm -f "${WHATIF_JSON}"
+  [[ -n "${TEMPLATE_DIR}" && -d "${TEMPLATE_DIR}" ]] && rm -rf "${TEMPLATE_DIR}"
+  return 0
+}
 trap cleanup EXIT
 
 # ---------------------------------------------------------------------------
@@ -400,6 +415,27 @@ SHA="$(pick_sha)"
 readonly SHA
 readonly RUNNER_IMG="${LOGIN_SERVER}/${RUNNER_REPO}:${SHA}"
 readonly MIGRATE_IMG="${LOGIN_SERVER}/${MIGRATE_REPO}:${SHA}"
+
+# ---------------------------------------------------------------------------
+# Materialize the infra template from the DEPLOY TARGET commit — the change that makes "deploy
+# origin/main" TRUE for the TEMPLATE, not just the image. Ref = origin/main (TARGET_HEAD) normally, or
+# the resolved SHA under --sha (sync skipped, TARGET_HEAD empty). NEVER the working tree: a behind/stale
+# tree is the benign post-merge norm this script deploys THROUGH, and its bicep would be pre-merge.
+# main.bicep is self-contained (no module/loadTextContent/loadFileAsBase64 refs — verified), so a single
+# `git show` into a temp dir is sufficient; the dir keeps the `.bicep` name az needs and would house any
+# future sibling module. Fail LOUDLY rather than silently fall back to the tree (the bug being fixed).
+# ---------------------------------------------------------------------------
+materialize_template() {
+  local ref="${TARGET_HEAD:-${SHA}}"
+  TEMPLATE_DIR="$(mktemp -d -t synthwatch-tpl.XXXXXX)" \
+    || fail "could not create a temp dir for the materialized template."
+  TEMPLATE="${TEMPLATE_DIR}/main.bicep"
+  git show "${ref}:${TEMPLATE_SRC_PATH}" > "${TEMPLATE}" 2>/dev/null \
+    || fail "cannot materialize ${TEMPLATE_SRC_PATH} from ${ref:0:12} — refusing to fall back to the (possibly stale) working tree. Is that commit fetched?"
+  [[ -s "${TEMPLATE}" ]] || fail "materialized template ${ref:0:12}:${TEMPLATE_SRC_PATH} is empty."
+  c_green "Infra template: deploying ${ref:0:12}:${TEMPLATE_SRC_PATH} (origin's IaC — NOT the working tree, which may be behind)." >&2
+}
+materialize_template
 
 # ---------------------------------------------------------------------------
 # 3. Run the what-if (structured JSON via --no-pretty-print). Secrets passed inline.
