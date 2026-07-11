@@ -231,12 +231,28 @@ test('apply upsert NEVER writes dashboard-owned columns', () => {
     'min_fail_locations',
     'slo_target',
     'assertions',
+    'archived_at', // ★ 0071: reversible archive is DASHBOARD-OWNED — reconcile must never touch it.
   ];
   for (const c of dashboardOwned) {
     assert.ok(!insertColumns.includes(c), `${c} must not be inserted`);
     assert.ok(!updateColumns.includes(c), `${c} must not be updated`);
     assert.ok(!text.includes(c), `${c} must not appear in the upsert SQL`);
   }
+});
+
+// ★ 0071 archive safety: archived_at must be in NEITHER git-write allow-list, so a manifest apply is
+// STRUCTURALLY incapable of writing it — the "survives reconcile" guarantee (a dashboard archive can never
+// be silently un-archived by a git apply, the same property tags/severity/locations rely on).
+test('★ archived_at is dashboard-owned: absent from every reconcile write allow-list (survives apply)', () => {
+  assert.ok(
+    !(GIT_AUTHORITATIVE_COLUMNS as readonly string[]).includes('archived_at'),
+    'archived_at must NOT be git-authoritative (else every apply would clobber a dashboard archive)',
+  );
+  assert.ok(
+    !(SEED_ONLY_COLUMNS as readonly string[]).includes('archived_at'),
+    'archived_at must NOT be seed-only',
+  );
+  assert.ok(!CHANGED_UPDATE_COLUMNS.includes('archived_at'), 'archived_at must NOT be in the changed-field UPDATE set');
 });
 
 test('apply upsert conflict-targets source_key and seeds the right values', () => {

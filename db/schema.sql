@@ -113,6 +113,13 @@ CREATE TABLE checks (
     enabled            BOOLEAN     NOT NULL DEFAULT TRUE,
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
 
+    -- Reversible, DASHBOARD-OWNED archive (mirrors 0071_checks_archived_at.sql). NULL = active;
+    -- a timestamp = archived (stops running, shows "archived", re-activatable — clear it to restore the
+    -- exact prior enabled/paused state). DISTINCT from pause (enabled=false). The runner's due-loop +
+    -- on-demand gates add `archived_at IS NULL`. ★ In NEITHER reconcile allow-list → a manifest apply
+    -- NEVER writes it (survives reconcile, like tags). Set/cleared by the api (PUT /checks/{id}/archive).
+    archived_at        TIMESTAMPTZ,
+
     -- Lighthouse / perf-budget config (Tier 3 — schema only for now; the audit
     -- code paths land in a later PR and nothing reads these yet). Kept in sync
     -- with db/migrations/0001_run_metrics.sql.

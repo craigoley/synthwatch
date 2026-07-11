@@ -312,6 +312,7 @@ async function findDueChecks(): Promise<{ id: number }[]> {
        JOIN check_locations cl
          ON cl.check_id = c.id AND cl.location = $1
       WHERE c.enabled
+        AND c.archived_at IS NULL
         AND ${DUE_PREDICATE_SQL}
       ORDER BY cl.last_run_at ASC NULLS FIRST, c.id ASC`,
     [LOCATION],
@@ -340,6 +341,7 @@ async function claim(id: number): Promise<Check | null> {
           AND cl.location = $2
           AND c.id = cl.check_id
           AND c.enabled
+          AND c.archived_at IS NULL
           AND ${DUE_PREDICATE_SQL}
        RETURNING cl.check_id
      ),
@@ -370,11 +372,14 @@ async function drainRunRequests(): Promise<number> {
   // first). Filtering to runnable-here requests first means a runner only ever claims what it can execute.
   // ★ SANDBOX (0064): the `AND c.enabled` gate is relaxed to `(c.enabled OR rr.sandbox)` so a SANDBOX-flagged
   // request may claim a PAUSED check — a NORMAL request (sandbox=false) still requires enabled (unchanged).
+  // ★ ARCHIVE (0071): same shape — an ARCHIVED check refuses a NORMAL on-demand run but a SANDBOX request
+  // may still validate it (mirrors the paused precedent; sandbox never opens incidents/alerts/SLO).
   const { rows: pending } = await pool.query<{ id: number; check_id: number; sandbox: boolean }>(
     `SELECT rr.id, rr.check_id, rr.sandbox
        FROM run_requests rr
        JOIN check_locations cl ON cl.check_id = rr.check_id AND cl.location = $1
        JOIN checks c           ON c.id = rr.check_id AND (c.enabled OR rr.sandbox)
+                                                     AND (c.archived_at IS NULL OR rr.sandbox)
       WHERE rr.status = 'pending'
       ORDER BY rr.requested_at`,
     [LOCATION],
@@ -443,6 +448,7 @@ async function forceClaim(id: number, sandbox = false): Promise<Check | null> {
           SET last_run_at = now()
          FROM checks c
         WHERE cl.check_id = $1 AND cl.location = $2 AND c.id = cl.check_id AND (c.enabled OR $3)
+          AND (c.archived_at IS NULL OR $3)
        RETURNING cl.check_id
      ),
      mirror AS (
