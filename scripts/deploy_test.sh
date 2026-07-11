@@ -459,6 +459,20 @@ expect_eq "bicep_field job cpu (unwraps json)"                   "2.0"  "$(print
 expect_eq "bicep_field job memory (strips quotes)"              "4Gi"  "$(printf '%s' "${BICEP_FIXTURE}" | bicep_field job memory)"
 expect_eq "bicep_field retentionJob replicaTimeout (NOT the runner 660)" "600" "$(printf '%s' "${BICEP_FIXTURE}" | bicep_field retentionJob replicaTimeout)"
 
+# ★ ABSENT field → EMPTY, not a non-zero-exit abort. This file runs under `set -euo pipefail` (like
+# deploy.sh), so `exp="$(bicep_field …)"` on a block MISSING the field would kill the run mid-line if the
+# grep pipeline weren't `|| true`-guarded — bypassing verify()'s graceful `<none in template>` flunk. That
+# these three assignments complete AT ALL proves no abort; the empty result proves absence is handled.
+NOFIELD_FIXTURE="$(cat <<'FIX'
+resource job 'Microsoft.App/jobs@2024-03-01' = {
+  properties: { template: { containers: [ { } ] } }
+}
+FIX
+)"
+expect_eq "bicep_field ABSENT replicaTimeout → empty, no set-e abort" "" "$(printf '%s' "${NOFIELD_FIXTURE}" | bicep_field job replicaTimeout)"
+expect_eq "bicep_field ABSENT cpu → empty, no set-e abort"            "" "$(printf '%s' "${NOFIELD_FIXTURE}" | bicep_field job cpu)"
+expect_eq "bicep_field ABSENT memory → empty, no set-e abort"         "" "$(printf '%s' "${NOFIELD_FIXTURE}" | bicep_field job memory)"
+
 if num_eq "2.0" "2";  then green "PASS  num_eq 2.0==2 (cpu tolerance)"; else red "FAIL  num_eq 2.0==2";   FAILS=$((FAILS + 1)); fi
 if num_eq "660" "660"; then green "PASS  num_eq 660==660";            else red "FAIL  num_eq 660==660"; FAILS=$((FAILS + 1)); fi
 # ★ MUST-GO-RED: a dropped value (live 240 vs expected 660) MUST be unequal → verify() flunks the deploy.

@@ -319,10 +319,15 @@ bicep_block() {
 # resource (empty if absent). cpu unwraps json('X'); memory strips the quotes; replicaTimeout is the int.
 bicep_field() {
   local block; block="$(bicep_block "$1")"
+  # ★ Each case ends in `|| true`: a field ABSENT from the block makes the grep pipeline exit non-zero,
+  # which — since verify() reads this via `exp="$(bicep_field …)"` under `set -euo pipefail` — would abort
+  # the whole DEPLOY instead of letting num_eq/`<none in template>` flunk it gracefully. Absence must yield
+  # EMPTY (a flunk), never a hard exit (a future bicep reformat that drops/moves a value must fail loud in
+  # verify(), not kill the deploy mid-run).
   case "$2" in
-    replicaTimeout) printf '%s' "${block}" | grep -oE 'replicaTimeout:[[:space:]]*[0-9]+' | head -1 | grep -oE '[0-9]+' ;;
-    cpu)            printf '%s' "${block}" | grep -oE "cpu:[[:space:]]*json\('[0-9.]+'\)" | head -1 | grep -oE "[0-9.]+" ;;
-    memory)         printf '%s' "${block}" | grep -oE "memory:[[:space:]]*'[0-9A-Za-z.]+'" | head -1 | sed -E "s/memory:[[:space:]]*'//; s/'//" ;;
+    replicaTimeout) printf '%s' "${block}" | grep -oE 'replicaTimeout:[[:space:]]*[0-9]+' | head -1 | grep -oE '[0-9]+' || true ;;
+    cpu)            printf '%s' "${block}" | grep -oE "cpu:[[:space:]]*json\('[0-9.]+'\)" | head -1 | grep -oE "[0-9.]+" || true ;;
+    memory)         printf '%s' "${block}" | grep -oE "memory:[[:space:]]*'[0-9A-Za-z.]+'" | head -1 | sed -E "s/memory:[[:space:]]*'//; s/'//" || true ;;
   esac
 }
 
