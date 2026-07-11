@@ -53,8 +53,8 @@ test('resolveLoginCredentials: FAIL-CLOSED on a leaf that is not v1 ciphertext (
   const saved = snapshot();
   try {
     process.env.CRED_ENC_KEY = TEST_KEY_B64;
-    // 'B2C_TEST_USER' is a legacy ref-name, not "v1:" ciphertext → decrypt throws → resolve throws.
-    assert.throws(() => resolveLoginCredentials({ username: 'B2C_TEST_USER' }), /did not decrypt/);
+    // A bare env-var ref-name (legacy model-A shape), not "v1:" ciphertext → decrypt throws → resolve throws.
+    assert.throws(() => resolveLoginCredentials({ username: 'LEGACY_ENV_REF' }), /did not decrypt/);
   } finally {
     restoreEnv(saved);
   }

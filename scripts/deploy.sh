@@ -57,8 +57,6 @@ readonly MIGRATE_REPO='synthwatch-migrate'
 readonly ENV_FILE="${HOME}/.synthwatch.env"
 readonly EXPECTED_API_VERSION='2025-04-01-preview'   # the #93/#94 fix — must survive every deploy
 readonly ACS_SECRET_REF='acs-email-conn'             # the runner ACS env's secretRef — the wipe canary
-readonly B2C_USER_SECRET_REF='b2c-test-user'         # B2C_TEST_USER secretRef — the b2c-login-test wipe canary
-readonly B2C_PASS_SECRET_REF='b2c-test-pass'         # B2C_TEST_PASS secretRef
 readonly CRED_ENC_KEY_SECRET_REF='cred-enc-key'      # CRED_ENC_KEY secretRef — model-B value crypto (runner decrypt)
 readonly API_HEALTH_URL='https://synthwatch-api.azurewebsites.net/api/checks'
 readonly API_CRED_FP_URL='https://synthwatch-api.azurewebsites.net/api/cred-key/fingerprint'  # model-B key drift-check
@@ -453,8 +451,6 @@ run_whatif() {
         acsEmailConnectionString="${ACS_CONN}" \
         vercelBypassToken="${VERCEL_BYPASS_TOKEN}" \
         alertRecipientEmail="${ALERT_RECIPIENT_EMAIL}" \
-        b2cTestUser="${B2C_TEST_USER:-}" \
-        b2cTestPass="${B2C_TEST_PASS:-}" \
         credEncKey="${CRED_ENC_KEY:?CRED_ENC_KEY must be set in ~/.synthwatch.env before deploy (base64 of 32 random bytes; an empty ACA secret is rejected and the runner cannot decrypt credential values)}" \
         runnerImage="${RUNNER_IMG}" \
         migrateImage="${MIGRATE_IMG}" \
@@ -519,8 +515,6 @@ do_deploy() {
         acsEmailConnectionString="${ACS_CONN}" \
         vercelBypassToken="${VERCEL_BYPASS_TOKEN}" \
         alertRecipientEmail="${ALERT_RECIPIENT_EMAIL}" \
-        b2cTestUser="${B2C_TEST_USER:-}" \
-        b2cTestPass="${B2C_TEST_PASS:-}" \
         credEncKey="${CRED_ENC_KEY:?CRED_ENC_KEY must be set in ~/.synthwatch.env before deploy (base64 of 32 random bytes; an empty ACA secret is rejected and the runner cannot decrypt credential values)}" \
         runnerImage="${RUNNER_IMG}" \
         migrateImage="${MIGRATE_IMG}" \
@@ -594,16 +588,6 @@ verify() {
   v="$(job_env_secretref "${RUNNER_JOB}" ACS_EMAIL_CONNECTION_STRING)"
   [[ "${v}" == "${ACS_SECRET_REF}" ]] && ok=1 || ok=0
   check "${ok}" "${RUNNER_JOB} ACS_EMAIL_CONNECTION_STRING secretRef='${v}' (expect ${ACS_SECRET_REF})"
-
-  # B2C secretRef PLUMBING present on the runner job (the b2c-login-test wipe canary). Asserts the
-  # env→secretRef mapping is intact — NOT that the value is set (the value is fail-soft/'' until Craig
-  # supplies it in ~/.synthwatch.env). A future deploy that drops the plumbing is caught here.
-  v="$(job_env_secretref "${RUNNER_JOB}" B2C_TEST_USER)"
-  [[ "${v}" == "${B2C_USER_SECRET_REF}" ]] && ok=1 || ok=0
-  check "${ok}" "${RUNNER_JOB} B2C_TEST_USER secretRef='${v}' (expect ${B2C_USER_SECRET_REF})"
-  v="$(job_env_secretref "${RUNNER_JOB}" B2C_TEST_PASS)"
-  [[ "${v}" == "${B2C_PASS_SECRET_REF}" ]] && ok=1 || ok=0
-  check "${ok}" "${RUNNER_JOB} B2C_TEST_PASS secretRef='${v}' (expect ${B2C_PASS_SECRET_REF})"
 
   # CRED_ENC_KEY secretRef PLUMBING present on the runner job (model-B value crypto — the decrypt canary).
   # Asserts the env→secretRef mapping is intact (not the value). A future deploy that drops it → runner

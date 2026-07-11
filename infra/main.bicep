@@ -77,15 +77,7 @@ param acsEmailConnectionString string
 @secure()
 param vercelBypassToken string
 
-@description('B2C test-account username for the on-demand b2c-login-test monitor (env B2C_TEST_USER). Secret — supplied at deploy from ~/.synthwatch.env, EXACTLY like acsEmailConnectionString/vercelBypassToken (deploy.sh passes it inline; a redeploy re-asserts it → never dropped). Default \'\' → fail-soft: the DISABLED on-demand monitor fail-closes at run time (requireSecret) until set. NEVER commit a value.')
-@secure()
-param b2cTestUser string = ''
-
-@description('B2C test-account password for the on-demand b2c-login-test monitor (env B2C_TEST_PASS). Secret — supplied at deploy from ~/.synthwatch.env like b2cTestUser. Default \'\' → fail-soft. NEVER commit a value.')
-@secure()
-param b2cTestPass string = ''
-
-@description('Model-B credential-value encryption key (env CRED_ENC_KEY) — base64 of 32 random bytes (AES-256). The api ENCRYPTS secret_headers/login_credentials values before store; the runner DECRYPTS them at run time (runner/crypto.ts ↔ synthwatch-api CredCrypto.cs). Secret — supplied at deploy from ~/.synthwatch.env, EXACTLY like b2cTestUser (deploy.sh passes it inline; a redeploy re-asserts it → never dropped). Default \'\' → the runner fail-CLOSES on decrypt (login monitors go red) until set. ★ Craig MUST set a real key in ~/.synthwatch.env BEFORE deploy. NEVER commit a value.')
+@description('Model-B credential-value encryption key (env CRED_ENC_KEY) — base64 of 32 random bytes (AES-256). The api ENCRYPTS secret_headers/login_credentials values before store; the runner DECRYPTS them at run time (runner/crypto.ts ↔ synthwatch-api CredCrypto.cs). Secret — supplied at deploy from ~/.synthwatch.env, EXACTLY like vercelBypassToken (deploy.sh passes it inline; a redeploy re-asserts it → never dropped). Default \'\' → the runner fail-CLOSES on decrypt (login monitors go red) until set. ★ Craig MUST set a real key in ~/.synthwatch.env BEFORE deploy. NEVER commit a value.')
 @secure()
 param credEncKey string = ''
 
@@ -514,18 +506,6 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
           value: vercelBypassToken
         }
         {
-          // B2C test-account credentials for the on-demand b2c-login-test monitor. Bicep-owned (value from
-          // the @secure param → re-asserted every deploy from ~/.synthwatch.env, so a redeploy can't WIPE it —
-          // the deploy-channel-mismatch fix). '' when unset → the DISABLED monitor fail-closes at run time
-          // (requireSecret). Craig supplies real values in ~/.synthwatch.env; NEVER committed.
-          name: 'b2c-test-user'
-          value: b2cTestUser
-        }
-        {
-          name: 'b2c-test-pass'
-          value: b2cTestPass
-        }
-        {
           // Model-B credential encryption key (CRED_ENC_KEY). Bicep-owned (value from the @secure param →
           // re-asserted every deploy from ~/.synthwatch.env). '' when unset → the runner fail-CLOSES on
           // decrypt. Craig supplies a real base64(32-byte) key in ~/.synthwatch.env; NEVER committed.
@@ -633,17 +613,6 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
               secretRef: 'vercel-bypass-token'
             }
             {
-              // B2C test creds → process.env for the on-demand b2c-login-test monitor's requireSecret()
-              // (read directly from env — checks.auth is not applied to browser contexts). From the
-              // bicep-owned secrets above (preserved across redeploys); unset/'' → the monitor fail-closes.
-              name: 'B2C_TEST_USER'
-              secretRef: 'b2c-test-user'
-            }
-            {
-              name: 'B2C_TEST_PASS'
-              secretRef: 'b2c-test-pass'
-            }
-            {
               // Model-B credential encryption key → process.env for runner/crypto.ts decrypt-on-read.
               // From the bicep-owned secret above (preserved across redeploys); unset/'' → decrypt fail-closes.
               name: 'CRED_ENC_KEY'
@@ -733,18 +702,6 @@ resource centralusJob 'Microsoft.App/jobs@2024-03-01' = {
           // injects it ONLY to PROTECTED_BYPASS_HOSTS). Craig supplies the real value out-of-band; NEVER committed.
           name: 'vercel-bypass-token'
           value: vercelBypassToken
-        }
-        {
-          // B2C test-account credentials for the on-demand b2c-login-test monitor. Bicep-owned (value from
-          // the @secure param → re-asserted every deploy from ~/.synthwatch.env, so a redeploy can't WIPE it —
-          // the deploy-channel-mismatch fix). '' when unset → the DISABLED monitor fail-closes at run time
-          // (requireSecret). Craig supplies real values in ~/.synthwatch.env; NEVER committed.
-          name: 'b2c-test-user'
-          value: b2cTestUser
-        }
-        {
-          name: 'b2c-test-pass'
-          value: b2cTestPass
         }
         {
           // Model-B credential encryption key (CRED_ENC_KEY). Bicep-owned (value from the @secure param →
@@ -840,17 +797,6 @@ resource centralusJob 'Microsoft.App/jobs@2024-03-01' = {
               secretRef: 'vercel-bypass-token'
             }
             {
-              // B2C test creds → process.env for the on-demand b2c-login-test monitor's requireSecret()
-              // (read directly from env — checks.auth is not applied to browser contexts). From the
-              // bicep-owned secrets above (preserved across redeploys); unset/'' → the monitor fail-closes.
-              name: 'B2C_TEST_USER'
-              secretRef: 'b2c-test-user'
-            }
-            {
-              name: 'B2C_TEST_PASS'
-              secretRef: 'b2c-test-pass'
-            }
-            {
               // Model-B credential encryption key → process.env for runner/crypto.ts decrypt-on-read.
               // From the bicep-owned secret above (preserved across redeploys); unset/'' → decrypt fail-closes.
               name: 'CRED_ENC_KEY'
@@ -935,18 +881,6 @@ resource westus2Job 'Microsoft.App/jobs@2024-03-01' = {
           // injects it ONLY to PROTECTED_BYPASS_HOSTS). Craig supplies the real value out-of-band; NEVER committed.
           name: 'vercel-bypass-token'
           value: vercelBypassToken
-        }
-        {
-          // B2C test-account credentials for the on-demand b2c-login-test monitor. Bicep-owned (value from
-          // the @secure param → re-asserted every deploy from ~/.synthwatch.env, so a redeploy can't WIPE it —
-          // the deploy-channel-mismatch fix). '' when unset → the DISABLED monitor fail-closes at run time
-          // (requireSecret). Craig supplies real values in ~/.synthwatch.env; NEVER committed.
-          name: 'b2c-test-user'
-          value: b2cTestUser
-        }
-        {
-          name: 'b2c-test-pass'
-          value: b2cTestPass
         }
         {
           // Model-B credential encryption key (CRED_ENC_KEY). Bicep-owned (value from the @secure param →
@@ -1034,17 +968,6 @@ resource westus2Job 'Microsoft.App/jobs@2024-03-01' = {
               // redeploys). The runner injects it ONLY to PROTECTED_BYPASS_HOSTS; unset/'' → fail-soft (no header).
               name: 'VERCEL_BYPASS_TOKEN'
               secretRef: 'vercel-bypass-token'
-            }
-            {
-              // B2C test creds → process.env for the on-demand b2c-login-test monitor's requireSecret()
-              // (read directly from env — checks.auth is not applied to browser contexts). From the
-              // bicep-owned secrets above (preserved across redeploys); unset/'' → the monitor fail-closes.
-              name: 'B2C_TEST_USER'
-              secretRef: 'b2c-test-user'
-            }
-            {
-              name: 'B2C_TEST_PASS'
-              secretRef: 'b2c-test-pass'
             }
             {
               // Model-B credential encryption key → process.env for runner/crypto.ts decrypt-on-read.
