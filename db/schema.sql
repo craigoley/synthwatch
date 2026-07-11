@@ -120,6 +120,14 @@ CREATE TABLE checks (
     -- NEVER writes it (survives reconcile, like tags). Set/cleared by the api (PUT /checks/{id}/archive).
     archived_at        TIMESTAMPTZ,
 
+    -- Git-removal purge clock (mirrors 0072_checks_removed_at.sql). NULL = the source_key IS in the
+    -- manifest (present in git); a timestamp = ABSENT from the manifest (git-removed) — the 90-day purge
+    -- clock. ★ RECONCILE-LIFECYCLE-OWNED (the OPPOSITE of archived_at): reconcile's removedAtUpdates
+    -- auto-sync stamps now() when the id leaves the manifest (idempotent) and clears it when the id
+    -- returns (cancel purge). The daily retention job hard-deletes past-90d rows EXCEPT incident-pinned
+    -- ones (deferred). The api only READS it (renders "pending purge"); removal is git-driven, not a user action.
+    removed_at         TIMESTAMPTZ,
+
     -- Lighthouse / perf-budget config (Tier 3 — schema only for now; the audit
     -- code paths land in a later PR and nothing reads these yet). Kept in sync
     -- with db/migrations/0001_run_metrics.sql.

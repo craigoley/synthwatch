@@ -12,6 +12,7 @@ import {
   computeDrift,
   b10FieldUpdates,
   redtestAnchorUpdates,
+  removedAtUpdates,
   computeApplyPlan,
   manifestUrl,
   type Monitor,
@@ -20,6 +21,7 @@ import {
   type ApplyPlanRow,
 } from './reconcile.js';
 import { activeLocations } from './locations.js';
+import { RETENTION_DAYS } from './retention.js';
 import { probeSpecsFromPool, type SpecProbe } from './specfetch/specCache.js';
 
 import { enforceProdGuard } from './prodGuard.js';
@@ -38,7 +40,7 @@ async function loadManagedChecks(): Promise<ManagedCheck[]> {
   // SYNC WITH the ManagedCheck interface in reconcile.ts.
   const { rows } = await pool.query<ManagedCheck>(
     `SELECT source_key, name, kind, target_url, flow_name, sensitive, redact_patterns,
-            environment, rewrite_from_origin, redtest_anchor
+            environment, rewrite_from_origin, redtest_anchor, removed_at
        FROM checks
       WHERE source_key IS NOT NULL`,
   );
@@ -244,6 +246,27 @@ async function main(): Promise<void> {
   }
   if (anchorUpdates.length === 0) {
     console.log('[reconcile] redtest_anchor sync: all checks already match the manifest (no anchor drift).');
+  }
+
+  // ★ SCOPED removed_at SYNC (R5-P2 git-removal) — the reconcile-owned purge clock. Stamp removed_at=now()
+  // the first time a managed check's id is ABSENT from the manifest (git-removed), CLEAR it (→ NULL, purge
+  // cancelled) when the id returns. The SET is guarded `WHERE removed_at IS NULL` so a re-run never resets an
+  // already-running clock (idempotent). Retention (retention.ts purgeRemovedChecks) hard-deletes past-90d
+  // rows, incident-deferred. removed_at is RECONCILE-OWNED (the opposite of archived_at, which reconcile
+  // must never touch); a git-derived fact, so it auto-applies here — the enabled=false STOP stays the
+  // approval-gated MISSING plan.
+  const removedUpdates = removedAtUpdates(manifest.monitors, managed);
+  for (const u of removedUpdates) {
+    if (u.removed) {
+      await pool.query(`UPDATE checks SET removed_at = now() WHERE source_key = $1 AND removed_at IS NULL`, [u.source_key]);
+      console.log(`[reconcile] removed_at sync: ${u.source_key} git-removed → purge clock started (${RETENTION_DAYS}d)`);
+    } else {
+      await pool.query(`UPDATE checks SET removed_at = NULL WHERE source_key = $1`, [u.source_key]);
+      console.log(`[reconcile] removed_at sync: ${u.source_key} re-added to manifest → purge CANCELLED (stays paused until re-enabled)`);
+    }
+  }
+  if (removedUpdates.length === 0) {
+    console.log('[reconcile] removed_at sync: no git-removal transitions (every managed check matches its manifest presence).');
   }
 
   // Snapshot the full manifest (every spec + its probe result) for the read-only catalog

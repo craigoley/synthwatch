@@ -2,9 +2,10 @@
 // Kept separate from retention.ts so that module stays side-effect-free + importable by tests
 // (mirrors rollupMain.ts / rollup.ts).
 //
-//   node dist/retentionMain.js   -> prune runs older than RETENTION_DAYS (cascades children)
+//   node dist/retentionMain.js   -> prune runs older than RETENTION_DAYS (cascades children) +
+//                                   hard-delete git-removed checks past the window (incident-deferred)
 import { pool } from './db.js';
-import { runRetention } from './retention.js';
+import { runRetention, purgeRemovedChecks } from './retention.js';
 import { recordFatal } from './runnerErrors.js';
 
 import { enforceProdGuard } from './prodGuard.js';
@@ -15,9 +16,17 @@ import { enforceProdGuard } from './prodGuard.js';
 enforceProdGuard();
 
 runRetention()
-  .then((r) => {
+  .then(async (r) => {
     console.log(
       `[retention] done: deleted ${r.deleted} run(s) older than ${r.retentionDays}d in ${r.batches} batch(es)`,
+    );
+    // ★ R5-P2: after pruning old runs, hard-delete git-removed checks past the SAME window (incident-deferred).
+    // Runs AFTER the run-prune so a purged check's non-incident-pinned runs are already trimmed; the check
+    // delete then cascades whatever remains. A removed check whose runs are incident-pinned is deferred.
+    const p = await purgeRemovedChecks();
+    console.log(
+      `[retention] git-removal purge done: hard-deleted ${p.purged} check(s) removed >${p.retentionDays}d ago` +
+        (p.deferred > 0 ? `; deferred ${p.deferred} (incident-pinned)` : ''),
     );
   })
   .catch(async (err) => {

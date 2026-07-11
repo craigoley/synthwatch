@@ -13,6 +13,7 @@ import {
   isResolvableSpec,
   b10FieldUpdates,
   redtestAnchorUpdates,
+  removedAtUpdates,
   isRedactionStrip,
   computeApplyPlan,
   fetchManifest,
@@ -119,6 +120,7 @@ const managed = (over: Partial<ManagedCheck> = {}): ManagedCheck => ({
   environment: 'prod',
   rewrite_from_origin: null,
   redtest_anchor: null,
+  removed_at: null,
   ...over,
 });
 
@@ -721,4 +723,32 @@ test('redtestAnchorUpdates: emits a targeted update when the live anchor diverge
   assert.deepEqual(redtestAnchorUpdates([monitor({})], [managed({ redtest_anchor: null })]), []);
   // no live check (not yet materialized) -> skipped (materialize is the separate gated concern)
   assert.deepEqual(redtestAnchorUpdates([monitor({ redtest_anchor: '**/x/**' })], []), []);
+});
+
+// ── removedAtUpdates (R5-P2 git-removal purge clock — reconcile-owned set/clear) ──────────────────────
+test('★ removedAtUpdates: git-removed check gets the clock; re-added check has it cleared; idempotent', () => {
+  const m = () => monitor({}); // manifest id 'wegmans-search-product'
+  const c = (over = {}) => managed(over); // check with the same source_key
+
+  // ABSENT from the manifest + not yet removed → START the purge clock (removed: true).
+  assert.deepEqual(removedAtUpdates([], [c({ removed_at: null })]), [
+    { source_key: 'wegmans-search-product', removed: true },
+  ]);
+
+  // PRESENT in the manifest + currently removed → CANCEL purge (removed: false), the re-add path.
+  assert.deepEqual(removedAtUpdates([m()], [c({ removed_at: new Date('2026-01-01') })]), [
+    { source_key: 'wegmans-search-product', removed: false },
+  ]);
+
+  // ★ IDEMPOTENT: absent + ALREADY removed → no-op (the clock is not reset — reconcileMain also guards
+  // `WHERE removed_at IS NULL`, but the pure fn already emits nothing so a re-run can't restart the clock).
+  assert.deepEqual(removedAtUpdates([], [c({ removed_at: new Date('2026-01-01') })]), []);
+
+  // present + not removed → in sync, no-op.
+  assert.deepEqual(removedAtUpdates([m()], [c({ removed_at: null })]), []);
+
+  // Mixed fleet: one present (in sync), one git-removed → exactly one start.
+  const kept = managed({ source_key: 'wegmans-search-product', removed_at: null });
+  const gone = managed({ source_key: 'retired-monitor', removed_at: null });
+  assert.deepEqual(removedAtUpdates([m()], [kept, gone]), [{ source_key: 'retired-monitor', removed: true }]);
 });

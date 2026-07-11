@@ -130,6 +130,10 @@ export interface Check {
   // due-loop + normal on-demand runs by the `archived_at IS NULL` gates). DISTINCT from enabled/pause.
   // Dashboard-owned: reconcile never writes it (absent from GIT_AUTHORITATIVE/SEED_ONLY), so it survives.
   archived_at: Date | null;
+  // Git-removal purge clock (0072). NULL = present in the manifest; a timestamp = git-removed (absent from
+  // the manifest) — the 90-day purge clock. RECONCILE-OWNED (the opposite of archived_at): reconcile's
+  // removedAtUpdates auto-sync sets it (absent) / clears it (re-added); retention purges past-90d rows.
+  removed_at: Date | null;
   // Perf budgets (Tier-1). A browser run that otherwise passes is downgraded to
   // 'warn' when a captured metric exceeds its budget. null => no budget for that
   // metric. claim() does SELECT *, so these ride along; typed here so code reads them.

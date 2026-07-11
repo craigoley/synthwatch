@@ -69,6 +69,10 @@ export interface ManagedCheck {
   rewrite_from_origin: string | null;
   // Recon #55 gap A (0063): read so the scoped redtest_anchor sync can detect divergence from the manifest.
   redtest_anchor: string | null;
+  // Git-removal purge clock (0072): read so removedAtUpdates can stamp it (id absent from the manifest) or
+  // clear it (id back). RECONCILE-OWNED — reconcile IS its writer (contrast archived_at, which reconcile
+  // never touches). null = present in git; a timestamp = git-removed, purge clock running.
+  removed_at: Date | null;
 }
 
 // 'redaction_mismatch' (0049): a sensitive/redact_patterns divergence — kept SEPARATE from generic
@@ -649,6 +653,37 @@ export function redtestAnchorUpdates(monitors: Monitor[], managed: ManagedCheck[
   return updates;
 }
 
+/** One scoped removed_at transition (0072). `removed=true` → git-removed (stamp the purge clock);
+ *  `removed=false` → re-added to the manifest (clear the clock, cancel purge). */
+export interface RemovedAtUpdate {
+  source_key: string;
+  removed: boolean;
+}
+
+/**
+ * ★ SCOPED removed_at SYNC (R5-P2 git-removal) — MIRRORS redtestAnchorUpdates: the reconcile-owned auto
+ * write path for the git-removal purge clock. For each MANAGED check:
+ *   • ABSENT from the manifest AND removed_at not yet set → { removed: true }  (start the 90-day clock)
+ *   • PRESENT in the manifest AND removed_at set          → { removed: false } (re-added → cancel purge)
+ * (already-in-sync rows emit nothing.) reconcileMain runs these as a targeted `UPDATE checks SET removed_at
+ * = now()` / `= NULL` — DELIBERATELY OUTSIDE the field-split apply plan, since removed_at is a git-derived
+ * FACT (present/absent), not an approval-gated action (the enabled=false soft-disable stays the MISSING
+ * plan). removed_at is RECONCILE-OWNED — the exact opposite of archived_at (dashboard-owned, reconcile
+ * never touches it): here reconcile IS the writer. The set is idempotent (reconcileMain guards WHERE
+ * removed_at IS NULL) so a re-run never resets an already-running clock.
+ */
+export function removedAtUpdates(monitors: Monitor[], managed: ManagedCheck[]): RemovedAtUpdate[] {
+  const manifestIds = new Set(monitors.map((m) => m.id));
+  const updates: RemovedAtUpdate[] = [];
+  for (const c of managed) {
+    const inManifest = manifestIds.has(c.source_key);
+    const isRemoved = c.removed_at != null;
+    if (!inManifest && !isRemoved) updates.push({ source_key: c.source_key, removed: true }); // git-removed → clock
+    else if (inManifest && isRemoved) updates.push({ source_key: c.source_key, removed: false }); // re-added → cancel
+  }
+  return updates;
+}
+
 // ---------------------------------------------------------------------------
 // RECONCILE-APPLY PHASE 0 — DRY-RUN PLAN. For each drift row, compute the EXACT statement(s) apply WOULD
 // run, WITHOUT executing them. Pure (buildApplyUpsert builds text+values without touching the DB;
@@ -811,7 +846,10 @@ export function computeApplyPlan(
         status: 'pending',
         plan: {
           disposition: 'pending',
-          summary: 'would SOFT-DISABLE (enabled=false); never hard-delete.',
+          // The approval-gated STOP action. The git-removal PURGE CLOCK (checks.removed_at) is set
+          // automatically by reconcile's removedAtUpdates auto-sync (a git-derived fact, not gated) and
+          // retention hard-deletes past-90d rows (incident-deferred) — see 0072.
+          summary: 'would SOFT-DISABLE (enabled=false); never hard-delete. (removed_at purge clock auto-stamped by reconcile; retention purges after 90d, incident-deferred.)',
           statements: [{ purpose: 'soft-disable', text: 'UPDATE checks SET enabled = false WHERE source_key = $1', values: [d.source_key] }],
         },
       });
