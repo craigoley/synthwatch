@@ -12,7 +12,7 @@
 import { test as nodeTest } from 'node:test';
 import assert from 'node:assert/strict';
 import { pool } from './db.js';
-import { runRetention, RETENTION_DAYS, RETENTION_BATCH_SIZE } from './retention.js';
+import { runRetention, purgeRemovedChecks, RETENTION_DAYS, RETENTION_BATCH_SIZE } from './retention.js';
 
 const SKIP = !process.env.DATABASE_URL;
 
@@ -146,5 +146,71 @@ nodeTest('batching deletes the full backlog across multiple small batches (live)
     assert.ok(RETENTION_BATCH_SIZE > 0, 'batch size constant is positive');
   } finally {
     await cleanup(checkId);
+  }
+});
+
+// ── R5-P2: git-removal purge (purgeRemovedChecks) ─────────────────────────────────────────────────────
+const test = SKIP ? nodeTest.skip : nodeTest;
+
+// A GIT-REMOVED check: removed_at stamped `removedDaysAgo` in the past (reconcile does this when the
+// manifest id disappears). source_key set (it WAS git-managed). Returns the check id.
+async function makeRemovedCheck(name: string, removedDaysAgo: number): Promise<number> {
+  const { rows } = await pool.query<{ id: number }>(
+    `INSERT INTO checks (name, kind, target_url, flow_name, spec_path, failure_threshold, severity, source_key, enabled, removed_at)
+     VALUES ($1, 'browser', 'https://example.test', 'noop', 'monitors/__test__/x.spec.ts', 1, 'critical', $1, false,
+             now() - make_interval(days => $2::int))
+     RETURNING id`,
+    [name, removedDaysAgo],
+  );
+  return rows[0].id;
+}
+async function checkExists(id: number): Promise<boolean> {
+  const { rows } = await pool.query(`SELECT 1 FROM checks WHERE id = $1`, [id]);
+  return rows.length > 0;
+}
+
+test('★ purge: a check git-removed > window ago (no incident) is HARD-DELETED; its runs cascade', async () => {
+  const id = await makeRemovedCheck(`__purge_past_${Date.now()}__`, WINDOW_DAYS + 1); // 91d removed
+  const runId = await seedRun(id, 10); // a recent run — cascades with the check
+  try {
+    const res = await purgeRemovedChecks({ retentionDays: WINDOW_DAYS });
+    assert.equal(await checkExists(id), false, 'a git-removed check past the window must be hard-deleted');
+    assert.equal(await runExists(runId), false, 'its runs cascade on the check delete');
+    assert.ok(res.purged >= 1, `expected >=1 purged, got ${res.purged}`);
+  } finally {
+    await cleanup(id);
+  }
+});
+
+test('★ purge MUST-GO-RED: an incident-pinned git-removed check past the window is DEFERRED (not deleted)', async () => {
+  const id = await makeRemovedCheck(`__purge_pinned_${Date.now()}__`, WINDOW_DAYS + 5); // 95d removed
+  const pinnedRun = await seedRun(id, 100);
+  await pool.query(
+    `INSERT INTO incidents (check_id, status, severity, opened_at, resolved_at, opened_run_id, resolved_run_id)
+     VALUES ($1, 'resolved', 'critical', now() - make_interval(days => 96), now() - make_interval(days => 95), $2, $2)`,
+    [id, pinnedRun],
+  );
+  try {
+    const res = await purgeRemovedChecks({ retentionDays: WINDOW_DAYS });
+    // ★ The invariant: a removed check whose runs are incident-pinned is NOT purged (MTTR history + the
+    // RESTRICT FK would block). If the purge deleted it, this assert (and the FK) would fail loudly.
+    assert.equal(await checkExists(id), true, 'an incident-pinned removed check must be DEFERRED, not deleted');
+    assert.equal(await runExists(pinnedRun), true, 'the incident-pinned run survives');
+    assert.ok(res.deferred >= 1, `the deferral must be counted (visible), got deferred=${res.deferred}`);
+  } finally {
+    await cleanup(id); // drops the incident first, then the check
+  }
+});
+
+test('purge: a check removed INSIDE the window, or re-added (removed_at NULL), is NOT purged', async () => {
+  const recent = await makeRemovedCheck(`__purge_recent_${Date.now()}__`, WINDOW_DAYS - 1); // 89d — inside window
+  const readded = await makeCheck(`__purge_readded_${Date.now()}__`); // removed_at NULL (present in git / re-added)
+  try {
+    await purgeRemovedChecks({ retentionDays: WINDOW_DAYS });
+    assert.equal(await checkExists(recent), true, 'a check removed inside the window survives (clock not elapsed)');
+    assert.equal(await checkExists(readded), true, 'a check with removed_at NULL is never purge-eligible');
+  } finally {
+    await cleanup(recent);
+    await cleanup(readded);
   }
 });

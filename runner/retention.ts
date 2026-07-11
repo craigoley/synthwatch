@@ -99,3 +99,63 @@ export async function runRetention(opts: RetentionOptions = {}): Promise<Retenti
 
   return { deleted, batches, retentionDays };
 }
+
+export interface PurgeRemovedResult {
+  purged: number;
+  deferred: number;
+  retentionDays: number;
+}
+
+/**
+ * ★ R5-P2 git-removal purge. HARD-DELETE a check that has been GIT-REMOVED (checks.removed_at set by
+ * reconcile's removedAtUpdates) for longer than the window — cascading its runs/run_steps/run_metrics
+ * (runs.check_id → checks ON DELETE CASCADE). Uses the SAME RETENTION_DAYS window as the run-retention
+ * above (rows + blobs expire on one clock).
+ *
+ * ★ INCIDENT-DEFERRED (the must-go-red): a removed check whose runs are still pinned by an incident
+ * (incidents.opened_run_id/resolved_run_id → runs is RESTRICT) is SKIPPED — deleting it would BOTH lose
+ * MTTR/incident history AND be BLOCKED by the RESTRICT FK (the CASCADE can't remove an incident-pinned
+ * run). So it stays until its incidents age out — the incident-preservation invariant (a tiny bounded set).
+ * `deferred` counts them so the deferral is visible, not silent.
+ *
+ * Idempotent + safe to re-run: a check only becomes eligible by aging past the cutoff, never by re-running;
+ * a re-added check has removed_at cleared by reconcile before the window elapses (purge cancelled).
+ */
+export async function purgeRemovedChecks(opts: RetentionOptions = {}): Promise<PurgeRemovedResult> {
+  const retentionDays = opts.retentionDays ?? RETENTION_DAYS;
+
+  // Count the DEFERRED (past-window but incident-pinned) checks first, so the deferral is observable even
+  // though the DELETE below excludes them by the SAME predicate.
+  const { rows: def } = await pool.query<{ n: string }>(
+    `SELECT count(*) AS n FROM checks c
+      WHERE c.removed_at < now() - make_interval(days => $1::int)
+        AND EXISTS (
+          SELECT 1 FROM runs r
+           JOIN incidents i ON (i.opened_run_id = r.id OR i.resolved_run_id = r.id)
+          WHERE r.check_id = c.id
+        )`,
+    [retentionDays],
+  );
+  const deferred = Number(def[0]?.n ?? 0);
+
+  const { rowCount } = await pool.query(
+    `DELETE FROM checks c
+      WHERE c.removed_at < now() - make_interval(days => $1::int)
+        -- ★ DEFER incident-pinned removed checks (preserve MTTR history + the RESTRICT FK would block).
+        AND NOT EXISTS (
+          SELECT 1 FROM runs r
+           JOIN incidents i ON (i.opened_run_id = r.id OR i.resolved_run_id = r.id)
+          WHERE r.check_id = c.id
+        )`,
+    [retentionDays],
+  );
+  const purged = rowCount ?? 0;
+
+  if (purged > 0 || deferred > 0) {
+    console.log(
+      `[retention] git-removal purge: hard-deleted ${purged} check(s) removed >${retentionDays}d ago` +
+        (deferred > 0 ? `; DEFERRED ${deferred} (incident-pinned — preserved for MTTR history)` : ''),
+    );
+  }
+  return { purged, deferred, retentionDays };
+}
