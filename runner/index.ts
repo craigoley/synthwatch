@@ -14,6 +14,7 @@
 // failure. It exits 1 only on infrastructure errors (e.g. DB unreachable).
 import { chromium, type Browser } from 'playwright';
 import { pool, type Check, type RunRecord, type TerminalStatus } from './db.js';
+import { writeProvisionalVerdict, enrichRunTrace } from './runFinalize.js';
 import { runHttpCheck } from './httpCheck.js';
 import { noteDeployMarker, hostOf } from './deploys.js';
 import { captureMainDocHeaders } from './browserMarker.js';
@@ -617,6 +618,33 @@ async function runOneInner(
     errorMessage = scrubError(redact, status, outcome.failedStep, errorMessage);
   }
 
+  // ★ Egress-IP (static-egress-IP Phase 0): the per-process public egress IP, captured once and warmed at
+  // startup, so this reads the cache with no added latency. Fail-soft → null if the reflector was
+  // unreachable. ★ NOT sensitive (our own infra's public IP) — stamped DIRECTLY, never through `redact`.
+  // Captured here (moved up from after trace processing) so the provisional verdict below carries it.
+  const egressIp = await captureEgressIp();
+
+  // ★ B1 (verdict-survives-crash): stamp the honest terminal verdict — status + timing + failed_step +
+  // error_message — NOW, BEFORE the memory-heavy trace processing (extract → redacted-zip rebuild →
+  // upload) below. That processing is where run #936920 OOM-killed (exit 137) rebuilding a 531s run's
+  // redacted zip in memory; because the terminal write used to be sequenced AFTER it — and SIGKILL runs
+  // no `finally` — the row stranded at 'running' and was reaped 30 min later to a generic verdict with no
+  // duration/failed_step/trace. Writing the verdict first means a crash during trace work leaves a
+  // finalized-WITHOUT-trace run (real status + failed_step), not a strand. Trace-derived fields
+  // (trace_url/trace_signals/screenshot_url) are enriched in a SECOND write after the trace work.
+  await writeProvisionalVerdict(runId, {
+    status,
+    durationMs: outcome.durationMs,
+    httpStatus: outcome.httpStatus,
+    errorMessage,
+    failedStep: outcome.failedStep,
+    certDaysRemaining: outcome.certDaysRemaining,
+    // attempts taken to reach this verdict: 1 = first try; >1 + status=pass = degrading-but-green.
+    retryCount,
+    egressIp,
+  });
+  state.finalized = true; // ★ verdict persisted — the runOne finally-guard + the stale-running reaper are now no-ops.
+
   // Screenshot: NEVER stored for a sensitive monitor (a rendered page shows cart contents / logged-in PII).
   let screenshotUrl: string | null = null;
   if (persist.failureScreenshot && outcome.screenshot) {
@@ -706,35 +734,10 @@ async function runOneInner(
     }
   }
 
-  // ★ Egress-IP (static-egress-IP Phase 0): the per-process public egress IP, captured once and warmed at
-  // startup, so this reads the cache with no added latency. Fail-soft → null if the reflector was
-  // unreachable. ★ NOT sensitive (our own infra's public IP) — stamped DIRECTLY, never through `redact`.
-  const egressIp = await captureEgressIp();
-
-  await pool.query(
-    `UPDATE runs
-        SET status = $2, finished_at = now(), duration_ms = $3, http_status = $4,
-            error_message = $5, failed_step = $6, screenshot_url = $7,
-            cert_days_remaining = $8, trace_url = $9, trace_signals = $10::jsonb,
-            retry_count = $11, egress_ip = $12
-      WHERE id = $1`,
-    [
-      runId,
-      status,
-      outcome.durationMs,
-      outcome.httpStatus,
-      errorMessage,
-      outcome.failedStep,
-      screenshotUrl,
-      outcome.certDaysRemaining,
-      traceUrl,
-      traceSignalsJson,
-      // attempts taken to reach this verdict: 1 = first try; >1 + status=pass = degrading-but-green.
-      retryCount,
-      egressIp,
-    ],
-  );
-  state.finalized = true; // ★ B2: terminal status persisted — the finally fallback is now a no-op.
+  // ★ B1: enrich the already-finalized run with the trace-derived fields. Touches ONLY
+  // trace_url/trace_signals/screenshot_url — the verdict written above is left intact. A crash BEFORE
+  // this point leaves a finalized-without-trace run (honest verdict, no trace_url), NOT a strand.
+  await enrichRunTrace(runId, { traceUrl, traceSignalsJson, screenshotUrl });
 
   const run: RunRecord = {
     id: runId,
