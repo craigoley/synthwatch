@@ -6,4 +6,5 @@
 {"type":"resource-snapshot","snapshot":{"_resourceType":"fetch","time":2.5,"timings":{"wait":0.5},"request":{"url":"https://www.wegmans.com/api/cart","method":"POST"},"response":{"status":201,"_transferSize":100,"content":{"size":50,"mimeType":"application/json"},"headers":[]}}}
 {"type":"resource-snapshot","snapshot":{"_resourceType":"fetch","time":3.5,"timings":{"wait":1.5},"request":{"url":"https://www.wegmans.com/api/cart/1","method":"PUT"},"response":{"status":200,"_transferSize":100,"content":{"size":50,"mimeType":"application/json"},"headers":[]}}}
 {"type":"resource-snapshot","snapshot":{"_resourceType":"fetch","time":5,"timings":{"wait":5},"request":{"url":"https://www.wegmans.com/api/cart/1","method":"DELETE"},"response":{"status":204,"_transferSize":100,"content":{"size":50,"mimeType":"application/json"},"headers":[]}}}
+{"type":"resource-snapshot","snapshot":{"_resourceType":"fetch","time":40,"timings":{"wait":10},"request":{"url":"https://www.wegmans.com/api/cart/lineitem","method":"POST"},"response":{"status":-1,"_transferSize":0,"content":{"size":0,"mimeType":""},"headers":[]}}}
 {"type":"context-options"}

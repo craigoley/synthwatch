@@ -1,7 +1,7 @@
 {
   "targetHost": "www.wegmans.com",
   "network": {
-    "totalRequests": 8,
+    "totalRequests": 9,
     "wireKb": 2245,
     "thirdPartyCount": 3,
     "failed": [
@@ -15,6 +15,17 @@
         "wire": 500,
         "encoding": "",
         "thirdParty": true
+      },
+      {
+        "url": "https://www.wegmans.com/api/cart/lineitem",
+        "status": -1,
+        "resourceType": "fetch",
+        "timeMs": 40,
+        "waitMs": 10,
+        "size": 0,
+        "wire": 0,
+        "encoding": "",
+        "thirdParty": false
       }
     ],
     "slowest": [
@@ -166,6 +177,11 @@
         "method": "DELETE",
         "url": "https://www.wegmans.com/api/cart/1",
         "status": 204
+      },
+      {
+        "method": "POST",
+        "url": "https://www.wegmans.com/api/cart/lineitem",
+        "status": -1
       }
     ]
   },
@@ -175,6 +191,11 @@
         "level": "error",
         "origin": "site",
         "text": "component:SiteHeaderSearch:helpers Invalid discovery pages storage data"
+      },
+      {
+        "level": "pageerror",
+        "origin": "site",
+        "text": "Uncaught TypeError: Cannot read properties of null (reading 'checkout')"
       },
       {
         "level": "error",
@@ -188,6 +209,7 @@
       }
     ],
     "droppedInfoLog": 2,
-    "droppedExtensionNoise": 5
+    "droppedExtensionNoise": 5,
+    "droppedError": 0
   }
 }

@@ -8,4 +8,5 @@
 {"type":"console","messageType":"error","text":"DEFAULT root logger initialized","location":{"url":""}}
 {"type":"console","messageType":"error","text":"AAA-init: extension boot","location":{"url":""}}
 {"type":"console","messageType":"error","text":"WebSocket connection to 'wss://realtime-c.astutebot.com/eventHub' failed","location":{"url":"https://realtime-c.astutebot.com/lib.js"}}
+{"type":"event","time":100,"class":"BrowserContext","method":"pageError","params":{"error":{"error":{"message":"Uncaught TypeError: Cannot read properties of null (reading 'checkout')","stack":"TypeError: Cannot read properties of null","name":"TypeError"}},"location":{"url":"https://www.wegmans.com/cart"}}}
 {"type":"frame-snapshot"}
