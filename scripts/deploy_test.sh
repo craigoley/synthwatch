@@ -479,6 +479,36 @@ if num_eq "660" "660"; then green "PASS  num_eq 660==660";            else red "
 if num_eq "660" "240"; then red "FAIL  num_eq must-go-red: 660 vs 240 wrongly equal (a silent drop would PASS!)"; FAILS=$((FAILS + 1)); else green "PASS  num_eq must-go-red: 660 != 240 (a dropped replicaTimeout FLUNKS verify)"; fi
 if num_eq "" "660"; then red "FAIL  num_eq empty-expected wrongly equal (a template-absent value would pass)"; FAILS=$((FAILS + 1)); else green "PASS  num_eq empty expected != anything"; fi
 
+# ★ mem_eq — MEMORY is the exact value the #253/#256 drop lost (2Gi shipped where 4Gi was intended). Exact
+# string compare; empty expected must FLUNK (a template-absent memory can't silently pass). verify() +
+# reconcile_resources share mem_eq, so this is the tested compare behind both.
+if mem_eq "4Gi" "4Gi"; then green "PASS  mem_eq 4Gi==4Gi"; else red "FAIL  mem_eq 4Gi==4Gi"; FAILS=$((FAILS + 1)); fi
+if mem_eq "4Gi" "2Gi"; then red "FAIL  mem_eq must-go-red: 4Gi vs 2Gi wrongly equal (THE #253 silent drop would PASS!)"; FAILS=$((FAILS + 1)); else green "PASS  mem_eq must-go-red: 4Gi != 2Gi (a dropped memory FLUNKS verify)"; fi
+if mem_eq "" "4Gi"; then red "FAIL  mem_eq empty-expected wrongly equal (a template-absent memory would pass)"; FAILS=$((FAILS + 1)); else green "PASS  mem_eq empty expected != anything"; fi
+
+# ===========================================================================
+# K. ★ image_covered_by_template — the STALE-TEMPLATE guard (the ACTUAL #253/#256 root cause). The
+#    2026-07-11 deploy shipped commit 3a2f955's 2Gi template atop the CURRENT image; materialize's
+#    fallback-to-a-stale-TARGET_HEAD let the template PREDATE the image, and verify() validated live 2Gi
+#    against that same stale 2Gi template and PASSED. The guard REFUSES a template older than the image.
+#    Build a throwaway 2-commit repo (OLD ancestor <- NEW descendant) and assert the covered/stale verdicts.
+# ===========================================================================
+GITGUARD_DIR="$(mktemp -d -t synthwatch-gitguard.XXXXXX)"
+git -C "${GITGUARD_DIR}" init -q
+git -C "${GITGUARD_DIR}" config user.email t@example.test
+git -C "${GITGUARD_DIR}" config user.name test
+printf 'old\n' > "${GITGUARD_DIR}/f"; git -C "${GITGUARD_DIR}" add f; git -C "${GITGUARD_DIR}" commit -qm old
+printf 'new\n' > "${GITGUARD_DIR}/f"; git -C "${GITGUARD_DIR}" commit -qam new
+GG_NEW="$(git -C "${GITGUARD_DIR}" rev-parse HEAD)"
+GG_OLD="$(git -C "${GITGUARD_DIR}" rev-parse HEAD~1)"
+# image_covered_by_template runs bare `git`, so evaluate it with cwd inside the fixture repo.
+guard() { ( cd "${GITGUARD_DIR}" && image_covered_by_template "$1" "$2" ); }
+if guard "${GG_NEW}" "${GG_NEW}"; then green "PASS  guard: template == image → covered"; else red "FAIL  guard: template==image should be covered"; FAILS=$((FAILS + 1)); fi
+if guard "${GG_OLD}" "${GG_NEW}"; then green "PASS  guard: template (NEW) is newer than image (OLD) → covered"; else red "FAIL  guard: newer template should be covered"; FAILS=$((FAILS + 1)); fi
+# ★ MUST-GO-RED: a template OLDER than the image (2Gi ancestor template on the current image) MUST be refused.
+if guard "${GG_NEW}" "${GG_OLD}"; then red "FAIL  guard must-go-red: a STALE template (older than the image) was ACCEPTED — the #253 drop would ship!"; FAILS=$((FAILS + 1)); else green "PASS  guard must-go-red: stale template (older than image) is REFUSED"; fi
+rm -rf "${GITGUARD_DIR}"
+
 echo
 if [[ "${FAILS}" -eq 0 ]]; then
   green "ALL TESTS PASSED"
