@@ -539,9 +539,14 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
         {
           name: 'runner'
           image: runnerImage
+          // 2.0 CPU / 4Gi (was 1.0 / 2Gi), on all 3 runner jobs. A long browser flow (shop-flow ~530s)
+          // OOM-killed the runner (exit 137) during POST-FLOW trace finalization — the in-memory
+          // redacted-zip rebuild of a large trace exceeded 2Gi. 4Gi gives headroom; the streaming
+          // redacted-trace build (traceRedact.ts) reduces peak memory durably. ACA Consumption requires
+          // memory = 2×CPU, so 4Gi ⇒ 2.0 CPU (the plan max).
           resources: {
-            cpu: json('1.0')
-            memory: '2Gi'
+            cpu: json('2.0')
+            memory: '4Gi'
           }
           env: [
             {
@@ -755,9 +760,14 @@ resource centralusJob 'Microsoft.App/jobs@2024-03-01' = {
         {
           name: 'runner'
           image: runnerImage
+          // 2.0 CPU / 4Gi (was 1.0 / 2Gi), on all 3 runner jobs. A long browser flow (shop-flow ~530s)
+          // OOM-killed the runner (exit 137) during POST-FLOW trace finalization — the in-memory
+          // redacted-zip rebuild of a large trace exceeded 2Gi. 4Gi gives headroom; the streaming
+          // redacted-trace build (traceRedact.ts) reduces peak memory durably. ACA Consumption requires
+          // memory = 2×CPU, so 4Gi ⇒ 2.0 CPU (the plan max).
           resources: {
-            cpu: json('1.0')
-            memory: '2Gi'
+            cpu: json('2.0')
+            memory: '4Gi'
           }
           env: [
             {
@@ -952,9 +962,14 @@ resource westus2Job 'Microsoft.App/jobs@2024-03-01' = {
         {
           name: 'runner'
           image: runnerImage
+          // 2.0 CPU / 4Gi (was 1.0 / 2Gi), on all 3 runner jobs. A long browser flow (shop-flow ~530s)
+          // OOM-killed the runner (exit 137) during POST-FLOW trace finalization — the in-memory
+          // redacted-zip rebuild of a large trace exceeded 2Gi. 4Gi gives headroom; the streaming
+          // redacted-trace build (traceRedact.ts) reduces peak memory durably. ACA Consumption requires
+          // memory = 2×CPU, so 4Gi ⇒ 2.0 CPU (the plan max).
           resources: {
-            cpu: json('1.0')
-            memory: '2Gi'
+            cpu: json('2.0')
+            memory: '4Gi'
           }
           env: [
             {
