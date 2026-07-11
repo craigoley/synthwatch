@@ -341,3 +341,23 @@ num_eq() {
     exit !(a == b)
   }'
 }
+
+# mem_eq <expected> <live> : memory equality — EXACT string ('4Gi' is a unit value, no numeric tolerance).
+# Empty expected → never matches (a value absent from the template must FLUNK, not silently pass — same
+# teeth as num_eq). Exit 0 = equal. Split from num_eq because MEMORY is the value the #253/#256 drop lost:
+# a 2Gi template shipped atop a 4Gi image and verify() (comparing live 2Gi to the STALE 2Gi template)
+# passed. verify() + reconcile_resources share this so the compare is tested in one place.
+mem_eq() {
+  [[ -n "$1" && "$1" == "$2" ]]
+}
+
+# image_covered_by_template <image_sha> <template_ref> : exit 0 IFF the deployed image's commit is an
+# ancestor-OR-EQUAL of the template commit — i.e. the template does NOT predate the image it ships. THE
+# #253/#256 stale-template guard: shipping an ANCESTOR's template atop a current image (a 2Gi ancestor
+# template on the current 4Gi image — confirmed at synthwatch-deploy-20260711-164541, templateHash
+# 5669735136662207502 == commit 3a2f955's 2Gi bicep) is the silent drop that verify() then validated against
+# and PASSED. Exit non-zero = STALE/unrelated → materialize REFUSES. Pure over git (no network); both refs
+# must be present locally (materialize fetches the image commit first, then requires it).
+image_covered_by_template() {
+  git merge-base --is-ancestor "$1" "$2" 2>/dev/null
+}

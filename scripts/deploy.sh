@@ -434,15 +434,23 @@ readonly MIGRATE_IMG="${LOGIN_SERVER}/${MIGRATE_REPO}:${SHA}"
 # so a single `git show` into a temp dir is sufficient; the dir keeps the `.bicep` name az needs.
 # ---------------------------------------------------------------------------
 materialize_template() {
-  # Ensure the local object store has the image commit — ACR can be ahead of the last `git fetch` (the
-  # root of the #253 drop). A best-effort targeted fetch; harmless if already present or offline.
+  # The image commit (${SHA}) is the FLOOR: it is the code being deployed, so its infra template is the one
+  # that must ship — the template must NEVER predate it. Ensure the commit is in the local object store (ACR
+  # can be ahead of the last `git fetch` — the root of the #253 drop); try a targeted fetch, then REQUIRE it.
+  # ★ #256 REGRESSION FIXED HERE: the old code fell back to TARGET_HEAD when the image commit was unfetchable
+  # (`elif ! git cat-file -e SHA; then ref=TARGET_HEAD`). When the LOCAL origin/main ref was itself stale
+  # (behind the just-merged image — a fetch race), that fallback shipped an ANCESTOR's template atop the
+  # current image (2Gi on a 4Gi image). verify() then compared live 2Gi to the STALE 2Gi template and PASSED
+  # — the exact double-failure at synthwatch-deploy-20260711-164541 (templateHash 5669735136662207502 ==
+  # commit 3a2f955's 2Gi bicep). We now REFUSE instead of guessing.
   git cat-file -e "${SHA}^{commit}" 2>/dev/null || git fetch --quiet origin "${SHA}" 2>/dev/null || true
+  git cat-file -e "${SHA}^{commit}" 2>/dev/null \
+    || fail "the deployed image commit ${SHA:0:12} is not in the local repo and could not be fetched — refusing to deploy: its infra template can't be resolved, and falling back to a possibly-stale origin/main would ship an ANCESTOR's template atop the image (the #253 drop). Run 'git fetch origin' (or 'git fetch origin ${SHA:0:12}') and retry."
 
+  # Deploy the NEWER of {origin/main (TARGET_HEAD), image ${SHA}} so the template can never PREDATE the image.
   local ref
   if [[ -z "${TARGET_HEAD}" ]]; then
     ref="${SHA}"                                                    # --sha override: sync skipped
-  elif ! git cat-file -e "${SHA}^{commit}" 2>/dev/null; then
-    ref="${TARGET_HEAD}"                                            # image commit unfetchable → origin/main
   elif git merge-base --is-ancestor "${TARGET_HEAD}" "${SHA}" 2>/dev/null; then
     ref="${SHA}"                                                    # image >= origin/main (incl. the lag bug)
   elif git merge-base --is-ancestor "${SHA}" "${TARGET_HEAD}" 2>/dev/null; then
@@ -450,6 +458,13 @@ materialize_template() {
   else
     fail "deploy target diverged: the image commit ${SHA:0:12} and origin/main ${TARGET_HEAD:0:12} share no ancestor line — refusing to guess the infra template. Run 'git fetch origin' and retry (or --sha to pin)."
   fi
+
+  # ★ INVARIANT (the #253/#256 stale-template guard, made explicit + belt-and-suspenders): ref must NOT
+  # predate the image. ref is max(TARGET_HEAD, SHA) by construction above, so this can only fire if a future
+  # refactor reintroduces a stale-fallback path — in which case it fails LOUD here rather than shipping a
+  # template verify() would validate against and silently pass.
+  image_covered_by_template "${SHA}" "${ref}" \
+    || fail "refusing to ship a STALE template: commit ${ref:0:12} PREDATES the deployed image ${SHA:0:12} (a template older than the image it ships — the #253/#256 drop). Run 'git fetch origin' and retry."
 
   TEMPLATE_DIR="$(mktemp -d -t synthwatch-tpl.XXXXXX)" \
     || fail "could not create a temp dir for the materialized template."
@@ -616,6 +631,46 @@ job_replica_timeout() { retry_nonempty _job_replica_timeout "$@"; }
 job_cpu()            { retry_nonempty _job_cpu "$@"; }
 job_memory()         { retry_nonempty _job_memory "$@"; }
 
+# ---------------------------------------------------------------------------
+# 6a. Reconcile runner-job RESOURCES to the deployed template (the #253/#256 fix, automated).
+# ACA job cpu/memory live on template.containers[].resources; an ARM `az deployment group create` does NOT
+# reliably resize an EXISTING job's resources in place — which is why Craig had to `az containerapp job
+# update --cpu/--memory` by hand (3×). So AFTER the ARM deploy, explicitly reconcile each of the 3
+# browser-runner jobs to the template's intended values (bicep_field on ${TEMPLATE}, now PINNED to the image
+# commit by the hardened materialize_template — never a stale ancestor). Idempotent: a job already in sync is
+# left alone. This makes Craig's manual force part of every deploy; verify() (next) then confirms it landed
+# and FAILS the deploy if it didn't. Mirrors start_and_wait_migrate's `az ... job update --image` pattern.
+# ---------------------------------------------------------------------------
+reconcile_resources() {
+  c_bold "Reconciling runner-job resources to the template (cpu/memory/replicaTimeout)…"
+  local tmpl pair ri jn ecpu emem ert lcpu lmem lrt
+  tmpl="$(cat "${TEMPLATE}" 2>/dev/null || true)"
+  if [[ -z "${tmpl}" ]]; then
+    c_red "  could not read the template ${TEMPLATE} — skipping resource reconcile (verify will flag drift)."
+    return
+  fi
+  for pair in "job:${RUNNER_JOB}" "centralusJob:${CENTRALUS_RUNNER_JOB}" "westus2Job:${WESTUS2_RUNNER_JOB}"; do
+    ri="${pair%%:*}"; jn="${pair##*:}"
+    ecpu="$(printf '%s' "${tmpl}" | bicep_field "${ri}" cpu)"
+    emem="$(printf '%s' "${tmpl}" | bicep_field "${ri}" memory)"
+    ert="$(printf '%s'  "${tmpl}" | bicep_field "${ri}" replicaTimeout)"
+    if [[ -z "${ecpu}" || -z "${emem}" ]]; then
+      c_yellow "  ${jn}: template carries no cpu/memory (cpu='${ecpu}' mem='${emem}') — skipping (verify flags)."
+      continue
+    fi
+    lcpu="$(job_cpu "${jn}")"; lmem="$(job_memory "${jn}")"; lrt="$(job_replica_timeout "${jn}")"
+    if num_eq "${ecpu}" "${lcpu}" && mem_eq "${emem}" "${lmem}" && { [[ -z "${ert}" ]] || num_eq "${ert}" "${lrt}"; }; then
+      c_green "  ${jn}: already ${lcpu}cpu / ${lmem} / ${lrt}s — in sync."
+      continue
+    fi
+    c_bold "  ${jn}: ${lcpu}cpu/${lmem}/${lrt}s → ${ecpu}cpu/${emem}/${ert:-$lrt}s — az containerapp job update…"
+    # ${ert:+…} keeps this bash-3.2-safe (no arrays under set -u); replicaTimeout is a bare int, no splitting.
+    az containerapp job update -n "${jn}" -g "${RG}" \
+      --cpu "${ecpu}" --memory "${emem}" ${ert:+--replica-timeout} ${ert:+"${ert}"} -o none 2>/dev/null \
+      || c_red "  ${jn}: az job update FAILED — verify() will flag the drift and fail the deploy."
+  done
+}
+
 verify() {
   c_bold "Verifying what landed…"
 
@@ -686,7 +741,7 @@ verify() {
       check "${ok}" "${jn} cpu='${v}' (expect ${exp:-<none in template>})"
       exp="$(printf '%s' "${tmpl}" | bicep_field "${ri}" memory)"
       v="$(job_memory "${jn}")"
-      { [[ -n "${exp}" && "${exp}" == "${v}" ]] && ok=1; } || ok=0
+      mem_eq "${exp}" "${v}" && ok=1 || ok=0
       check "${ok}" "${jn} memory='${v}' (expect ${exp:-<none in template>})"
     done
   fi
@@ -902,9 +957,11 @@ main() {
 
   do_deploy
   echo
+  reconcile_resources                          # ★ #253/#256: force runner-job cpu/memory to the template
+  echo                                         #    (ARM won't resize an existing job in place) — no manual az
   handle_migrations "${prev_sha}" "${SHA}"   # BUG 3 + FIX 1: auto-run the migrate job if one shipped
   echo
-  verify                                       # BUG 2: every job's image; + migration-applied
+  verify                                       # BUG 2: every job's image; config-value drift; migration-applied
 
   # ★ FIX 2: --post-reconcile — trigger the reconcile job, wait, print the post-deploy state
   # (spec_catalog + reconcile_drift) so the operator sees it without manually sleeping/re-querying.
