@@ -54,6 +54,11 @@ export interface ConsoleSummary {
   messages: ConsoleMessage[];
   droppedInfoLog: number;
   droppedExtensionNoise: number;
+  // ★ Error-class messages (error/warning/pageerror) dropped by the MAX_CONSOLE_MESSAGES cap. info/log
+  // chatter is already excluded up front (droppedInfoLog) so an error is NEVER dropped in favour of an
+  // info log; this makes the REMAINING truncation (errors beyond the cap) HONEST instead of silent — a
+  // diff over a silently-truncated error set would be unreliable. 0 = nothing preserved was dropped.
+  droppedError: number;
 }
 export interface TraceSignals {
   targetHost: string | null;
@@ -72,7 +77,7 @@ const EMPTY_NETWORK: NetworkSummary = {
   topThirdParties: [],
   mutations: [],
 };
-const EMPTY_CONSOLE: ConsoleSummary = { messages: [], droppedInfoLog: 0, droppedExtensionNoise: 0 };
+const EMPTY_CONSOLE: ConsoleSummary = { messages: [], droppedInfoLog: 0, droppedExtensionNoise: 0, droppedError: 0 };
 
 // ★ Browser-EXTENSION console noise — a trace captured/opened with extensions is NOT the monitored site.
 // Matched against the message text AND its source url. THE load-bearing correctness filter; ported VERBATIM.
@@ -205,8 +210,14 @@ export function extractNetwork(
     totalRequests: reqs.length,
     wireKb: Math.trunc(reqs.reduce((acc, r) => acc + r.wire, 0) / 1024),
     thirdPartyCount: reqs.filter((r) => r.third).length,
+    // ★ FAILED = HTTP errors (status >= 400) AND ABORTS (status <= 0). Playwright records an
+    // aborted/blocked/interrupted request (requestfailed — connection killed, CSP-blocked, cancelled
+    // mid-flight) as a resource-snapshot whose response.status is -1 (or 0 when there's no response at
+    // all). Those were previously DROPPED (>= 400 only), yet an abort is often MORE diagnostic than a
+    // 4xx — something got killed. The status itself distinguishes them for a consumer: <= 0 = abort,
+    // >= 400 = HTTP error. First-seen order, capped at FAILED_CAP (both classes share the cap).
     failed: reqs
-      .filter((r) => r.status >= 400)
+      .filter((r) => r.status >= 400 || r.status <= 0)
       .slice(0, FAILED_CAP)
       .map(slim),
     slowest: byDesc((r) => r.time)
@@ -246,17 +257,39 @@ export function extractConsole(
 
   for (const line of lines(traceNdjson)) {
     const root = tryParse(line);
-    if (!root || root.type !== 'console') continue;
-    const level = str(root.messageType) || 'log';
-    // Redact BEFORE dedup/slice so a session token the site logs is scrubbed uniformly (no-op for
-    // non-sensitive monitors). The location url is only host-derived for `origin`, never stored.
-    const text = redact(str(root.text).trim());
-    const loc = isObj(root.location) ? str(root.location.url) : '';
+    if (!root) continue;
 
-    if (level !== 'error' && level !== 'warning') {
-      droppedLevel++; // info/log chatter
+    // Two event shapes carry an error signal, BOTH in trace.trace (already in-hand — no extra parse):
+    //   • {type:'console', messageType, text, location:{url}} — a console error/warning.
+    //   • {type:'event', method:'pageError', params:{error:{error:{message,…}}, location:{url}}} — an
+    //     UNCAUGHT page exception. Previously invisible unless the site ALSO console-logged it, so a
+    //     browser monitor was blind to real uncaught exceptions. Captured as level='pageerror' (a distinct
+    //     category in the SAME messages array — no wire-shape change).
+    let level: string;
+    let text: string;
+    let loc: string;
+    if (root.type === 'console') {
+      level = str(root.messageType) || 'log';
+      // Redact BEFORE dedup/slice so a session token the site logs is scrubbed uniformly (no-op for
+      // non-sensitive monitors). The location url is only host-derived for `origin`, never stored.
+      text = redact(str(root.text).trim());
+      loc = isObj(root.location) ? str(root.location.url) : '';
+      if (level !== 'error' && level !== 'warning') {
+        droppedLevel++; // info/log chatter — dropped up front, so it can NEVER push out an error below.
+        continue;
+      }
+    } else if (root.type === 'event' && root.method === 'pageError') {
+      const params = isObj(root.params) ? root.params : {};
+      const errWrap = isObj(params.error) ? params.error : {};
+      const err = isObj(errWrap.error) ? errWrap.error : {};
+      level = 'pageerror';
+      text = redact(str(err.message).trim());
+      loc = isObj(params.location) ? str(params.location.url) : '';
+      if (text.length === 0) continue; // a pageError with no message carries no signal
+    } else {
       continue;
     }
+
     if (EXTENSION_NOISE.test(text) || EXTENSION_NOISE.test(loc)) {
       droppedExt++;
       continue;
@@ -272,12 +305,17 @@ export function extractConsole(
     });
   }
 
-  // Bound the list, keeping the most relevant: the site's own errors first, then warnings/third-party.
-  // Composite score (error is the high bit, site the low bit) reproduces OrderByDesc(error).ThenByDesc(site);
-  // V8 sort is stable, so first-seen order is preserved within each tier.
-  const score = (m: ConsoleMessage) => (m.level === 'error' ? 2 : 0) + (m.origin === 'site' ? 1 : 0);
+  // Bound the list, keeping the most relevant: the site's own errors/pageerrors first, then warnings/
+  // third-party. Composite score (error OR pageerror is the high bit, site the low bit); V8 sort is stable,
+  // so first-seen order is preserved within each tier. ★ `kept` holds ONLY error/warning/pageerror (info
+  // was excluded up front), so an error can never be dropped in favour of an info log; and droppedError
+  // records how many of these preserved messages the cap still truncated — making that truncation VISIBLE
+  // (a diff over a silently-truncated error set would be unreliable).
+  const score = (m: ConsoleMessage) =>
+    (m.level === 'error' || m.level === 'pageerror' ? 2 : 0) + (m.origin === 'site' ? 1 : 0);
   const messages = [...kept].sort((a, b) => score(b) - score(a)).slice(0, MAX_CONSOLE_MESSAGES);
-  return { messages, droppedInfoLog: droppedLevel, droppedExtensionNoise: droppedExt };
+  const droppedError = kept.length - messages.length;
+  return { messages, droppedInfoLog: droppedLevel, droppedExtensionNoise: droppedExt, droppedError };
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────────────────────────────────────

@@ -79,6 +79,66 @@ test('console messages are hard-capped at 40 for a pathological trace', () => {
   assert.ok(extractConsole(lines, TARGET).messages.length <= 40);
 });
 
+// ── capture completeness: aborts + pageerror + honest error-truncation ──────────────────────────────────
+test('★ network.failed includes ABORTS (status -1 AND 0), not just HTTP >= 400', () => {
+  const nd = [
+    '{"type":"resource-snapshot","snapshot":{"_resourceType":"fetch","time":10,"timings":{"wait":5},"request":{"url":"https://www.wegmans.com/api/ok","method":"GET"},"response":{"status":200,"_transferSize":100,"content":{"size":50}}}}',
+    '{"type":"resource-snapshot","snapshot":{"_resourceType":"fetch","time":20,"timings":{"wait":5},"request":{"url":"https://www.wegmans.com/api/notfound","method":"GET"},"response":{"status":404,"_transferSize":0,"content":{"size":0}}}}',
+    '{"type":"resource-snapshot","snapshot":{"_resourceType":"fetch","time":30,"timings":{"wait":5},"request":{"url":"https://www.wegmans.com/api/aborted","method":"POST"},"response":{"status":-1,"_transferSize":0,"content":{"size":0}}}}',
+    '{"type":"resource-snapshot","snapshot":{"_resourceType":"fetch","time":40,"timings":{"wait":5},"request":{"url":"https://www.wegmans.com/api/noresp","method":"POST"},"response":{"status":0,"_transferSize":0,"content":{"size":0}}}}',
+  ].join('\n');
+  const n = extractNetwork(nd, TARGET);
+  // 200 excluded; the 404 AND both aborts (-1, 0) captured. The status itself tags an abort vs an http error.
+  assert.deepEqual(
+    n.failed.map((f) => f.status).sort((a, b) => a - b),
+    [-1, 0, 404],
+  );
+  assert.ok(n.failed.some((f) => f.status === -1 && f.url.includes('/aborted')));
+  assert.ok(n.failed.some((f) => f.status === 0 && f.url.includes('/noresp')));
+});
+
+test('★ console captures an uncaught page exception (pageError event) as level=pageerror', () => {
+  const nd = [
+    '{"type":"console","messageType":"error","text":"a real site error","location":{"url":"https://www.wegmans.com/x"}}',
+    '{"type":"event","class":"BrowserContext","method":"pageError","params":{"error":{"error":{"message":"Uncaught TypeError: x is null","stack":"TypeError: x is null","name":"TypeError"}},"location":{"url":"https://www.wegmans.com/cart"}}}',
+  ].join('\n');
+  const c = extractConsole(nd, TARGET);
+  const pe = c.messages.find((m) => m.level === 'pageerror');
+  assert.ok(pe, 'the uncaught page exception is captured (was invisible unless also console-logged)');
+  assert.equal(pe!.origin, 'site');
+  assert.ok(pe!.text.includes('Uncaught TypeError'));
+});
+
+test('★ drop-policy MUST-GO-RED: an error is NEVER dropped in favour of an info log', () => {
+  const errors = Array.from(
+    { length: 5 },
+    (_, i) => `{"type":"console","messageType":"error","text":"site error ${i}","location":{"url":"https://www.wegmans.com/e${i}"}}`,
+  );
+  const infos = Array.from(
+    { length: 100 },
+    (_, i) => `{"type":"console","messageType":"info","text":"chatter ${i}","location":{"url":"https://www.wegmans.com/i${i}"}}`,
+  );
+  // info FIRST: if the cap were ever applied BEFORE the level filter, the info flood would crowd out the errors.
+  const c = extractConsole([...infos, ...errors].join('\n'), TARGET);
+  assert.equal(c.messages.filter((m) => m.level === 'error').length, 5); // every error survives
+  assert.equal(
+    c.messages.some((m) => m.level !== 'error' && m.level !== 'warning' && m.level !== 'pageerror'),
+    false,
+  ); // no info/log ever persisted
+  assert.equal(c.droppedInfoLog, 100);
+  assert.equal(c.droppedError, 0); // under the cap → nothing preserved was truncated
+});
+
+test('★ drop-policy: error-class truncation beyond the cap is VISIBLE via droppedError (not silent)', () => {
+  const nd = Array.from(
+    { length: 50 },
+    (_, i) => `{"type":"console","messageType":"error","text":"distinct site error ${i}","location":{"url":"https://www.wegmans.com/e${i}"}}`,
+  ).join('\n');
+  const c = extractConsole(nd, TARGET);
+  assert.equal(c.messages.length, 40); // capped
+  assert.equal(c.droppedError, 10); // 50 errors − 40 kept = 10, RECORDED (not silently lost)
+});
+
 test('network summary: counts, top-N, third-party grouping (parity)', () => {
   const n = extractNetwork(NETWORK_NDJSON, TARGET);
   assert.equal(n.totalRequests, 5); // context-options skipped
