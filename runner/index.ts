@@ -677,14 +677,14 @@ async function runOneInner(
     } catch (err) {
       console.warn(`[runner] run ${runId} trace-signals extraction skipped (non-fatal):`, err);
     }
-    // ★ B10 (revised — failed-run trace visibility): a sensitive monitor still stores NO RAW zip
-    // (the raw capture carries typed credentials, cookies/session tokens, and the logged-in DOM),
-    // but a FAILED run now persists a REDACTED, REDUCED copy (traceRedact.ts): text streams scrubbed
-    // by the monitor's redactor + structural session-material rules, binary entries (screencast
-    // frames — unscrubbable) dropped. Same per-run key + 90d purge as a raw failure trace. FAIL-
-    // CLOSED: if the redacted copy can't be built, nothing is uploaded. Green sensitive runs still
-    // discard everything (no permanent success-baseline — that slot is purge-exempt), and the
-    // screenshot skip above is unchanged. Non-sensitive monitors: unchanged ('raw'/'none').
+    // ★ B10 (revised — trace visibility on EVERY sensitive run): a sensitive monitor still stores NO RAW
+    // zip (the raw capture carries typed credentials, cookies/session tokens, and the logged-in DOM), but
+    // now persists a REDACTED, REDUCED copy on EVERY run — pass AND fail (tracePersistPlan returns
+    // 'redacted' for both): text streams scrubbed by the monitor's redactor + structural session-material
+    // rules, binary entries (screencast frames — unscrubbable) dropped. Same per-run key + 90d purge as a
+    // raw failure trace. FAIL-CLOSED: if the redacted copy can't be built, nothing is uploaded. Still NO
+    // permanent success-baseline for sensitive (that slot is purge-exempt) and the screenshot skip above is
+    // unchanged. Non-sensitive monitors: unchanged ('raw' on fail, success-baseline on pass).
     if (persist.failureTraceMode === 'raw') {
       traceUrl = await uploadTrace(runId, outcome.tracePath);
     } else if (persist.failureTraceMode === 'redacted') {
