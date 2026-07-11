@@ -102,14 +102,17 @@ test('★ tracePersistPlan: a sensitive FAILED run persists the REDACTED trace �
   }
 });
 
-test('★ tracePersistPlan: green-discard HOLDS for sensitive — pass/warn persists nothing at all', () => {
+test('★ tracePersistPlan: a sensitive PASS/WARN run ALSO persists the REDACTED trace (surface it, keep scrubbing)', () => {
+  // Craig's B: the trace is surfaced on green runs too — the SAME redacted/reduced zip as the fail path
+  // (secrets scrubbed, images dropped), to the per-run runs.trace_url. Still NO success baseline (a
+  // permanent purge-exempt logged-in capture) and NO screenshots.
   for (const status of ['pass', 'warn'] as const) {
     assert.deepEqual(tracePersistPlan(true, status), {
-      failureTraceMode: 'none',
+      failureTraceMode: 'redacted',
       successBaseline: false, // the purge-exempt baseline slot stays OFF for sensitive
       failureScreenshot: false,
       baselineScreenshot: false,
-    }, `sensitive + ${status} → fully discarded (no redacted copy either)`);
+    }, `sensitive + ${status} → redacted zip (surfaced), never a raw trace / baseline / screenshot`);
   }
 });
 
