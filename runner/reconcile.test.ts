@@ -729,9 +729,11 @@ test('redtestAnchorUpdates: emits a targeted update when the live anchor diverge
 test('★ removedAtUpdates: git-removed check gets the clock; re-added check has it cleared; idempotent', () => {
   const m = () => monitor({}); // manifest id 'wegmans-search-product'
   const c = (over = {}) => managed(over); // check with the same source_key
+  const other = () => monitor({ id: 'some-other-monitor' }); // NON-EMPTY manifest that lacks the check
 
-  // ABSENT from the manifest + not yet removed → START the purge clock (removed: true).
-  assert.deepEqual(removedAtUpdates([], [c({ removed_at: null })]), [
+  // ABSENT from a (non-empty) manifest + not yet removed → START the purge clock (removed: true).
+  // (Manifest is non-empty on purpose: an EMPTY manifest is the fleet-wide-wipe guard case, tested below.)
+  assert.deepEqual(removedAtUpdates([other()], [c({ removed_at: null })]), [
     { source_key: 'wegmans-search-product', removed: true },
   ]);
 
@@ -742,7 +744,7 @@ test('★ removedAtUpdates: git-removed check gets the clock; re-added check has
 
   // ★ IDEMPOTENT: absent + ALREADY removed → no-op (the clock is not reset — reconcileMain also guards
   // `WHERE removed_at IS NULL`, but the pure fn already emits nothing so a re-run can't restart the clock).
-  assert.deepEqual(removedAtUpdates([], [c({ removed_at: new Date('2026-01-01') })]), []);
+  assert.deepEqual(removedAtUpdates([other()], [c({ removed_at: new Date('2026-01-01') })]), []);
 
   // present + not removed → in sync, no-op.
   assert.deepEqual(removedAtUpdates([m()], [c({ removed_at: null })]), []);
@@ -751,4 +753,24 @@ test('★ removedAtUpdates: git-removed check gets the clock; re-added check has
   const kept = managed({ source_key: 'wegmans-search-product', removed_at: null });
   const gone = managed({ source_key: 'retired-monitor', removed_at: null });
   assert.deepEqual(removedAtUpdates([m()], [kept, gone]), [{ source_key: 'retired-monitor', removed: true }]);
+});
+
+test('★ removedAtUpdates FLEET-WIDE-WIPE GUARD: an EMPTY manifest never starts a purge clock', () => {
+  // A bad commit / path-or-branch misconfig that resolves to a valid-but-empty manifest (monitors:[]) must
+  // NOT stamp removed_at on the entire managed fleet — that would silently start the 90-day purge on every
+  // check in one ungated auto-write. The guard suppresses ALL starts when the manifest is empty (re-add
+  // CLEARS would survive, but are vacuous — nothing is present to re-add). (PR #264 review hardening.)
+  const fleet = [
+    managed({ source_key: 'a', removed_at: null }),
+    managed({ source_key: 'b', removed_at: null }),
+    managed({ source_key: 'c', removed_at: new Date('2026-01-01') }), // already removed — untouched either way
+  ];
+  assert.deepEqual(removedAtUpdates([], fleet), []); // ★ MUST be empty — no fleet-wide clock start
+
+  // Contrast: the SAME fleet under a NON-EMPTY manifest that lists none of them DOES start clocks for the
+  // not-yet-removed ones — proving the guard keys on emptiness, not merely on "the manifest lacks the id".
+  assert.deepEqual(removedAtUpdates([monitor({ id: 'unrelated' })], fleet), [
+    { source_key: 'a', removed: true },
+    { source_key: 'b', removed: true },
+  ]);
 });

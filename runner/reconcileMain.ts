@@ -256,6 +256,16 @@ async function main(): Promise<void> {
   // must never touch); a git-derived fact, so it auto-applies here — the enabled=false STOP stays the
   // approval-gated MISSING plan.
   const removedUpdates = removedAtUpdates(manifest.monitors, managed);
+  // ★ Fleet-wide-wipe guard visibility (defense-in-depth, PR #264 review): removedAtUpdates NEVER starts a
+  // purge clock from an EMPTY manifest (a bad commit / path-or-branch misconfig that empties monitors:[]).
+  // Surface that suppression loudly — otherwise the empty-manifest case silently reads as "no transitions".
+  if (manifest.monitors.length === 0 && managed.length > 0) {
+    const wouldStamp = managed.filter((c) => c.removed_at == null).length;
+    console.warn(
+      `[reconcile] removed_at sync: manifest is EMPTY — SKIPPED starting the purge clock on ${wouldStamp} managed ` +
+        `check(s) (fleet-wide-wipe guard). Remove monitors individually if intentional; else investigate the manifest source.`,
+    );
+  }
   for (const u of removedUpdates) {
     if (u.removed) {
       await pool.query(`UPDATE checks SET removed_at = now() WHERE source_key = $1 AND removed_at IS NULL`, [u.source_key]);
@@ -265,7 +275,7 @@ async function main(): Promise<void> {
       console.log(`[reconcile] removed_at sync: ${u.source_key} re-added to manifest → purge CANCELLED (stays paused until re-enabled)`);
     }
   }
-  if (removedUpdates.length === 0) {
+  if (removedUpdates.length === 0 && !(manifest.monitors.length === 0 && managed.length > 0)) {
     console.log('[reconcile] removed_at sync: no git-removal transitions (every managed check matches its manifest presence).');
   }
 

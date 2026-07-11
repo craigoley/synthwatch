@@ -671,15 +671,27 @@ export interface RemovedAtUpdate {
  * plan). removed_at is RECONCILE-OWNED — the exact opposite of archived_at (dashboard-owned, reconcile
  * never touches it): here reconcile IS the writer. The set is idempotent (reconcileMain guards WHERE
  * removed_at IS NULL) so a re-run never resets an already-running clock.
+ *
+ * ★ FLEET-WIDE-WIPE GUARD: an EMPTY manifest (`monitors: []` — a bad commit that empties the file, or a
+ * path/branch misconfig that resolves to a valid-but-empty manifest; validateManifest accepts empty) would
+ * otherwise stamp removed_at on the ENTIRE managed fleet in one ungated auto-write. So this NEVER STARTS a
+ * new purge clock from an empty manifest (mirrors sync-from-source jobs that refuse a source-empty wipe).
+ * Re-add CLEARS (removed:false) stay allowed — they only ever CANCEL a purge, never start one — but are
+ * vacuous when the manifest is empty (nothing is present to re-add). reconcileMain logs the skip loudly.
  */
 export function removedAtUpdates(monitors: Monitor[], managed: ManagedCheck[]): RemovedAtUpdate[] {
   const manifestIds = new Set(monitors.map((m) => m.id));
+  const manifestEmpty = monitors.length === 0; // untrusted source — never start clocks from it
   const updates: RemovedAtUpdate[] = [];
   for (const c of managed) {
     const inManifest = manifestIds.has(c.source_key);
     const isRemoved = c.removed_at != null;
-    if (!inManifest && !isRemoved) updates.push({ source_key: c.source_key, removed: true }); // git-removed → clock
-    else if (inManifest && isRemoved) updates.push({ source_key: c.source_key, removed: false }); // re-added → cancel
+    if (!inManifest && !isRemoved) {
+      if (manifestEmpty) continue; // ★ guard: an empty manifest never starts a fleet-wide purge clock
+      updates.push({ source_key: c.source_key, removed: true }); // git-removed → start the clock
+    } else if (inManifest && isRemoved) {
+      updates.push({ source_key: c.source_key, removed: false }); // re-added → cancel purge
+    }
   }
   return updates;
 }
