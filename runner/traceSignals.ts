@@ -362,6 +362,12 @@ function hostOf(url: string): string {
 // Matches http(s)/ws(s) and captures the authority up to the first path/query/fragment/quote/space; then
 // strips userinfo + port. '' when the text carries no URL. FAITHFUL-PORTED — keep byte-identical to the C#
 // TraceExtractor.ResourceHostFromText (same regex + strip steps) so the golden fixture agrees.
+//
+// ASSUMPTION: "first URL ≈ the resource". True for the shapes this targets (CSP "Refused to load '<resource>'",
+// "Access to fetch at '<resource>' from origin '<page>'", failed-load/websocket). KNOWN BLIND SPOT: a Mixed
+// Content warning emits the PAGE url first and the insecure RESOURCE second, so sourceHost resolves to the
+// page (origin:'site') — the frame-vs-resource misclassification this fix removes, for one message family.
+// Strictly better than the old exact-host rule; left as-is (a display/fingerprint heuristic, not a boundary).
 function resourceHostFromText(text: string): string {
   const m = text.match(/(?:https?|wss?):\/\/([^\s/'"?#)]+)/i);
   if (!m) return '';
