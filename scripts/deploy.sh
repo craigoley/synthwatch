@@ -418,22 +418,48 @@ readonly MIGRATE_IMG="${LOGIN_SERVER}/${MIGRATE_REPO}:${SHA}"
 
 # ---------------------------------------------------------------------------
 # Materialize the infra template from the DEPLOY TARGET commit — the change that makes "deploy
-# origin/main" TRUE for the TEMPLATE, not just the image. Ref = origin/main (TARGET_HEAD) normally, or
-# the resolved SHA under --sha (sync skipped, TARGET_HEAD empty). NEVER the working tree: a behind/stale
-# tree is the benign post-merge norm this script deploys THROUGH, and its bicep would be pre-merge.
-# main.bicep is self-contained (no module/loadTextContent/loadFileAsBase64 refs — verified), so a single
-# `git show` into a temp dir is sufficient; the dir keeps the `.bicep` name az needs and would house any
-# future sibling module. Fail LOUDLY rather than silently fall back to the tree (the bug being fixed).
+# origin/main" TRUE for the TEMPLATE, not just the image. NEVER the working tree: a behind/stale tree is
+# the benign post-merge norm this script deploys THROUGH, and its bicep would be pre-merge.
+#
+# ★ #251 materialized from TARGET_HEAD (local `git rev-parse origin/main`) alone — but that STILL dropped
+# value changes (the #253 silent drop): the deploy shipped image ${SHA} (resolved from ACR, which CI had
+# already pushed for the newest commit) while the LOCAL origin/main ref LAGGED it (fetch race / not yet
+# pulled). So TARGET_HEAD pointed at an ANCESTOR (#252, memory 2Gi) while the image was #253 (4Gi) — a
+# stale template rode a current image, and `az create` reported success at 2Gi. Deploy from the NEWER
+# (descendant) of {TARGET_HEAD, image ${SHA}} so the TEMPLATE can never be older than the image it ships:
+#   • image ${SHA} is a descendant of origin/main (the lag bug, incl. equal) → use ${SHA} (matches image);
+#   • origin/main is a descendant of the image (infra-only commits ahead of the newest built image) →
+#     use TARGET_HEAD (ship those infra-only changes);
+#   • genuinely diverged (no ancestor line) → HALT rather than guess.
+# The image commit may not be in the local object store yet (ACR ahead of the last fetch — the bug's root)
+# so fetch it by SHA first. main.bicep is self-contained (no module/loadTextContent/loadFileAsBase64 refs),
+# so a single `git show` into a temp dir is sufficient; the dir keeps the `.bicep` name az needs.
 # ---------------------------------------------------------------------------
 materialize_template() {
-  local ref="${TARGET_HEAD:-${SHA}}"
+  # Ensure the local object store has the image commit — ACR can be ahead of the last `git fetch` (the
+  # root of the #253 drop). A best-effort targeted fetch; harmless if already present or offline.
+  git cat-file -e "${SHA}^{commit}" 2>/dev/null || git fetch --quiet origin "${SHA}" 2>/dev/null || true
+
+  local ref
+  if [[ -z "${TARGET_HEAD}" ]]; then
+    ref="${SHA}"                                                    # --sha override: sync skipped
+  elif ! git cat-file -e "${SHA}^{commit}" 2>/dev/null; then
+    ref="${TARGET_HEAD}"                                            # image commit unfetchable → origin/main
+  elif git merge-base --is-ancestor "${TARGET_HEAD}" "${SHA}" 2>/dev/null; then
+    ref="${SHA}"                                                    # image >= origin/main (incl. the lag bug)
+  elif git merge-base --is-ancestor "${SHA}" "${TARGET_HEAD}" 2>/dev/null; then
+    ref="${TARGET_HEAD}"                                            # origin/main has infra-only commits ahead
+  else
+    fail "deploy target diverged: the image commit ${SHA:0:12} and origin/main ${TARGET_HEAD:0:12} share no ancestor line — refusing to guess the infra template. Run 'git fetch origin' and retry (or --sha to pin)."
+  fi
+
   TEMPLATE_DIR="$(mktemp -d -t synthwatch-tpl.XXXXXX)" \
     || fail "could not create a temp dir for the materialized template."
   TEMPLATE="${TEMPLATE_DIR}/main.bicep"
   git show "${ref}:${TEMPLATE_SRC_PATH}" > "${TEMPLATE}" 2>/dev/null \
     || fail "cannot materialize ${TEMPLATE_SRC_PATH} from ${ref:0:12} — refusing to fall back to the (possibly stale) working tree. Is that commit fetched?"
   [[ -s "${TEMPLATE}" ]] || fail "materialized template ${ref:0:12}:${TEMPLATE_SRC_PATH} is empty."
-  c_green "Infra template: deploying ${ref:0:12}:${TEMPLATE_SRC_PATH} (origin's IaC — NOT the working tree, which may be behind)." >&2
+  c_green "Infra template: deploying ${ref:0:12}:${TEMPLATE_SRC_PATH} (newest of origin/main + image commit — never older than the shipped image)." >&2
 }
 materialize_template
 
@@ -573,10 +599,28 @@ _job_image() {  # job -> image
   az containerapp job show -n "$1" -g "${RG}" \
     --query "properties.template.containers[0].image" -o tsv 2>/dev/null || true
 }
+# shellcheck disable=SC2329  # invoked indirectly via retry_nonempty "$@"
+_job_replica_timeout() {  # job -> replicaTimeout (seconds)
+  az containerapp job show -n "$1" -g "${RG}" \
+    --query "properties.configuration.replicaTimeout" -o tsv 2>/dev/null || true
+}
+# shellcheck disable=SC2329  # invoked indirectly via retry_nonempty "$@"
+_job_cpu() {  # job -> container cpu
+  az containerapp job show -n "$1" -g "${RG}" \
+    --query "properties.template.containers[0].resources.cpu" -o tsv 2>/dev/null || true
+}
+# shellcheck disable=SC2329  # invoked indirectly via retry_nonempty "$@"
+_job_memory() {  # job -> container memory
+  az containerapp job show -n "$1" -g "${RG}" \
+    --query "properties.template.containers[0].resources.memory" -o tsv 2>/dev/null || true
+}
 # Verify-facing wrappers: retry the raw read on a transient empty (mid-reconciliation).
-job_env_value()     { retry_nonempty _job_env_value "$@"; }
-job_env_secretref() { retry_nonempty _job_env_secretref "$@"; }
-job_image()         { retry_nonempty _job_image "$@"; }
+job_env_value()      { retry_nonempty _job_env_value "$@"; }
+job_env_secretref()  { retry_nonempty _job_env_secretref "$@"; }
+job_image()          { retry_nonempty _job_image "$@"; }
+job_replica_timeout() { retry_nonempty _job_replica_timeout "$@"; }
+job_cpu()            { retry_nonempty _job_cpu "$@"; }
+job_memory()         { retry_nonempty _job_memory "$@"; }
 
 verify() {
   c_bold "Verifying what landed…"
@@ -634,6 +678,34 @@ verify() {
     [[ "${v}" == "1" ]] && ok=1 || ok=0
     check "${ok}" "${j} SYNTHWATCH_DEPLOYED='${v}' (expect 1 — A4 prod-guard; the job REFUSES TO START without it)"
   done
+
+  # ★ CONFIG-VALUE checks: replicaTimeout / cpu / memory on the 3 browser-runner jobs must match the
+  # DEPLOYED template. This is the gap that let TWO silent drops (replicaTimeout 240→660 #250, memory
+  # 2Gi→4Gi #253) ship a current image atop a STALE template while verify() reported "all passed" — the
+  # drop only surfaced weeks later as a runtime OOM/strand. EXPECTED comes from the materialized template
+  # itself (bicep_field on ${TEMPLATE}), so this stays correct as values change — never a hardcoded 660/4Gi.
+  # (Only the 3 browser-runner jobs carry non-default resources/timeout; the aux jobs are left to bicep.)
+  local tmpl pair ri jn exp
+  tmpl="$(cat "${TEMPLATE}" 2>/dev/null || true)"
+  if [[ -z "${tmpl}" ]]; then
+    flunk "config-verify: could not read the deployed template ${TEMPLATE} for expected values"
+  else
+    for pair in "job:${RUNNER_JOB}" "centralusJob:${CENTRALUS_RUNNER_JOB}" "westus2Job:${WESTUS2_RUNNER_JOB}"; do
+      ri="${pair%%:*}"; jn="${pair##*:}"
+      exp="$(printf '%s' "${tmpl}" | bicep_field "${ri}" replicaTimeout)"
+      v="$(job_replica_timeout "${jn}")"
+      num_eq "${exp}" "${v}" && ok=1 || ok=0
+      check "${ok}" "${jn} replicaTimeout='${v}' (expect ${exp:-<none in template>})"
+      exp="$(printf '%s' "${tmpl}" | bicep_field "${ri}" cpu)"
+      v="$(job_cpu "${jn}")"
+      num_eq "${exp}" "${v}" && ok=1 || ok=0
+      check "${ok}" "${jn} cpu='${v}' (expect ${exp:-<none in template>})"
+      exp="$(printf '%s' "${tmpl}" | bicep_field "${ri}" memory)"
+      v="$(job_memory "${jn}")"
+      { [[ -n "${exp}" && "${exp}" == "${v}" ]] && ok=1; } || ok=0
+      check "${ok}" "${jn} memory='${v}' (expect ${exp:-<none in template>})"
+    done
+  fi
 
   # ★ BUG 2: EVERY job must be on the intended image — not just the runner job. A correct
   # deploy puts the migrate job on migrate:SHA and every other job on runner:SHA. The old

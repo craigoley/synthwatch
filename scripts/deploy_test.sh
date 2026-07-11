@@ -411,6 +411,60 @@ cd_rolled="$(grep -oE 'containerapp job update -n [a-z0-9-]+' "${ROOT}/.github/w
 runner_image_set="$(printf '%s\n' "${RUNNER_IMAGE_JOBS[@]}" | sort -u | tr '\n' ' ')"
 expect_eq "deploy.yml rolls EXACTLY RUNNER_IMAGE_JOBS (no CD/deploy.sh drift)" "${runner_image_set}" "${cd_rolled}"
 
+# ===========================================================================
+# J. ★ CONFIG-VALUE extraction + comparison (verify()'s data-driven replicaTimeout/cpu/memory checks —
+#    the fix for the silent-drop class). bicep_field must pull the RUNNER-job values from the deployed
+#    template BLOCK-SCOPED (not bleed the aux jobs' 600/0.25/0.5Gi), and num_eq must be 2-vs-2.0 tolerant
+#    AND MUST-GO-RED on a real mismatch (a dropped value → verify() flunks instead of a silent pass).
+# ===========================================================================
+BICEP_FIXTURE="$(cat <<'FIX'
+resource job 'Microsoft.App/jobs@2024-03-01' = {
+  properties: {
+    configuration: {
+      replicaTimeout: 660
+    }
+    template: {
+      containers: [
+        {
+          resources: {
+            cpu: json('2.0')
+            memory: '4Gi'
+          }
+        }
+      ]
+    }
+  }
+}
+resource retentionJob 'Microsoft.App/jobs@2024-03-01' = {
+  properties: {
+    configuration: {
+      replicaTimeout: 600
+    }
+    template: {
+      containers: [
+        {
+          resources: {
+            cpu: json('0.25')
+            memory: '0.5Gi'
+          }
+        }
+      ]
+    }
+  }
+}
+FIX
+)"
+expect_eq "bicep_field job replicaTimeout (runner, block-scoped)" "660" "$(printf '%s' "${BICEP_FIXTURE}" | bicep_field job replicaTimeout)"
+expect_eq "bicep_field job cpu (unwraps json)"                   "2.0"  "$(printf '%s' "${BICEP_FIXTURE}" | bicep_field job cpu)"
+expect_eq "bicep_field job memory (strips quotes)"              "4Gi"  "$(printf '%s' "${BICEP_FIXTURE}" | bicep_field job memory)"
+expect_eq "bicep_field retentionJob replicaTimeout (NOT the runner 660)" "600" "$(printf '%s' "${BICEP_FIXTURE}" | bicep_field retentionJob replicaTimeout)"
+
+if num_eq "2.0" "2";  then green "PASS  num_eq 2.0==2 (cpu tolerance)"; else red "FAIL  num_eq 2.0==2";   FAILS=$((FAILS + 1)); fi
+if num_eq "660" "660"; then green "PASS  num_eq 660==660";            else red "FAIL  num_eq 660==660"; FAILS=$((FAILS + 1)); fi
+# ★ MUST-GO-RED: a dropped value (live 240 vs expected 660) MUST be unequal → verify() flunks the deploy.
+if num_eq "660" "240"; then red "FAIL  num_eq must-go-red: 660 vs 240 wrongly equal (a silent drop would PASS!)"; FAILS=$((FAILS + 1)); else green "PASS  num_eq must-go-red: 660 != 240 (a dropped replicaTimeout FLUNKS verify)"; fi
+if num_eq "" "660"; then red "FAIL  num_eq empty-expected wrongly equal (a template-absent value would pass)"; FAILS=$((FAILS + 1)); else green "PASS  num_eq empty expected != anything"; fi
+
 echo
 if [[ "${FAILS}" -eq 0 ]]; then
   green "ALL TESTS PASSED"

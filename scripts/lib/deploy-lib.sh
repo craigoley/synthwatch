@@ -296,3 +296,43 @@ retry_nonempty() {
   done
   printf '%s' "${out}"
 }
+
+# ── Config-value extraction from the DEPLOYED bicep (data-driven verify) ─────────────────────────────
+# The infra silent-drop class (#250 replicaTimeout 240→660, #253 memory 2Gi→4Gi) shipped a CURRENT image
+# with a STALE template and PASSED verify() — which checked images/env/secretRefs but NEVER these
+# container/config values — so the drop surfaced weeks later as a runtime OOM/strand. These PURE helpers
+# read the EXPECTED value straight out of the deployed template so verify() stays correct as values change
+# (never a hardcoded 660/4Gi). Kept here so deploy_test.sh drives the EXACT shipped logic.
+
+# bicep_block <resource-ident> : stdin = bicep text → the `resource <ident> '…' = { … }` block, up to the
+# next TOP-LEVEL `resource `/`module ` (both start at column 0). The trailing space in the head makes
+# `job` match `resource job '…'` but NOT `resource centralusJob`/`jobFoo`.
+bicep_block() {
+  awk -v head="resource $1 " '
+    index($0, head) == 1 { inblk = 1 }
+    inblk && (index($0, "resource ") == 1 || index($0, "module ") == 1) && index($0, head) != 1 { inblk = 0 }
+    inblk { print }
+  '
+}
+
+# bicep_field <resource-ident> <replicaTimeout|cpu|memory> : stdin = bicep → the value on that job
+# resource (empty if absent). cpu unwraps json('X'); memory strips the quotes; replicaTimeout is the int.
+bicep_field() {
+  local block; block="$(bicep_block "$1")"
+  case "$2" in
+    replicaTimeout) printf '%s' "${block}" | grep -oE 'replicaTimeout:[[:space:]]*[0-9]+' | head -1 | grep -oE '[0-9]+' ;;
+    cpu)            printf '%s' "${block}" | grep -oE "cpu:[[:space:]]*json\('[0-9.]+'\)" | head -1 | grep -oE "[0-9.]+" ;;
+    memory)         printf '%s' "${block}" | grep -oE "memory:[[:space:]]*'[0-9A-Za-z.]+'" | head -1 | sed -E "s/memory:[[:space:]]*'//; s/'//" ;;
+  esac
+}
+
+# num_eq <a> <b> : equality tolerant of 2 vs 2.0 vs 2.00 (cpu is json('2.0') in bicep, 2 or 2.0 live).
+# Both numeric → numeric compare; otherwise exact string compare. Empty expected → never matches (so a
+# value absent from the template can't silently "pass"). Exit 0 = equal.
+num_eq() {
+  [[ -z "$1" ]] && return 1
+  awk -v a="$1" -v b="$2" 'BEGIN{
+    if (a ~ /^[0-9]+(\.[0-9]+)?$/ && b ~ /^[0-9]+(\.[0-9]+)?$/) { exit !((a+0) == (b+0)) }
+    exit !(a == b)
+  }'
+}
