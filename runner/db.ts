@@ -93,7 +93,7 @@ export interface Check {
   // stored/logged/exposed. Mirrors `auth`'s *_env model. null = none.
   secret_headers: Record<string, string> | null;
   // Per-monitor LOGIN CREDENTIALS (0067), references-only: { credentialRole -> ENV_VAR_NAME } (e.g.
-  // { username: 'B2C_TEST_USER', password: 'B2C_TEST_PASS' }). The runner resolves process.env[ENV_VAR_NAME]
+  // { username: 'SOME_USER_ENV', password: 'SOME_PASS_ENV' }). The runner resolves process.env[ENV_VAR_NAME]
   // at run time and exposes it to the browser spec as credential(role) (loginCredentials.ts); the value is
   // never stored/logged/exposed. Mirrors `secret_headers`/`auth`'s *_env model. null = none.
   login_credentials: Record<string, string> | null;
