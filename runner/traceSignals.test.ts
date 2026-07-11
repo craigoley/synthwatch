@@ -79,6 +79,41 @@ test('console messages are hard-capped at 40 for a pathological trace', () => {
   assert.ok(extractConsole(lines, TARGET).messages.length <= 40);
 });
 
+// ── Error-diff P1: resource-host classification (console) ───────────────────────────────────────────────
+// origin is keyed off the host of the RESOURCE the error is ABOUT (parsed from the first URL in the text),
+// not the frame that logged it — and against the Wegmans first-party allowlist, not the exact target host.
+
+test('★ console MUST-GO-RED: a CSP refusal of a third-party resource LOGGED BY the site frame is third-party', () => {
+  // A CSP violation is reported BY the page (location.url = the site), but is ABOUT a third-party resource.
+  // The OLD frame-based rule (origin = isSite(host of location.url)) mislabelled this origin:'site'. The
+  // resource-host rule reads di.rlcdn.com out of the text → third-party (and records it as sourceHost).
+  const nd =
+    '{"type":"console","messageType":"error","text":"Refused to load the script \'https://di.rlcdn.com/tag.js\' because it violates the Content Security Policy directive","location":{"url":"https://www.wegmans.com/"}}';
+  const c = extractConsole(nd, TARGET);
+  assert.equal(c.messages.length, 1);
+  assert.equal(c.messages[0].origin, 'third-party'); // NOT 'site' — the resource, not the logging frame
+  assert.equal(c.messages[0].sourceHost, 'di.rlcdn.com');
+});
+
+test('★ console MUST-GO-RED: a *.wegmans.cloud resource error is FIRST-party (old exact-host marked it third-party)', () => {
+  // The task's headline bug: the OLD rule only matched the exact target host (www.wegmans.com), so a
+  // *.wegmans.cloud resource fell through to third-party. The allowlist makes it first-party.
+  const nd =
+    '{"type":"console","messageType":"error","text":"GET https://api.wegmans.cloud/v1/cart 500 (Internal Server Error)","location":{"url":"https://www.wegmans.com/cart"}}';
+  const c = extractConsole(nd, TARGET);
+  assert.equal(c.messages.length, 1);
+  assert.equal(c.messages[0].origin, 'site'); // .wegmans.cloud is first-party
+  assert.equal(c.messages[0].sourceHost, 'api.wegmans.cloud');
+});
+
+test('console sourceHost falls back to the logging frame when the text carries no URL', () => {
+  const nd =
+    '{"type":"console","messageType":"error","text":"component:Cart:helpers Invalid state","location":{"url":"https://images.wegmans.com/x.js"}}';
+  const c = extractConsole(nd, TARGET);
+  assert.equal(c.messages[0].sourceHost, 'images.wegmans.com'); // frame host (no URL in text)
+  assert.equal(c.messages[0].origin, 'site'); // images.wegmans.com is a first-party sibling subdomain
+});
+
 // ── capture completeness: aborts + pageerror + honest error-truncation ──────────────────────────────────
 test('★ network.failed includes ABORTS (status -1 AND 0), not just HTTP >= 400', () => {
   const nd = [
@@ -143,21 +178,41 @@ test('network summary: counts, top-N, third-party grouping (parity)', () => {
   const n = extractNetwork(NETWORK_NDJSON, TARGET);
   assert.equal(n.totalRequests, 5); // context-options skipped
   assert.equal(n.wireKb, Math.trunc((43165 + 50000 + 2205000 + 500 + 0) / 1024));
-  assert.equal(n.thirdPartyCount, 3); // 2× images.wegmans.com + the blob: (no host)
+  // ★ Error-diff P1: images.wegmans.com is a SIBLING subdomain of the target (www.wegmans.com) → FIRST-party
+  // under the Wegmans allowlist. The old exact-target-host rule wrongly marked it third-party; now only the
+  // host-less blob: resource (no host → third-party) remains.
+  assert.equal(n.thirdPartyCount, 1);
 
   assert.equal(n.failed.length, 1);
   assert.equal(n.failed[0].status, 404);
+  assert.equal(n.failed[0].thirdParty, false); // images.wegmans.com — now correctly first-party
   assert.equal(n.slowest[0].timeMs, 1499); // blob script slowest
   assert.equal(n.largest[0].size, 2205000); // hero image largest
+  assert.equal(n.largest[0].thirdParty, false); // images.wegmans.com — now correctly first-party
 
   assert.equal(n.uncompressed.length, 1); // only big.js (text, no encoding, > floor)
   assert.ok(n.uncompressed[0].url.includes('big.js'));
 
-  assert.equal(n.topThirdParties.length, 1); // host-less blob: excluded
-  assert.equal(n.topThirdParties[0].host, 'images.wegmans.com');
-  assert.equal(n.topThirdParties[0].count, 2);
+  // host-less blob: excluded from grouping; images.wegmans.com is first-party → not grouped. No third parties.
+  assert.deepEqual(n.topThirdParties, []);
 
   assert.deepEqual(n.mutations, []); // GET-only fixture → mutations is an EMPTY list (matches C# empty, not absent)
+});
+
+// ★ Error-diff P1: grouping still works for a GENUINE third-party host (bot.emplifi.io — not Wegmans-owned),
+// so the allowlist fix narrows what counts as third-party without breaking the third-party rollup itself.
+test('network third-party grouping groups a real third-party host by wire KB (parity)', () => {
+  const nd = [
+    '{"type":"resource-snapshot","snapshot":{"_resourceType":"document","time":10,"timings":{"wait":5},"request":{"url":"https://www.wegmans.com/","method":"GET"},"response":{"status":200,"_transferSize":1000,"content":{"size":500}}}}',
+    '{"type":"resource-snapshot","snapshot":{"_resourceType":"script","time":20,"timings":{"wait":5},"request":{"url":"https://bot.emplifi.io/a.js","method":"GET"},"response":{"status":200,"_transferSize":40000,"content":{"size":40000}}}}',
+    '{"type":"resource-snapshot","snapshot":{"_resourceType":"script","time":30,"timings":{"wait":5},"request":{"url":"https://bot.emplifi.io/b.js","method":"GET"},"response":{"status":200,"_transferSize":8000,"content":{"size":8000}}}}',
+  ].join('\n');
+  const n = extractNetwork(nd, TARGET);
+  assert.equal(n.thirdPartyCount, 2); // both emplifi scripts (www.wegmans.com document is first-party)
+  assert.equal(n.topThirdParties.length, 1);
+  assert.equal(n.topThirdParties[0].host, 'bot.emplifi.io');
+  assert.equal(n.topThirdParties[0].count, 2);
+  assert.equal(n.topThirdParties[0].kb, Math.trunc((40000 + 8000) / 1024));
 });
 
 // ── mutations (POST/PUT/PATCH/DELETE) — parity with C# TraceExtractor.ExtractNetwork Mutations ──────────────

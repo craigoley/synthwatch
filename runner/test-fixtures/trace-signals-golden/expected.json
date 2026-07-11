@@ -3,7 +3,7 @@
   "network": {
     "totalRequests": 9,
     "wireKb": 2245,
-    "thirdPartyCount": 3,
+    "thirdPartyCount": 1,
     "failed": [
       {
         "url": "https://images.wegmans.com/api/x",
@@ -14,7 +14,7 @@
         "size": 0,
         "wire": 500,
         "encoding": "",
-        "thirdParty": true
+        "thirdParty": false
       },
       {
         "url": "https://www.wegmans.com/api/cart/lineitem",
@@ -71,7 +71,7 @@
         "size": 2205000,
         "wire": 2205000,
         "encoding": "",
-        "thirdParty": true
+        "thirdParty": false
       },
       {
         "url": "https://images.wegmans.com/api/x",
@@ -82,7 +82,7 @@
         "size": 0,
         "wire": 500,
         "encoding": "",
-        "thirdParty": true
+        "thirdParty": false
       }
     ],
     "largest": [
@@ -95,7 +95,7 @@
         "size": 2205000,
         "wire": 2205000,
         "encoding": "",
-        "thirdParty": true
+        "thirdParty": false
       },
       {
         "url": "https://www.wegmans.com/",
@@ -155,13 +155,7 @@
         "thirdParty": false
       }
     ],
-    "topThirdParties": [
-      {
-        "host": "images.wegmans.com",
-        "count": 2,
-        "kb": 2153
-      }
-    ],
+    "topThirdParties": [],
     "mutations": [
       {
         "method": "POST",
@@ -190,21 +184,25 @@
       {
         "level": "error",
         "origin": "site",
+        "sourceHost": "www.wegmans.com",
         "text": "component:SiteHeaderSearch:helpers Invalid discovery pages storage data"
       },
       {
         "level": "pageerror",
         "origin": "site",
+        "sourceHost": "www.wegmans.com",
         "text": "Uncaught TypeError: Cannot read properties of null (reading 'checkout')"
       },
       {
         "level": "error",
         "origin": "third-party",
+        "sourceHost": "realtime-c.astutebot.com",
         "text": "WebSocket connection to 'wss://realtime-c.astutebot.com/eventHub' failed"
       },
       {
         "level": "warning",
         "origin": "site",
+        "sourceHost": "www.wegmans.com",
         "text": "[Meta Pixel] - Duplicate Pixel ID: 376538596548029."
       }
     ],

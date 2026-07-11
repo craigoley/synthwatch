@@ -9,6 +9,7 @@
 //   change both sides together. Pure + non-fatal: a missing entry / unparseable line yields an empty section.
 import AdmZip from 'adm-zip';
 import { type Redactor, IDENTITY_REDACTOR } from './redact.js';
+import { isFirstParty } from './firstPartyHosts.js';
 
 // ── output shape (camelCase — matches TraceSignalsDto serialized with JsonSerializerDefaults.Web) ──────────
 export interface TraceRequest {
@@ -48,6 +49,10 @@ export interface NetworkSummary {
 export interface ConsoleMessage {
   level: string;
   origin: string;
+  // ★ Error-diff P1: the host of the RESOURCE this error is about — parsed from the first URL in the error
+  // text, else the logging frame's host. Drives `origin` (via the first-party allowlist) and is a component
+  // of the per-error diff fingerprint (synthwatch-api TraceSignalsDiff). '' when no host is derivable.
+  sourceHost: string;
   text: string;
 }
 export interface ConsoleSummary {
@@ -166,7 +171,7 @@ export function extractNetwork(
       size: int(content.size),
       wire: int(resp._transferSize),
       enc: header(resp, 'content-encoding'),
-      third: !isSite(hostOf(url), targetHost),
+      third: !isFirstParty(hostOf(url), targetHost),
       method: str(req.method),
     });
   }
@@ -298,9 +303,15 @@ export function extractConsole(
     if (seen.has(key)) continue; // dedupe repeats
     seen.add(key);
 
+    // ★ Error-diff P1: classify by the RESOURCE the error is ABOUT, not the frame that logged it. Prefer the
+    // host of the first URL in the error text (a CSP refusal / failed load / websocket names its resource);
+    // fall back to the logging frame's host when the text carries none. Keying off the frame alone mislabelled
+    // a third-party resource refused by the site frame as origin:'site'.
+    const sourceHost = resourceHostFromText(text) || hostOf(loc);
     kept.push({
       level,
-      origin: isSite(hostOf(loc), targetHost) ? 'site' : 'third-party',
+      origin: isFirstParty(sourceHost, targetHost) ? 'site' : 'third-party',
+      sourceHost,
       text: text.slice(0, 200),
     });
   }
@@ -347,11 +358,19 @@ function hostOf(url: string): string {
   }
 }
 
-function isSite(host: string, target: string | null): boolean {
-  if (!target || host.length === 0) return false;
-  const h = host.toLowerCase();
-  const t = target.toLowerCase();
-  return h === t || h.endsWith('.' + t);
+// ★ Error-diff P1: the host of the first URL embedded in an error's text (the resource the error is ABOUT).
+// Matches http(s)/ws(s) and captures the authority up to the first path/query/fragment/quote/space; then
+// strips userinfo + port. '' when the text carries no URL. FAITHFUL-PORTED — keep byte-identical to the C#
+// TraceExtractor.ResourceHostFromText (same regex + strip steps) so the golden fixture agrees.
+function resourceHostFromText(text: string): string {
+  const m = text.match(/(?:https?|wss?):\/\/([^\s/'"?#)]+)/i);
+  if (!m) return '';
+  let auth = m[1];
+  const at = auth.lastIndexOf('@'); // strip userinfo (user:pass@host)
+  if (at >= 0) auth = auth.slice(at + 1);
+  const colon = auth.indexOf(':'); // strip port
+  if (colon >= 0) auth = auth.slice(0, colon);
+  return auth.toLowerCase();
 }
 
 function header(resp: Record<string, unknown>, name: string): string {
