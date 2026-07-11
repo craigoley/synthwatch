@@ -126,6 +126,10 @@ export interface Check {
   redact_patterns: string[] | null;
   severity: 'critical' | 'warning';
   enabled: boolean;
+  // Reversible dashboard-owned archive (0071). NULL = active; a timestamp = archived (excluded from the
+  // due-loop + normal on-demand runs by the `archived_at IS NULL` gates). DISTINCT from enabled/pause.
+  // Dashboard-owned: reconcile never writes it (absent from GIT_AUTHORITATIVE/SEED_ONLY), so it survives.
+  archived_at: Date | null;
   // Perf budgets (Tier-1). A browser run that otherwise passes is downgraded to
   // 'warn' when a captured metric exceeds its budget. null => no budget for that
   // metric. claim() does SELECT *, so these ride along; typed here so code reads them.
