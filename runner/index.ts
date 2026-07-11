@@ -694,7 +694,7 @@ async function runOneInner(
         // fall back to `redact` (declared patterns + credential values)
       }
       const redactedPath = `${outcome.tracePath}.redacted.zip`;
-      if (buildRedactedTraceZip(outcome.tracePath, redactedPath, zipRedact)) {
+      if (await buildRedactedTraceZip(outcome.tracePath, redactedPath, zipRedact)) {
         traceUrl = await uploadTrace(runId, redactedPath);
         await unlink(redactedPath).catch(() => {});
       } else {

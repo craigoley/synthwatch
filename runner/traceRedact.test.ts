@@ -207,12 +207,12 @@ test('rules 1-2 escape-aware: HAR pair + auth-ish JSON key with escaped quotes s
   assert.equal(outKey.access_token, '<redacted>');
 });
 
-test('★ buildRedactedTraceZip: binary entries dropped, text kept, and NO planted secret survives ANYWHERE', () => {
+test('★ buildRedactedTraceZip: binary entries dropped, text kept, and NO planted secret survives ANYWHERE', async () => {
   const dir = tmpDir();
   try {
     const src = writeFixtureZip(dir);
     const dest = join(dir, 'trace.redacted.zip');
-    assert.equal(buildRedactedTraceZip(src, dest, redactor), true);
+    assert.equal(await buildRedactedTraceZip(src, dest, redactor), true);
 
     const out = new AdmZip(dest);
     const names = out.getEntries().map((e) => e.entryName).sort();
@@ -233,20 +233,20 @@ test('★ buildRedactedTraceZip: binary entries dropped, text kept, and NO plant
   }
 });
 
-test('buildRedactedTraceZip fail-closed: a corrupt zip → false, dest not left behind', () => {
+test('buildRedactedTraceZip fail-closed: a corrupt zip → false, dest not left behind', async () => {
   const dir = tmpDir();
   try {
     const src = join(dir, 'corrupt.zip');
     writeFileSync(src, Buffer.from('this is not a zip'));
     const dest = join(dir, 'out.zip');
-    assert.equal(buildRedactedTraceZip(src, dest, redactor), false);
+    assert.equal(await buildRedactedTraceZip(src, dest, redactor), false);
     assert.equal(existsSync(dest), false, 'no partial output left for the caller to upload');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test('buildRedactedTraceZip fail-closed: a valid zip that is NOT a Playwright trace → false', () => {
+test('buildRedactedTraceZip fail-closed: a valid zip that is NOT a Playwright trace → false', async () => {
   const dir = tmpDir();
   try {
     const zip = new AdmZip();
@@ -254,17 +254,61 @@ test('buildRedactedTraceZip fail-closed: a valid zip that is NOT a Playwright tr
     const src = join(dir, 'nottrace.zip');
     writeFileSync(src, zip.toBuffer());
     const dest = join(dir, 'out.zip');
-    assert.equal(buildRedactedTraceZip(src, dest, redactor), false);
+    assert.equal(await buildRedactedTraceZip(src, dest, redactor), false);
     assert.equal(existsSync(dest), false);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test('buildRedactedTraceZip fail-closed: a missing source file → false', () => {
+test('buildRedactedTraceZip fail-closed: a missing source file → false', async () => {
   const dir = tmpDir();
   try {
-    assert.equal(buildRedactedTraceZip(join(dir, 'nope.zip'), join(dir, 'out.zip'), redactor), false);
+    assert.equal(await buildRedactedTraceZip(join(dir, 'nope.zip'), join(dir, 'out.zip'), redactor), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ★ MEMORY-BOUNDED (the B2 point): a DROPPED entry (screencast frame) that is FAR larger than the
+// container has headroom must NOT be pulled into memory. The old in-memory build did `new AdmZip(srcPath)`
+// — loading the ENTIRE zip, jpegs included — which is exactly what OOM-killed the runner on a long run.
+// The streaming build skips dropped entries WITHOUT decompressing them, so peak memory tracks the kept
+// TEXT entries only, not the (dominant) screencast bulk. Here the dropped jpeg is 160 MiB of INCOMPRESSIBLE
+// random bytes (so the on-disk zip is really ~160 MiB, not squashed by deflate); we assert the run's own
+// RSS growth stays well under that. MUST-GO-RED under the old AdmZip code: loading the 160 MiB entry grows
+// RSS by ≥160 MiB, blowing the bound.
+test('buildRedactedTraceZip: a huge DROPPED entry is streamed past, not loaded — peak memory stays bounded', async () => {
+  const dir = tmpDir();
+  try {
+    const BIG = 160 * 1024 * 1024; // 160 MiB, incompressible
+    const src = join(dir, 'trace.zip');
+    {
+      // Build the fixture with AdmZip (setup only — this is NOT the code under test). Kept in its own
+      // block so the 160 MiB source buffer is dead by the time we measure the function's own growth.
+      const { randomBytes } = await import('node:crypto');
+      const zip = new AdmZip();
+      zip.addFile('trace.trace', Buffer.from(TRACE_NDJSON, 'utf8'));
+      zip.addFile('trace.network', Buffer.from('{"tiny":"line"}', 'utf8'));
+      zip.addFile('resources/bigframe.jpeg', randomBytes(BIG)); // dropped by classifyEntry
+      writeFileSync(src, zip.toBuffer());
+    }
+    const dest = join(dir, 'trace.redacted.zip');
+
+    const before = process.memoryUsage().rss;
+    const ok = await buildRedactedTraceZip(src, dest, redactor);
+    const grew = process.memoryUsage().rss - before;
+
+    assert.equal(ok, true, 'streams to a valid redacted zip despite the huge dropped entry');
+    const out = new AdmZip(dest);
+    const names = out.getEntries().map((e) => e.entryName).sort();
+    assert.deepEqual(names, ['trace.network', 'trace.trace'], 'the 160 MiB jpeg is dropped; text kept');
+    // Bounded: the streamed run must not have pulled the 160 MiB entry into memory. Generous half-size
+    // ceiling absorbs GC/allocator noise while still catching a whole-zip load (which would add ≥160 MiB).
+    assert.ok(
+      grew < BIG / 2,
+      `RSS grew ${(grew / 1048576).toFixed(1)} MiB during redaction of a 160 MiB-dropped-entry trace — expected « the entry size (streaming, not whole-zip load)`,
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
