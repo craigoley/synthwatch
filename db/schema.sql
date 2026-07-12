@@ -241,6 +241,31 @@ CREATE TABLE check_tags (
 CREATE INDEX check_tags_key_value_idx ON check_tags (key, value);
 
 -- ---------------------------------------------------------------------------
+-- env_domain_map: ordered domain→environment inference for reconcile-apply (0073).
+-- reconcile resolves checks.environment as manifest.environment ?? inferFromDomain(target_url, map) ?? 'prod'
+-- (explicit manifest > inferred > default). Pattern = exact host or `*.suffix` wildcard (host == suffix OR
+-- host endsWith '.'+suffix); lowest priority wins, ties by id. runner/envDomainMap.ts is the matcher. The
+-- API only SELECTs it (read endpoint; CRUD is env PR-3). Seed is conservative — matches no current prod host.
+-- ---------------------------------------------------------------------------
+CREATE TABLE env_domain_map (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    pattern     text NOT NULL UNIQUE
+                CHECK (pattern = lower(pattern) AND pattern !~ '[[:space:]]'),
+    environment text NOT NULL CHECK (environment IN ('prod','staging','dev')),
+    priority    int  NOT NULL DEFAULT 100 CHECK (priority >= 0),
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX env_domain_map_priority_idx ON env_domain_map (priority, id);
+INSERT INTO env_domain_map (pattern, environment, priority) VALUES
+    ('preview.commerce.wegmans.com', 'staging', 100),
+    ('*.preview.wegmans.com',        'staging', 200),
+    ('*.staging.wegmans.com',        'staging', 200),
+    ('*.dev.wegmans.com',            'dev',     200),
+    ('localhost',                    'dev',     300),
+    ('127.0.0.1',                    'dev',     300)
+ON CONFLICT (pattern) DO NOTHING;
+
+-- ---------------------------------------------------------------------------
 -- locations: registry of deployed regions (mirrors 0020_location_registry.sql).
 -- The check_locations rows ARE a check's assignment; this registry says which
 -- locations exist / are active and what a new check defaults to (one cursor per

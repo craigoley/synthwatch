@@ -20,6 +20,7 @@ import {
   type DriftRow,
   type ApplyPlanRow,
 } from './reconcile.js';
+import { loadEnvDomainMap } from './envDomainMap.js';
 import { activeLocations } from './locations.js';
 import { RETENTION_DAYS } from './retention.js';
 import { probeSpecsFromPool, type SpecProbe } from './specfetch/specCache.js';
@@ -177,12 +178,15 @@ async function main(): Promise<void> {
   // the SAME pass WARMS spec_cache (a successful probe upserts compiled_js + last_good), so this
   // front-loads the runtime cache before checks run the fetch path.
   const specPaths = manifest.monitors.map((m) => m.script);
-  const [managed, specRunnable] = await Promise.all([
+  const [managed, specRunnable, envMap] = await Promise.all([
     loadManagedChecks(),
     probeSpecsFromPool(specPaths),
+    // env PR-2: the ordered domain→env inference rules, so drift + apply resolve environment as
+    // manifest.environment ?? inferFromDomain(target_url) ?? 'prod' (explicit > inferred > default).
+    loadEnvDomainMap(),
   ]);
 
-  const drift = computeDrift(manifest.monitors, managed, specRunnable);
+  const drift = computeDrift(manifest.monitors, managed, specRunnable, envMap);
   await persistDrift(drift);
 
   // ★ RECONCILE-APPLY PHASE 0 (DRY-RUN): compute the apply PLAN per drift + persist it to
@@ -190,7 +194,7 @@ async function main(): Promise<void> {
   // assignDefaultLocations are NOT executed (computeApplyPlan only RENDERS their SQL). The ONLY new write
   // is the plan record. Never-throw: a plan-compute failure must not break the detect path that works.
   try {
-    const plans = computeApplyPlan(manifest.monitors, drift, await activeLocations());
+    const plans = computeApplyPlan(manifest.monitors, drift, await activeLocations(), envMap);
     await persistApplyPlan(plans);
     const blocked = plans.filter((p) => p.status === 'blocked').length;
     console.log(
