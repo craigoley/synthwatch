@@ -630,9 +630,16 @@ do_deploy() {
 # 7. Verify what LANDED (always runs, even if create 'Failed'). Non-zero exit on any failure.
 # ---------------------------------------------------------------------------
 VERIFY_FAILS=0
+VERIFY_SKIPS=0
 EXPECTED_MIGRATIONS=''   # set by handle_migrations: versions the deploy range shipped (BUG 3)
 pass() { c_green "  PASS  $*"; }
 flunk() { c_red   "  FAIL  $*"; VERIFY_FAILS=$((VERIFY_FAILS + 1)); }
+# skip <message> : a check that is legitimately NOT APPLICABLE — an AFFIRMATIVELY-established "nothing to
+# assert" (the parser WORKED and found none), NOT a parse that failed and shrugged. ★ Printed DISTINCTLY from
+# PASS so a green never stands in for a check that asserted nothing (the #279 lesson: a vacuous PASS
+# manufactures confidence). Not a failure — but a SKIP where a PASS is expected is itself a signal, so it is
+# counted and surfaced in the summary. A parse FAILURE must still `flunk`, never `skip`.
+skip() { c_yellow "  SKIP  $*"; VERIFY_SKIPS=$((VERIFY_SKIPS + 1)); }
 # check <ok-bool> <message> : pass if first arg is "1", else flunk. Avoids the A&&B||C trap.
 check() { if [[ "$1" == "1" ]]; then pass "$2"; else flunk "$2"; fi; }
 
@@ -798,7 +805,10 @@ verify_cors() {
   # can never SIGPIPE, so "declares no CORS" is a reliable, RARE state (never a parse miss). A DECLARED block
   # that then can't be parsed FLUNKS below (never a silent pass).
   if ! template_declares_cors "${tmpl}"; then
-    pass "cors: template declares no blob CORS — nothing to assert"
+    # AFFIRMATIVELY established (template_declares_cors is a reliable pure-bash predicate post-#279, not a
+    # parse that shrugged) → SKIP, not PASS: this check asserted nothing, so it must never show green (the
+    # #279 lesson). If corsRules ARE declared but unparseable, the flunks below fire — never this skip.
+    skip "cors: template declares no blob CORS — nothing to assert (verified: no corsRules in the template)"
     return
   fi
   storage_acct="$(printf '%s' "${tmpl}" | bicep_param storageAccountName)"
@@ -829,22 +839,22 @@ verify() {
   # AOAI api-version preserved on runner + narrative (the #93/#94 defect).
   local v ok
   v="$(job_env_value "${RUNNER_JOB}" AZURE_OPENAI_API_VERSION)"
-  [[ "${v}" == "${EXPECTED_API_VERSION}" ]] && ok=1 || ok=0
+  str_eq "${EXPECTED_API_VERSION}" "${v}" && ok=1 || ok=0
   check "${ok}" "${RUNNER_JOB} AZURE_OPENAI_API_VERSION='${v}' (expect ${EXPECTED_API_VERSION})"
   v="$(job_env_value "${NARRATIVE_JOB}" AZURE_OPENAI_API_VERSION)"
-  [[ "${v}" == "${EXPECTED_API_VERSION}" ]] && ok=1 || ok=0
+  str_eq "${EXPECTED_API_VERSION}" "${v}" && ok=1 || ok=0
   check "${ok}" "${NARRATIVE_JOB} AZURE_OPENAI_API_VERSION='${v}' (expect ${EXPECTED_API_VERSION})"
 
   # ACS secretRef present on the runner job (the recurring email-wipe defect).
   v="$(job_env_secretref "${RUNNER_JOB}" ACS_EMAIL_CONNECTION_STRING)"
-  [[ "${v}" == "${ACS_SECRET_REF}" ]] && ok=1 || ok=0
+  str_eq "${ACS_SECRET_REF}" "${v}" && ok=1 || ok=0
   check "${ok}" "${RUNNER_JOB} ACS_EMAIL_CONNECTION_STRING secretRef='${v}' (expect ${ACS_SECRET_REF})"
 
   # CRED_ENC_KEY secretRef PLUMBING present on the runner job (model-B value crypto — the decrypt canary).
   # Asserts the env→secretRef mapping is intact (not the value). A future deploy that drops it → runner
   # can't decrypt credential values → login monitors fail closed; caught here.
   v="$(job_env_secretref "${RUNNER_JOB}" CRED_ENC_KEY)"
-  [[ "${v}" == "${CRED_ENC_KEY_SECRET_REF}" ]] && ok=1 || ok=0
+  str_eq "${CRED_ENC_KEY_SECRET_REF}" "${v}" && ok=1 || ok=0
   check "${ok}" "${RUNNER_JOB} CRED_ENC_KEY secretRef='${v}' (expect ${CRED_ENC_KEY_SECRET_REF})"
 
   # AZURE_CLIENT_ID present where expected (MI pin; #90).
@@ -866,7 +876,7 @@ verify() {
   # assertion is the deploy-time proof it is genuinely present on each running job.
   for j in "${RUNNER_IMAGE_JOBS[@]}"; do
     v="$(job_env_value "${j}" SYNTHWATCH_DEPLOYED)"
-    [[ "${v}" == "1" ]] && ok=1 || ok=0
+    str_eq "1" "${v}" && ok=1 || ok=0
     check "${ok}" "${j} SYNTHWATCH_DEPLOYED='${v}' (expect 1 — A4 prod-guard; the job REFUSES TO START without it)"
   done
 
@@ -961,7 +971,7 @@ verify() {
   # API health.
   local code
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "${API_HEALTH_URL}" 2>/dev/null || true)"
-  [[ "${code}" == "200" ]] && ok=1 || ok=0
+  str_eq "200" "${code}" && ok=1 || ok=0
   check "${ok}" "API ${API_HEALTH_URL} -> '${code}' (expect 200)"
 
   # ★ CRED_ENC_KEY DRIFT-CHECK (model-B single-source safety net). The runner secret was set from
@@ -989,7 +999,7 @@ verify() {
       if command -v psql >/dev/null 2>&1; then
         n="$(psql "${DATABASE_URL:-}" -tAc \
               "SELECT 1 FROM schema_migrations WHERE version='${mig}'" 2>/dev/null || true)"
-        [[ "${n}" == "1" ]] && ok=1 || ok=0
+        str_eq "1" "${n}" && ok=1 || ok=0
         check "${ok}" "migration ${mig} recorded in schema_migrations"
       else
         flunk "migration ${mig} unverified — psql not on PATH"
@@ -998,10 +1008,14 @@ verify() {
   fi
 
   echo
+  local skipnote=""
+  if [[ "${VERIFY_SKIPS}" -gt 0 ]]; then
+    skipnote=" (${VERIFY_SKIPS} SKIP — asserted nothing; see SKIP lines. A SKIP where a PASS is expected is a signal.)"
+  fi
   if [[ "${VERIFY_FAILS}" -eq 0 ]]; then
-    c_green "VERIFY: all checks passed."
+    c_green "VERIFY: all checks passed.${skipnote}"
   else
-    c_red "VERIFY: ${VERIFY_FAILS} check(s) FAILED."
+    c_red "VERIFY: ${VERIFY_FAILS} check(s) FAILED.${skipnote}"
   fi
 }
 

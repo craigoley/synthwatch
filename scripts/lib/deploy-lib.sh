@@ -351,6 +351,18 @@ mem_eq() {
   [[ -n "$1" && "$1" == "$2" ]]
 }
 
+# str_eq <expected> <live> : plain string equality with the SAME empty-expected guard as num_eq/mem_eq — exit 0
+# IFF a NON-EMPTY <expected> exactly equals <live>. ★ An EMPTY <expected> → exit 1 (FLUNK), never a match. This
+# closes the #279 vacuous-pass class for every string assertion in verify(): a comparison where the expected
+# side came back empty (a readonly constant left unset, or a future template-derived value whose parse missed)
+# must FAIL, never let an empty-vs-empty `[[ "" == "" ]]` silently pass. The verify() string checks route
+# through this so the guard is uniform + tested in one place (mirrors num_eq/mem_eq being the tested numeric
+# comparators). NOTE identical body to mem_eq today — kept as its own name so the intent (generic guarded
+# string-eq vs memory-specific) is explicit and each has its own must-go-red.
+str_eq() {
+  [[ -n "$1" && "$1" == "$2" ]]
+}
+
 # image_covered_by_template <image_sha> <template_ref> : exit 0 IFF the deployed image's commit is an
 # ancestor-OR-EQUAL of the template commit — i.e. the template does NOT predate the image it ships. THE
 # #253/#256 stale-template guard: shipping an ANCESTOR's template atop a current image (a 2Gi ancestor
