@@ -166,8 +166,13 @@ An incremental deploy does NOT delete the existing admin when this is false, so 
 Set true only to (re)create the admin if it were ever actually lost.''')
 param reassertPostgresEntraAdmin bool = false
 
-@description('principalId of the synthwatch-api Function App MI — granted Container Apps Jobs Operator on the runner job so its on-demand "Run now" / test-send ARM jobs/start succeeds.')
+@description('principalId of the synthwatch-api Function App MI — granted Container Apps Jobs Operator on the runner job so its on-demand "Run now" / test-send ARM jobs/start succeeds, AND Storage Blob Delegator on the artifacts account so it can mint short-TTL user-delegation SAS URLs for the trace viewer.')
 param apiManagedIdentityPrincipalId string = '67f2bd0c-1334-42a7-b521-3005064d7171'
+
+@description('Origins allowed to fetch trace blobs cross-origin (blob-service CORS) — the dashboard the viewer runs on, so its direct SAS fetch of a large trace is not CORS-blocked. Exact origins (scheme+host, no trailing slash), never "*". Defaults to the prod dashboard; add preview origins here as needed.')
+param dashboardCorsOrigins array = [
+  'https://synthwatch-dashboard.vercel.app'
+]
 
 @description('Blob container for failure screenshots. Matches the runner default (AZURE_STORAGE_CONTAINER).')
 param artifactContainerName string = 'synthwatch-artifacts'
@@ -218,6 +223,12 @@ var acrPullRoleId = '7f951dda-4ed3-4680-a7ca-43fe172d538d'
 // `jobs/start` call succeeds (without it the start 403s, StartAsync returns false, and the trigger
 // silently never fires an off-schedule execution — the request only runs on the next */5 cron tick).
 var jobsOperatorRoleId = 'b9a307c4-5aa3-4b52-ba60-2b17c136cd7b'
+
+// Storage Blob Delegator built-in role — grants Microsoft.Storage/.../generateUserDelegationKey. The API MI
+// needs this ON THE ARTIFACTS ACCOUNT to mint the read-only, single-blob, short-TTL user-delegation SAS the
+// dashboard trace viewer fetches (the Vercel serverless proxy can't stream a 124 MB trace). Key-LESS SAS —
+// AAD-signed, no account key. (It already holds Storage Blob Data Reader, granted in the API's own bicep.)
+var storageBlobDelegatorRoleId = 'db58b8e5-c6ad-4a2a-8342-4190687cbf4a'
 
 // ---------------------------------------------------------------------------
 // Observability: Log Analytics workspace backing the ACA environment.
@@ -329,6 +340,37 @@ resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
 resource blobService 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01' = {
   parent: storage
   name: 'default'
+  properties: {
+    // Allow the dashboard origin to fetch a trace blob cross-origin via its short-TTL SAS URL (the viewer's
+    // direct fetch bypasses the Vercel serverless proxy). GET/HEAD only; the blob stays private (public access
+    // off) — CORS is not the auth boundary, the single-blob read SAS is. '*' headers/exposed cover the
+    // viewer's Range requests on the zip. maxAge caches the preflight.
+    cors: {
+      corsRules: [
+        {
+          allowedOrigins: dashboardCorsOrigins
+          allowedMethods: [ 'GET', 'HEAD' ]
+          allowedHeaders: [ '*' ]
+          exposedHeaders: [ '*' ]
+          maxAgeInSeconds: 3600
+        }
+      ]
+    }
+  }
+}
+
+// ★ The API MI mints the trace-viewer's user-delegation SAS — grant it Storage Blob Delegator on the
+// artifacts account (generateUserDelegationKey). Least-privilege: Delegator only permits obtaining a
+// delegation key; the SAS it signs is itself read-only + single-blob + ~2 min. Deterministic guid() name →
+// a redeploy adopts it idempotently.
+resource apiBlobDelegatorAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(storage.id, apiManagedIdentityPrincipalId, storageBlobDelegatorRoleId)
+  scope: storage
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', storageBlobDelegatorRoleId)
+    principalId: apiManagedIdentityPrincipalId
+    principalType: 'ServicePrincipal'
+  }
 }
 
 resource artifactContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {
