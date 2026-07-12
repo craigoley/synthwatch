@@ -13,10 +13,26 @@
 -- rounded-2dp (for display). The RATE is passed in by the caller from COST_RATE_PER_VCPU_SECOND (the api
 -- config) — the function is NOT a second rate source.
 -- Apply: psql "$DATABASE_URL" -f db/migrations/0069_cost_projection.sql
+--
+-- ★ REPLAY-IDEMPOTENCY (amended 2026-07-12): DROP-then-CREATE, NOT `CREATE OR REPLACE`. This is an
+-- EFFECT-PRESERVING amendment of an already-applied migration — prod recorded 0069 in schema_migrations, so
+-- migrate.sh NEVER re-runs it; the result is unchanged (a 13-col cost_projection, later superseded by 0078's
+-- 17-col DROP+CREATE). What changed is REPLAY-SAFETY: the runner schema materializes as db/schema.sql (now
+-- 0078's 17-col end state) and then replays every migration on top (db/migrate.sh's idempotency contract; the
+-- api schema-parity gate does the same). `CREATE OR REPLACE` CANNOT change a function's return type, so
+-- re-applying this OLD 13-col signature on top of the 17-col schema.sql errored ("cannot change return type of
+-- existing function") and halted the replay AT 0069 — breaking a fresh DB (schema.sql + migrate.sh) and the
+-- parity gate. `DROP FUNCTION IF EXISTS` drops whatever is present (nothing on a truly-empty DB; the 17-col on
+-- a schema.sql base), then CREATE re-establishes the 13-col; 0078 then DROP+CREATEs the 17-col, so the replay
+-- CONVERGES to 0078's end state. The function BODY below is BYTE-IDENTICAL to the original 0069 (only the two
+-- lines — this DROP and CREATE-OR-REPLACE → CREATE — changed). A plain DROP is safe: 0078 already DROPs this
+-- function without CASCADE in prod, proving nothing depends on it. The grant is re-issued below the CREATE.
 
 BEGIN;
 
-CREATE OR REPLACE FUNCTION cost_projection(p_rate numeric)
+DROP FUNCTION IF EXISTS cost_projection(numeric);
+
+CREATE FUNCTION cost_projection(p_rate numeric)
 RETURNS TABLE (
     check_id         bigint,
     source_key       text,
