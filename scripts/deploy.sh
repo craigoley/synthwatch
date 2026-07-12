@@ -360,13 +360,8 @@ sync_target_to_origin() {
   local origin_head local_head state
   origin_head="$(git rev-parse origin/main 2>/dev/null)" \
     || fail "cannot resolve origin/main — is the 'origin' remote configured with a 'main' branch?"
-
-  # ★ STALE-SCRIPT GUARD (concern B): abort BEFORE any deploy work — and before the benign "behind origin"
-  # NOTE below — if the RUNNING deploy scripts differ from origin/main. deploy.sh deploys origin/main's
-  # template but executes the LOCAL copy of itself; a stale local copy silently runs OLD logic (the #254/#268
-  # "merged but not executing" trap). Being behind on the SCRIPT is never benign, unlike the template.
-  assert_deploy_scripts_current
-
+  # (The stale-SCRIPT guard runs UNCONDITIONALLY at the top level — before this, and before the --sha branch —
+  # so it also covers --sha, which skips this function. See assert_deploy_scripts_current's call site.)
   local_head="$(git rev-parse HEAD 2>/dev/null || echo '')"
   state="$(git_drift_state "${local_head}" "${origin_head}")"
   DRIFT_STATE="${state}"   # hoisted for the post-deploy sync offer (offer_local_sync)
@@ -430,6 +425,14 @@ offer_local_sync() {
     c_green "     or re-run with --sync to do it automatically after a successful deploy (skipped if the tree is dirty)." >&2
   fi
 }
+
+# ★ Concern B: refuse a STALE copy of the deploy scripts — UNCONDITIONALLY, before any deploy work and BEFORE
+# the --sha branch. --sha skips sync_target_to_origin, so putting the guard here (not inside sync) keeps a
+# stale script from silently running old verify()/materialize logic on a --sha deploy too. Needs a fresh
+# origin/main; this fetch also primes the ref sync_target_to_origin reads next (a second fetch is harmless).
+git fetch --quiet origin 2>/dev/null \
+  || c_yellow "WARN: 'git fetch origin' failed — the deploy-script currency check uses the last-fetched origin/main." >&2
+assert_deploy_scripts_current
 
 # Derive the target from origin/main (unless --sha overrides the whole pick). --sha is the manual escape
 # hatch and bypasses the origin sync entirely.
@@ -758,7 +761,7 @@ verify_rbac() {
 # corsRules reference), so this stays correct as origins change. Live corsRules was `[]` before #270 — the
 # exact silent pre-state to catch.
 verify_cors() {
-  local tmpl storage_acct origins_tok origins live o
+  local tmpl storage_acct origins live o
   tmpl="$(cat "${TEMPLATE}" 2>/dev/null || true)"
   if [[ -z "${tmpl}" ]]; then flunk "cors: could not read the template ${TEMPLATE}"; return; fi
   if ! printf '%s' "${tmpl}" | grep -q "corsRules"; then
@@ -766,19 +769,25 @@ verify_cors() {
     return
   fi
   storage_acct="$(printf '%s' "${tmpl}" | bicep_param storageAccountName)"
-  origins_tok="$(printf '%s' "${tmpl}" | sed -nE 's/^[[:space:]]*allowedOrigins:[[:space:]]*([A-Za-z0-9_]+).*/\1/p' | head -1)"
-  if [[ -z "${origins_tok}" ]]; then flunk "cors: template declares corsRules but the allowedOrigins token didn't parse"; return; fi
-  origins="$(printf '%s' "${tmpl}" | bicep_param_array "${origins_tok}")"
-  if [[ -z "${origins}" ]]; then flunk "cors: could not resolve origins from param '${origins_tok}'"; return; fi
+  # EVERY corsRule's allowedOrigins token — not just the first — so the data-driven guarantee is N-rules-deep
+  # (a second rule referencing a different origins param must not slip past unasserted).
+  local toks="" tok
+  toks="$(printf '%s' "${tmpl}" | cors_origins_tokens)"
+  if [[ -z "${toks}" ]]; then flunk "cors: template declares corsRules but no allowedOrigins param token parsed"; return; fi
   live="$(az storage account blob-service-properties show -n "${storage_acct}" -g "${RG}" --query "cors.corsRules[].allowedOrigins[]" -o tsv 2>/dev/null || true)"
-  while IFS= read -r o; do
-    [[ -z "${o}" ]] && continue
-    if printf '%s' "${live}" | contains_line "${o}"; then
-      pass "cors: blob service allows origin ${o}"
-    else
-      flunk "cors: blob service does NOT allow origin ${o} (live corsRules empty/missing it) — the bicep declares it; the deploy did NOT land it"
-    fi
-  done <<< "${origins}"
+  while IFS= read -r tok || [[ -n "${tok}" ]]; do
+    [[ -z "${tok}" ]] && continue
+    origins="$(printf '%s' "${tmpl}" | bicep_param_array "${tok}")"
+    if [[ -z "${origins}" ]]; then flunk "cors: could not resolve origins from param '${tok}' (inline arrays unsupported — add a resolver)"; continue; fi
+    while IFS= read -r o || [[ -n "${o}" ]]; do
+      [[ -z "${o}" ]] && continue
+      if printf '%s' "${live}" | contains_line "${o}"; then
+        pass "cors: blob service allows origin ${o}"
+      else
+        flunk "cors: blob service does NOT allow origin ${o} (live corsRules empty/missing it) — the bicep declares it; the deploy did NOT land it"
+      fi
+    done <<< "${origins}"
+  done <<< "${toks}"
 }
 
 verify() {

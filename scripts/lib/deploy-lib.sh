@@ -439,3 +439,11 @@ script_differs_from_ref() {
   git -C "${repo}" cat-file -e "${ref}:${relpath}" 2>/dev/null || return 1   # ref lacks it → not stale
   ! diff -q <(git -C "${repo}" show "${ref}:${relpath}") "${repo}/${relpath}" >/dev/null 2>&1
 }
+
+# cors_origins_tokens : stdin = bicep → the param token of EVERY blob corsRule's `allowedOrigins:` (one per
+# line), so verify_cors asserts all rules' origins, not just the first (the data-driven guarantee is
+# N-rules-deep). Empty if none. (Inline `allowedOrigins: [ … ]` arrays yield no token — a param ref is
+# expected; verify_cors flunks an unresolvable token rather than skipping it.)
+cors_origins_tokens() {
+  sed -nE 's/^[[:space:]]*allowedOrigins:[[:space:]]*([A-Za-z0-9_]+).*/\1/p'
+}

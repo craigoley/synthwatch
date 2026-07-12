@@ -555,6 +555,25 @@ expect_eq "role_assignments_from_template row 1" "storageBlobDelegatorRoleId	api
 expect_eq "role_assignments_from_template row 2" "acrPullRoleId	identity.properties.principalId	acr" "$(printf '%s' "${RBAC_FIXTURE}" | role_assignments_from_template | sed -n 2p)"
 expect_eq "role_assignments count" "2" "$(printf '%s' "${RBAC_FIXTURE}" | role_assignments_from_template | grep -c .)"
 
+# ★ cors_origins_tokens: EVERY corsRule's allowedOrigins param token (not just the first) — so verify_cors's
+# data-driven guarantee is N-rules-deep (a 2nd rule referencing a different param can't slip past unasserted).
+CORS_FIXTURE="$(cat <<'FIX'
+cors: {
+  corsRules: [
+    {
+      allowedOrigins: dashboardCorsOrigins
+      allowedMethods: [ 'GET', 'HEAD' ]
+    }
+    {
+      allowedOrigins: previewCorsOrigins
+      allowedMethods: [ 'GET' ]
+    }
+  ]
+}
+FIX
+)"
+expect_eq "cors_origins_tokens finds BOTH rules' origin params" "dashboardCorsOrigins previewCorsOrigins" "$(printf '%s' "${CORS_FIXTURE}" | cors_origins_tokens | tr '\n' ' ' | sed 's/ $//')"
+
 # contains_line — the tested comparator behind the RBAC + CORS live assertions.
 if printf 'AcrPull\nStorage Blob Delegator\n' | contains_line "Storage Blob Delegator"; then green "PASS  contains_line finds an exact role"; else red "FAIL  contains_line should find the role"; FAILS=$((FAILS + 1)); fi
 # ★ MUST-GO-RED: a declared role/origin ABSENT from the live list MUST flunk (a silent not-landed grant/CORS
