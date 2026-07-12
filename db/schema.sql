@@ -1192,4 +1192,20 @@ CREATE TABLE red_tests (
 );
 CREATE INDEX red_tests_check_time_idx ON red_tests (check_id, tested_at DESC);
 
+-- error_mutes (migration 0076) — per-CHECK, per-FINGERPRINT mute for the error-diff NEW bucket (error-diff P4).
+-- An operator MUTES a known/accepted NEW error; the API's error-diff read then moves that fingerprint out of
+-- new[] into a muted[] bucket (never silently dropped). DASHBOARD-managed (API has SELECT/INSERT/DELETE — grant
+-- is in the migration, not here). Notes are set at mute time, not editable (no UPDATE). check_id ON DELETE
+-- CASCADE — a check purge takes its mutes with it. The UNIQUE(check_id, fingerprint) index also serves the
+-- per-check load (WHERE check_id = $1). See runner db/migrations/0076_error_mutes.sql.
+CREATE TABLE error_mutes (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    check_id    bigint NOT NULL REFERENCES checks(id) ON DELETE CASCADE,
+    fingerprint text NOT NULL,
+    muted_at    timestamptz NOT NULL DEFAULT now(),
+    muted_by    text NULL,
+    note        text NULL,
+    CONSTRAINT error_mutes_check_fingerprint_key UNIQUE (check_id, fingerprint)
+);
+
 COMMIT;
