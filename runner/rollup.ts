@@ -51,6 +51,9 @@ export async function computeRollupForDay(checkId: number, day: string): Promise
           -- signal, so it never enters the daily availability/latency rollup — mirrors the sla_availability()
           -- exclusion. A sandbox-only day → total_count=0 (correct "no counted runs", not a real row).
           AND NOT r.sandbox
+          -- SUPERSEDED-TRANSIENT EXCLUSION (0077): a failed run whose confirmation PASSED was transient — it
+          -- must not enter the daily availability/down_count rollup. Mirrors the sandbox exclusion above.
+          AND r.superseded_by_run_id IS NULL
           AND NOT EXISTS (
             SELECT 1 FROM maintenance_windows mw
              WHERE (mw.check_id = r.check_id OR mw.check_id IS NULL)

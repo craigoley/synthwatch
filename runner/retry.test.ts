@@ -4,7 +4,7 @@
 // so a retried-away 'fail' is discarded identically to a retried-away 'error'.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { runWithRetry, effectiveRetries } from './retry.js';
+import { runWithRetry, effectiveRetries, confirmByRerunEligible } from './retry.js';
 
 type R = { status: string; attempt: number };
 
@@ -119,6 +119,19 @@ test('effectiveRetries: sandbox forces 0 even if also already-failing', () => {
 test('effectiveRetries: non-sandbox is UNCHANGED (default arg = full retry preserved)', () => {
   assert.equal(effectiveRetries(2, false), 2); // the fix must not touch normal scheduled runs
   assert.equal(effectiveRetries(2, false, false), 2);
+});
+
+// ── confirm-by-rerun (0077): browser/multistep confirm a failure in a FRESH execution, so their IN-RUN
+// fast-retry is OFF (retries → 0). The confirmation IS the retry — this is what stops the 3×5-min strand.
+test('effectiveRetries: confirmByRerun forces 0 retries (confirm-eligible kind → single in-run attempt)', () => {
+  assert.equal(effectiveRetries(2, false, false, true), 0); // browser/multistep → 1 attempt, confirm by re-run
+  assert.equal(effectiveRetries(2, false, true, false), 0); // still 0 when only sandbox is set
+  assert.equal(effectiveRetries(2, false, false, false), 2); // http/net/ssl keep the in-run fast-retry
+});
+test('confirmByRerunEligible: browser + multistep only', () => {
+  assert.equal(confirmByRerunEligible('browser'), true);
+  assert.equal(confirmByRerunEligible('multistep'), true);
+  for (const k of ['http', 'ssl', 'dns', 'tcp', 'ping']) assert.equal(confirmByRerunEligible(k), false);
 });
 
 // ── retry_count telemetry (0048): `attempts` = how many tries to reach the verdict ──────────────

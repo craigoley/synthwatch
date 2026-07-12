@@ -49,10 +49,14 @@ nodeTest('SANDBOX run SKIPS evaluate() → no incident for a failing paused moni
   try {
     const run = await seedFailRun(check.id);
 
-    await applyRunSideEffects(check, run, true); // sandbox → skip
+    await applyRunSideEffects(check, run, { sandbox: true, alreadyFailing: false, confirmationOfRunId: null }); // sandbox → skip
     assert.equal(await openIncidentCount(check.id), 0, 'sandbox run must NOT open an incident (no page for a paused monitor)');
 
-    await applyRunSideEffects(check, run, false); // control: normal → evaluate opens it
+    // Control: a NON-sandbox failure of the same (browser) check DOES open an incident. ★ alreadyFailing:true
+    // (a sustained outage) so confirm-by-rerun (0077) is skipped and evaluate() opens immediately — this proves
+    // the SANDBOX flag, not the confirm-by-rerun deferral, gated the first assert. (A healthy browser failure
+    // would instead DEFER to a confirmation run — covered by the confirmation-retry tests.)
+    await applyRunSideEffects(check, run, { sandbox: false, alreadyFailing: true, confirmationOfRunId: null });
     assert.equal(await openIncidentCount(check.id), 1, 'a NON-sandbox run of the same failure DOES open an incident (proves the skip gated it)');
 
     const { rows } = await pool.query<{ enabled: boolean }>(`SELECT enabled FROM checks WHERE id = $1`, [check.id]);

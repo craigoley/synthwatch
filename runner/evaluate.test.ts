@@ -6,7 +6,7 @@
 // breach / successful capture) is unchanged — no false positives.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { perfBudgetVerdict, hasPerfBudget, perfBudgetBreach, budgetedMetricCaptureFailed } from './evaluate.js';
+import { perfBudgetVerdict, hasPerfBudget, perfBudgetBreach, budgetedMetricCaptureFailed, shouldConfirmByRerun } from './evaluate.js';
 import { EMPTY_METRICS, type RunMetrics } from './metrics.js';
 import type { Check } from './db.js';
 
@@ -126,4 +126,21 @@ test('B1 silent-null: a healthy captured LCP within budget → PASS; over budget
   const c = check({ perf_budget_lcp_ms: 2000 });
   assert.equal(perfBudgetVerdict(c, 'pass', metrics({ lcpMs: 1200 }), false, 'default').status, 'pass');
   assert.equal(perfBudgetVerdict(c, 'pass', metrics({ lcpMs: 4000 }), false, 'default').status, 'warn');
+});
+
+// ── confirm-by-rerun deferral decision (0077, pure) ─────────────────────────────────────────────
+// A healthy browser/multistep failure DEFERS to a fresh-execution confirmation; everything else does not.
+test('shouldConfirmByRerun: healthy browser/multistep fail or error → DEFER', () => {
+  for (const kind of ['browser', 'multistep'] as const) {
+    for (const status of ['fail', 'error']) {
+      assert.equal(shouldConfirmByRerun(check({ kind }), status, false), true, `${kind}/${status}`);
+    }
+  }
+});
+test('shouldConfirmByRerun: NOT for pass/warn, NOT for http/ssl, NOT when already-failing (D2/D5)', () => {
+  assert.equal(shouldConfirmByRerun(check({ kind: 'browser' }), 'pass', false), false);
+  assert.equal(shouldConfirmByRerun(check({ kind: 'browser' }), 'warn', false), false);
+  assert.equal(shouldConfirmByRerun(check({ kind: 'browser' }), 'infra_error', false), false);
+  assert.equal(shouldConfirmByRerun(check({ kind: 'http' }), 'fail', false), false); // in-run retry keeps http
+  assert.equal(shouldConfirmByRerun(check({ kind: 'browser' }), 'fail', true), false); // already-failing → immediate
 });

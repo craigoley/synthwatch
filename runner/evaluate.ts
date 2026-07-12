@@ -11,6 +11,8 @@ import { pool, type Check, type RunRecord, type TerminalStatus } from './db.js';
 import type { RunMetrics } from './metrics.js';
 import { dispatchAlerts, resolveChannels } from './alerts.js';
 import { rcaEnabled, runRca } from './rca.js';
+import { confirmByRerunEligible } from './retry.js';
+import { fireRunnerJobStart } from './jobTrigger.js';
 
 interface OpenIncident {
   id: number;
@@ -420,7 +422,10 @@ async function aggregateVerdict(check: Check): Promise<Verdict> {
          FROM runs
         -- infra_error excluded with running: it's "didn't run", neither up nor down. A
         -- location producing only infra_error is NOT reporting (can't block OR cause paging).
+        -- ★ SUPERSEDED-TRANSIENT EXCLUSION (0077): a failed run whose confirmation PASSED was transient — it
+        -- must not count toward the failure window (else a self-resolving blip would still open an incident).
         WHERE check_id = $1 AND status NOT IN ('running', 'infra_error')
+          AND superseded_by_run_id IS NULL
      ),
      per_loc AS (
        SELECT location,
@@ -865,8 +870,91 @@ export async function maybeBurnAlert(check: Check): Promise<void> {
  * is UNIT-TESTABLE: index.ts runs main() on import (house convention), so runOneInner itself isn't; this
  * wrapper is the exact seam runOneInner calls, and the sandbox test asserts on it directly.
  */
-export async function applyRunSideEffects(check: Check, run: RunRecord, sandbox: boolean): Promise<void> {
-  if (sandbox) return; // paused-monitor sandbox run: persist the run only, no incident/alert/SLO.
+export interface RunSideEffectContext {
+  /** Paused-monitor sandbox validation — persist only, no incident/alert/SLO (0064/0065). */
+  sandbox: boolean;
+  /** Whether the check had an OPEN incident BEFORE this run (from runOneInner's hasOpenIncident). */
+  alreadyFailing: boolean;
+  /** Set when THIS run is a CONFIRMATION run — the id of the original run it is confirming (0077). */
+  confirmationOfRunId: number | null;
+}
+
+export async function applyRunSideEffects(
+  check: Check,
+  run: RunRecord,
+  ctx: RunSideEffectContext,
+): Promise<void> {
+  if (ctx.sandbox) return; // paused-monitor sandbox run: persist the run only, no incident/alert/SLO.
+
+  // ── (A) THIS run IS a confirmation → it OWNS the verdict (0077, D4). ──────────────────────────────────
+  if (ctx.confirmationOfRunId != null) {
+    if (run.status === 'pass' || run.status === 'warn') {
+      // The original failure was TRANSIENT: mark it superseded (it stays VISIBLE in run history but the
+      // read-side health filters exclude superseded_by_run_id IS NOT NULL). Done BEFORE evaluate so
+      // aggregateVerdict/rollup already exclude it.
+      await pool.query(`UPDATE runs SET superseded_by_run_id = $2 WHERE id = $1`, [ctx.confirmationOfRunId, run.id]);
+      console.log(
+        `[confirm] check ${check.id} "${check.name}" confirmation PASSED — original run ${ctx.confirmationOfRunId} was transient (superseded, no incident).`,
+      );
+    } else {
+      console.log(
+        `[confirm] check ${check.id} "${check.name}" confirmation ${run.status.toUpperCase()} — failure CONFIRMED; opening incident as normal.`,
+      );
+    }
+    // Either outcome: the confirmation is the authoritative run. pass/warn → evaluate resolves nothing (no
+    // incident was opened); fail/error → evaluate opens the incident exactly as today. A confirmation NEVER
+    // enqueues another (D4) — control never reaches branch (B) because confirmationOfRunId is set.
+    await evaluate(check, run);
+    await maybeBurnAlert(check);
+    return;
+  }
+
+  // ── (B) A normal SCHEDULED run that just FAILED on a confirm-eligible, HEALTHY check → DEFER (0077, D2/D5). ─
+  // Skip evaluate (no incident/alert), enqueue ONE confirmation run in a fresh execution. The failed run
+  // PERSISTS visibly as fail/error, awaiting its confirmation — it is NEVER silently discarded.
+  if (shouldConfirmByRerun(check, run.status, ctx.alreadyFailing)) {
+    await enqueueConfirmationRun(check, run);
+    return;
+  }
+
+  // ── (C) Everything else → today's behavior. ──────────────────────────────────────────────────────────
   await evaluate(check, run);
   await maybeBurnAlert(check);
+}
+
+/**
+ * True when a finished run should DEFER its verdict to a fresh-execution confirmation (0077): a browser/multistep
+ * check (confirmByRerunEligible) that just went down (fail/error) while HEALTHY (no open incident). Excludes:
+ * already-failing checks (D5 — a sustained outage counts immediately, no 2× cost, no retry-storm), warn/pass
+ * (not down), infra_error (not a site outage; evaluate short-circuits it), sandbox (handled by the early return),
+ * and confirmation runs themselves (handled by branch A). Pure — unit-testable.
+ */
+export function shouldConfirmByRerun(check: Check, status: string, alreadyFailing: boolean): boolean {
+  return (
+    !alreadyFailing &&
+    (status === 'fail' || status === 'error') &&
+    confirmByRerunEligible(check.kind)
+  );
+}
+
+/**
+ * Enqueue ONE confirmation run for a just-failed scheduled check + fire a dedicated fresh execution (0077).
+ * The run_requests INSERT is the DURABLE enqueue (the one-pending-per-check partial unique index coalesces, so
+ * a concurrent enqueue is a safe no-op); ARM jobs/start is the immediacy optimization (best-effort — the next
+ * cron tick drains the pending request if it fails). The confirmation, when drained, links back to the original
+ * via drainRunRequests's "latest awaiting original" lookup.
+ */
+async function enqueueConfirmationRun(check: Check, run: RunRecord): Promise<void> {
+  await pool.query(
+    `INSERT INTO run_requests (check_id, confirmation) VALUES ($1, true)
+       ON CONFLICT (check_id) WHERE status = 'pending' DO NOTHING`,
+    [check.id],
+  );
+  console.log(
+    `[confirm] check ${check.id} "${check.name}" down (${run.status}) on run ${run.id} — enqueued a confirmation ` +
+      `run (fresh execution); evaluate() DEFERRED until it settles. The failed run is visible, awaiting confirmation.`,
+  );
+  await fireRunnerJobStart().catch((err) =>
+    console.warn('[confirm] jobs/start failed (non-fatal; the next cron tick drains the pending confirmation):', err),
+  );
 }

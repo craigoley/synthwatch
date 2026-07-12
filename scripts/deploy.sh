@@ -762,6 +762,8 @@ verify_rbac() {
       storage)      scopeId="/subscriptions/${sub_id}/resourceGroups/${RG}/providers/Microsoft.Storage/storageAccounts/${storage_acct}" ;;
       acr)          scopeId="/subscriptions/${sub_id}/resourceGroups/${RG}/providers/Microsoft.ContainerRegistry/registries/${acr_name}" ;;
       job)          scopeId="/subscriptions/${sub_id}/resourceGroups/${RG}/providers/Microsoft.App/jobs/${RUNNER_JOB}" ;;
+      centralusJob) scopeId="/subscriptions/${sub_id}/resourceGroups/${RG}/providers/Microsoft.App/jobs/${CENTRALUS_RUNNER_JOB}" ;;
+      westus2Job)   scopeId="/subscriptions/${sub_id}/resourceGroups/${RG}/providers/Microsoft.App/jobs/${WESTUS2_RUNNER_JOB}" ;;
       reconcileJob) scopeId="/subscriptions/${sub_id}/resourceGroups/${RG}/providers/Microsoft.App/jobs/${RECONCILE_JOB}" ;;
       *) flunk "rbac '${roleName}': UNKNOWN scope token '${scopeTok}' — verify() needs a resolver (refusing to skip)"; continue ;;
     esac
