@@ -78,7 +78,10 @@ readonly ROOT
 # is REQUIRED: a mid-run reset can't fix the RUNNING process — bash already parsed the old functions into
 # memory. Guarded by SYNTHWATCH_DEPLOY_SYNCED so it runs ONCE (the re-exec'd process skips it). Runs BEFORE
 # the lib is sourced / functions are parsed, using only plain git + echo (no lib deps yet).
-if [[ -z "${SYNTHWATCH_DEPLOY_SYNCED:-}" ]]; then
+# --help / -h is READ-ONLY — skip the sync entirely (no fetch, no tree mutation, no re-exec) so a docs lookup
+# never touches the network or the working tree. --what-if-only DOES sync (it previews a real deploy, so it
+# should run the CURRENT classifier logic). This runs before arg parsing, so match the raw args.
+if [[ -z "${SYNTHWATCH_DEPLOY_SYNCED:-}" && " $* " != *" --help "* && " $* " != *" -h "* ]]; then
   _branch="$(git -C "${ROOT}" symbolic-ref --quiet --short HEAD || echo '(detached)')"
   if [[ "${_branch}" != "main" ]]; then
     echo "deploy.sh: refusing to run on branch '${_branch}', not 'main'. deploy.sh fast-forwards the tree to" >&2
