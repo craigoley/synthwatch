@@ -57,14 +57,16 @@ test('cost_projection: clean-multiplier rate + pure run-count divergence + count
     // Counts tracked as we insert (no brittle hardcoding). Anchor: recent, normal.
     let total = 1, recent = 1, prior = 0, confirm = 0, sandbox = 0;
     for (let i = 0; i < 199; i++) {
-      const isRecent = i < 100; // <84h → recent half; else prior half; all < 168h (7d)
-      const ageHours = isRecent ? 2 + i * 0.02 : 90 + (i - 100) * 0.02;
+      const isRecent = i < 100; // <84h (5040min) → recent half; else prior half; all < 168h (7d)
+      // INTEGER minutes — make_interval(hours =>) takes an int, so fractional hours are a PG error;
+      // mins => $::int is the idiom the other integration tests use. recent: 120..219min; prior: 5400..5498min.
+      const ageMins = isRecent ? 120 + i : 5400 + (i - 100);
       const isConfirm = i < 7;
       const isSandbox = i >= 7 && i < 12;
       await pool.query(
         `INSERT INTO runs (check_id, status, started_at, finished_at, location, duration_ms, sandbox, confirmation_of_run_id)
-         VALUES ($1, 'pass', now() - make_interval(hours => $2), now(), 'default', $3, $4, $5)`,
-        [checkId, ageHours, DUR, isSandbox, isConfirm ? anchorId : null],
+         VALUES ($1, 'pass', now() - make_interval(mins => $2::int), now(), 'default', $3, $4, $5)`,
+        [checkId, ageMins, DUR, isSandbox, isConfirm ? anchorId : null],
       );
       total++; if (isRecent) recent++; else prior++; if (isConfirm) confirm++; if (isSandbox) sandbox++;
     }
