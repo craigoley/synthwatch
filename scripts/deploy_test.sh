@@ -486,6 +486,24 @@ if mem_eq "4Gi" "4Gi"; then green "PASS  mem_eq 4Gi==4Gi"; else red "FAIL  mem_e
 if mem_eq "4Gi" "2Gi"; then red "FAIL  mem_eq must-go-red: 4Gi vs 2Gi wrongly equal (THE #253 silent drop would PASS!)"; FAILS=$((FAILS + 1)); else green "PASS  mem_eq must-go-red: 4Gi != 2Gi (a dropped memory FLUNKS verify)"; fi
 if mem_eq "" "4Gi"; then red "FAIL  mem_eq empty-expected wrongly equal (a template-absent memory would pass)"; FAILS=$((FAILS + 1)); else green "PASS  mem_eq empty expected != anything"; fi
 
+# ★ THE #279 SWEEP — every comparator behind a verify() check must FLUNK when it cannot actually compare:
+# empty EXPECTED (a constant left unset / a parse that missed), empty LIVE (an az/psql read that failed), or
+# BOTH empty (the vacuous empty-vs-empty match the CORS parser hit). A green here would manufacture confidence.
+
+# str_eq — the guarded comparator the verify() STRING checks (AOAI api-version, ACS/CRED secretRef,
+# SYNTHWATCH_DEPLOYED, API 200, migration recorded) now route through, so an empty-vs-empty can never pass.
+if str_eq "2025-04-01-preview" "2025-04-01-preview"; then green "PASS  str_eq exact match"; else red "FAIL  str_eq exact match"; FAILS=$((FAILS + 1)); fi
+if str_eq "2025-04-01-preview" "2024-01-01"; then red "FAIL  str_eq mismatch wrongly equal (a drifted value would PASS!)"; FAILS=$((FAILS + 1)); else green "PASS  str_eq must-go-red: mismatch FLUNKS"; fi
+if str_eq "" "acs-email-conn";  then red "FAIL  str_eq EMPTY-EXPECTED matched (a constant left unset would vacuously PASS — the #279 class!)"; FAILS=$((FAILS + 1)); else green "PASS  str_eq must-go-red: empty expected != anything"; fi
+if str_eq "acs-email-conn" ""; then red "FAIL  str_eq empty-LIVE matched (a failed az read would PASS!)"; FAILS=$((FAILS + 1)); else green "PASS  str_eq must-go-red: empty live != a real expected"; fi
+if str_eq "" "";               then red "FAIL  str_eq BOTH-EMPTY matched (the vacuous empty-vs-empty pass — the exact #279 shape!)"; FAILS=$((FAILS + 1)); else green "PASS  str_eq must-go-red: empty-vs-empty FLUNKS (no vacuous match)"; fi
+
+# num_eq / mem_eq — round out the empty-LIVE and BOTH-EMPTY axes (empty-EXPECTED already covered above).
+if num_eq "660" ""; then red "FAIL  num_eq empty-LIVE matched (a failed job_replica_timeout read would PASS!)"; FAILS=$((FAILS + 1)); else green "PASS  num_eq must-go-red: empty live != 660"; fi
+if num_eq "" "";    then red "FAIL  num_eq BOTH-EMPTY matched (vacuous #279 shape)"; FAILS=$((FAILS + 1)); else green "PASS  num_eq must-go-red: empty-vs-empty FLUNKS"; fi
+if mem_eq "4Gi" ""; then red "FAIL  mem_eq empty-LIVE matched (a failed job_memory read would PASS!)"; FAILS=$((FAILS + 1)); else green "PASS  mem_eq must-go-red: empty live != 4Gi"; fi
+if mem_eq "" "";    then red "FAIL  mem_eq BOTH-EMPTY matched (vacuous #279 shape)"; FAILS=$((FAILS + 1)); else green "PASS  mem_eq must-go-red: empty-vs-empty FLUNKS"; fi
+
 # ===========================================================================
 # K. ★ image_covered_by_template — the STALE-TEMPLATE guard (the ACTUAL #253/#256 root cause). The
 #    2026-07-11 deploy shipped commit 3a2f955's 2Gi template atop the CURRENT image; materialize's
