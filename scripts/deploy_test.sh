@@ -609,6 +609,21 @@ if script_differs_from_ref "${SCRIPTGUARD_DIR}" origin/main scripts/deploy.sh; t
 if script_differs_from_ref "${SCRIPTGUARD_DIR}" origin/main scripts/nonexistent.sh; then red "FAIL  script guard: a ref-missing path wrongly read as stale"; FAILS=$((FAILS + 1)); else green "PASS  script guard: a ref-missing path is not stale (skip, no false abort)"; fi
 rm -rf "${SCRIPTGUARD_DIR}"
 
+# ===========================================================================
+# N. ★ START-OF-RUN tree-sync policy (tree_sync_decision) — the pure verdict the deploy.sh sync block acts on.
+#    Must-go-reds: a DIRTY behind tree ABORTS (never discards work); a not-main checkout ABORTS (never resets
+#    a feature branch); a clean behind tree FAST-FORWARDS; a diverged tree is PRESERVED (never auto-reset).
+# ===========================================================================
+expect_eq "tree_sync: not on main → abort"                 "not-main" "$(tree_sync_decision featureX aaa bbb 0 0)"
+expect_eq "tree_sync: local == origin → current"           "current"  "$(tree_sync_decision main aaa aaa 1 0)"
+expect_eq "tree_sync: origin unresolvable → current"       "current"  "$(tree_sync_decision main aaa '' 0 0)"
+expect_eq "tree_sync: behind + clean → fast-forward"       "ff"       "$(tree_sync_decision main aaa bbb 1 0)"
+# ★ MUST-GO-RED: a behind tree with uncommitted TRACKED changes must ABORT — a silent fast-forward would
+# discard the work (the exact thing this must never do).
+expect_eq "tree_sync must-go-red: behind + DIRTY → abort"  "dirty"    "$(tree_sync_decision main aaa bbb 1 1)"
+# ★ MUST-GO-RED: a diverged local (commit(s) not on origin) must be PRESERVED, never auto-reset.
+expect_eq "tree_sync must-go-red: diverged → preserve"     "diverged" "$(tree_sync_decision main aaa bbb 0 0)"
+
 echo
 if [[ "${FAILS}" -eq 0 ]]; then
   green "ALL TESTS PASSED"

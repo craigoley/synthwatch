@@ -35,10 +35,9 @@
 #                                     #   of WAITING for CI to finish building the target (the default).
 #   scripts/deploy.sh --post-reconcile # after deploy+verify: trigger the reconcile job, WAIT,
 #                                     #   then print spec_catalog + reconcile_drift (no manual sleep).
-#   scripts/deploy.sh --sync          # after a SUCCESSFUL deploy, reset local main to origin/main IF it's
-#                                     #   stale/behind (opt-in; refuses on a dirty tree). Default: OFF —
-#                                     #   the working tree is never auto-mutated; without it, a stale main
-#                                     #   only prints the sync one-liner as a suggestion.
+#   scripts/deploy.sh --sync          # NO-OP (back-compat): the tree is now fast-forwarded to origin/main at
+#                                     #   the START of every run (a clean, behind main), so there's nothing
+#                                     #   to sync afterward. A dirty or diverged tree aborts up front instead.
 #   scripts/deploy.sh --help
 #
 # Requires: az (logged in), jq, git, curl; psql for the DB check (provided via ~/.synthwatch.env PATH).
@@ -71,6 +70,55 @@ readonly MIGRATE_JOB='synthwatch-migrate-job'
 # Repo root, so the script works from any cwd.
 ROOT="$(git rev-parse --show-toplevel)"
 readonly ROOT
+
+# ★ START-OF-RUN SYNC — deploy.sh treats origin/main as authoritative for the template + image; it now does
+# the SAME for its OWN working tree, so it ALWAYS runs current logic (and reads a current deploy-lib.sh /
+# what-if classifier / db/migrations) BY CONSTRUCTION — no stale-detection, no manual `git reset` after every
+# merge. Fetch, then fast-forward a CLEAN main to origin/main and RE-EXEC the now-current script. The re-exec
+# is REQUIRED: a mid-run reset can't fix the RUNNING process — bash already parsed the old functions into
+# memory. Guarded by SYNTHWATCH_DEPLOY_SYNCED so it runs ONCE (the re-exec'd process skips it). Runs BEFORE
+# the lib is sourced / functions are parsed, using only plain git + echo (no lib deps yet).
+if [[ -z "${SYNTHWATCH_DEPLOY_SYNCED:-}" ]]; then
+  _branch="$(git -C "${ROOT}" symbolic-ref --quiet --short HEAD || echo '(detached)')"
+  if [[ "${_branch}" != "main" ]]; then
+    echo "deploy.sh: refusing to run on branch '${_branch}', not 'main'. deploy.sh fast-forwards the tree to" >&2
+    echo "  origin/main at start and will NOT reset your branch. Run 'git checkout main', then re-run." >&2
+    exit 1
+  fi
+  git -C "${ROOT}" fetch --quiet origin 2>/dev/null \
+    || echo "deploy.sh: WARN 'git fetch origin' failed — proceeding against the last-fetched origin/main." >&2
+  _origin="$(git -C "${ROOT}" rev-parse origin/main 2>/dev/null || true)"
+  _local="$(git -C "${ROOT}" rev-parse HEAD 2>/dev/null || true)"
+  if [[ -n "${_origin}" && "${_local}" != "${_origin}" ]]; then
+    if git -C "${ROOT}" merge-base --is-ancestor "${_local}" "${_origin}" 2>/dev/null; then
+      # Local main is strictly BEHIND origin/main — a pure FAST-FORWARD (reset --hard only moves forward, no
+      # committed work is lost). "Dirty" = uncommitted changes to TRACKED files; untracked files survive the
+      # reset (scratch/analysis files are fine) so they don't block it — only real uncommitted WORK aborts,
+      # never silently destroyed.
+      if [[ -n "$(git -C "${ROOT}" status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
+        echo "deploy.sh: refusing to run — the tree is behind origin/main AND has uncommitted changes to" >&2
+        echo "  TRACKED files. deploy.sh must run from origin/main; fast-forwarding would discard them." >&2
+        echo "  Commit or stash, then re-run:   git stash   (or git commit)   &&   ./scripts/deploy.sh" >&2
+        exit 1
+      fi
+      echo "deploy.sh: local main ${_local:0:12} is behind origin/main ${_origin:0:12} — fast-forwarding (clean tree)…" >&2
+      git -C "${ROOT}" reset --hard origin/main >/dev/null 2>&1 \
+        || { echo "deploy.sh: 'git reset --hard origin/main' failed — aborting rather than run a partially-synced tree." >&2; exit 1; }
+      echo "deploy.sh: synced local main to origin/main ${_origin:0:12}; re-running with current logic…" >&2
+      SYNTHWATCH_DEPLOY_SYNCED=1 exec bash "${ROOT}/scripts/deploy.sh" "$@"
+    else
+      # Local main has commit(s) NOT on origin/main (ahead / diverged / squash-merge leftover). NEVER
+      # auto-reset — that could destroy real un-pushed work. Proceed against origin/main; the
+      # belt-and-suspenders assert_deploy_scripts_current below ABORTS if the scripts are actually stale
+      # (else this is a benign pre-squash leftover whose scripts already match origin).
+      echo "deploy.sh: local main has commit(s) not on origin/main — NOT auto-syncing (preserving them);" >&2
+      echo "  the deploy targets origin/main and the stale-script guard aborts if the scripts differ." >&2
+    fi
+  fi
+  # Marked synced (behind→reset+reexec above already exited): already-current, diverged, or origin
+  # unresolvable — nothing more to fast-forward this run.
+  export SYNTHWATCH_DEPLOY_SYNCED=1
+fi
 # The infra template is deployed from the TARGET COMMIT (origin/main), NOT the working tree. The tree
 # can be stale/behind — the BENIGN post-squash-merge state this script explicitly permits ("never touch
 # the working tree", sync_target_to_origin) — and compiling ITS bicep would ship a PRE-merge template
@@ -84,11 +132,8 @@ TEMPLATE=''  # materialized temp file (a real .bicep so az compiles it); set aft
 WHATIF_ONLY=0
 POST_RECONCILE=0
 SHA_OVERRIDE=''
-# ★ --sync (opt-in): after a SUCCESSFUL deploy, if local main is stale/behind vs origin, reset it to
-# origin/main. OFF by default — the working tree is NEVER auto-mutated. Even when set, it refuses on a
-# dirty tree (won't clobber uncommitted work). Set by classification; read post-deploy (offer_local_sync).
-SYNC_AFTER=0
-DRIFT_STATE=''
+# --sync is now a NO-OP (accepted for muscle-memory): the tree is fast-forwarded to origin/main at the START
+# of every run (see the START-OF-RUN SYNC block above), so there is nothing to sync AFTER a deploy anymore.
 # ★ FIX 3: when the newest deployable image PREDATES the target (CI mid-build), WAIT for CI to
 # finish building the target then proceed, instead of erroring out + making the user re-run.
 # Default ON; --no-wait restores the old immediate-refuse behavior. A CI FAILURE or a timeout
@@ -143,7 +188,7 @@ while [[ $# -gt 0 ]]; do
     # image is overridden only with --sha — so there is nothing left for --yes to auto-proceed.
     --yes|-y) shift ;;
     --post-reconcile) POST_RECONCILE=1; shift ;;
-    --sync) SYNC_AFTER=1; shift ;;       # opt-in: reset local main to origin/main AFTER a successful deploy (refuses on a dirty tree)
+    --sync) c_yellow "note: --sync is now a no-op — the tree is fast-forwarded to origin/main at the START of every run." >&2; shift ;;
     --no-wait) WAIT_FOR_CI=0; shift ;;   # ★ FIX 3: don't wait for CI — refuse immediately on a stale-image halt
     --sha) [[ $# -ge 2 ]] || fail "--sha needs a value"; SHA_OVERRIDE="$2"; shift 2 ;;
     --help|-h) usage ;;
@@ -364,7 +409,9 @@ sync_target_to_origin() {
   # so it also covers --sha, which skips this function. See assert_deploy_scripts_current's call site.)
   local_head="$(git rev-parse HEAD 2>/dev/null || echo '')"
   state="$(git_drift_state "${local_head}" "${origin_head}")"
-  DRIFT_STATE="${state}"   # hoisted for the post-deploy sync offer (offer_local_sync)
+  # NOTE: the START-OF-RUN SYNC block already fast-forwarded a behind main to origin/main (and re-exec'd),
+  # so on a clean checkout this is almost always 'same'. The other branches remain as defensive notes for a
+  # diverged/squash-leftover local main (which the start sync deliberately does NOT auto-reset).
   case "${state}" in
     same)
       c_green "Local main == origin/main (${origin_head:0:12}) — deploying that." >&2 ;;
@@ -397,34 +444,8 @@ sync_target_to_origin() {
   TARGET_HEAD="${origin_head}"
 }
 
-# ---------------------------------------------------------------------------
-# offer_local_sync — post-deploy affordance for a stale/behind local main. OFFERS a sync, NEVER forces it:
-#   • default (no --sync): print the one-liner as a SUGGESTION only — the working tree is left untouched.
-#   • --sync: the user explicitly opted in, so reset local main to origin/main — BUT still refuse on a dirty
-#     tree (uncommitted work is never clobbered, even on request). The no-auto-mutate property is preserved:
-#     the tree only changes when the user both passed --sync AND has nothing uncommitted to lose.
-# Only relevant for 'stale'/'behind' (a benign, subsumed local); 'diverged' (real work) and 'same' are skipped.
-# ---------------------------------------------------------------------------
-offer_local_sync() {
-  case "${DRIFT_STATE}" in stale|behind) ;; *) return 0 ;; esac
-  if [[ "${SYNC_AFTER}" -eq 1 ]]; then
-    if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
-      c_yellow "--sync requested, but the working tree has UNCOMMITTED changes — NOT resetting (would lose them)." >&2
-      c_yellow "      Commit or stash them first, then: git checkout main && git fetch origin && git reset --hard origin/main" >&2
-      return 0
-    fi
-    c_bold "--sync: local main is ${DRIFT_STATE} and the tree is clean — resetting it to origin/main…" >&2
-    if git checkout main --quiet 2>/dev/null && git fetch origin --quiet 2>/dev/null && git reset --hard origin/main >/dev/null 2>&1; then
-      c_green "Local main is now at origin/main ($(git rev-parse --short origin/main 2>/dev/null))." >&2
-    else
-      c_yellow "WARN: --sync reset failed — the deploy still succeeded (it shipped origin/main); sync manually." >&2
-    fi
-  else
-    c_green "Tip: local main is ${DRIFT_STATE} vs origin/main (the deploy already shipped origin/main). To sync it (optional):" >&2
-    c_green "        git checkout main && git fetch origin && git reset --hard origin/main" >&2
-    c_green "     or re-run with --sync to do it automatically after a successful deploy (skipped if the tree is dirty)." >&2
-  fi
-}
+# (offer_local_sync REMOVED — the START-OF-RUN SYNC fast-forwards the tree to origin/main BEFORE the deploy,
+#  so there is no stale/behind local main left to offer a post-deploy sync for. `--sync` is a no-op alias.)
 
 # ★ Concern B: refuse a STALE copy of the deploy scripts — UNCONDITIONALLY, before any deploy work and BEFORE
 # the --sha branch. --sha skips sync_target_to_origin, so putting the guard here (not inside sync) keeps a
@@ -1095,11 +1116,8 @@ main() {
     post_reconcile || c_red "post-reconcile reported a problem (see above)."
   fi
 
-  # Deploy shipped (origin/main). If local main is a benign stale/behind checkout, OFFER to sync it —
-  # print the one-liner, or perform it only if --sync was passed and the tree is clean. Never auto-mutates.
-  echo
-  offer_local_sync
-
+  # (No post-deploy sync offer: the START-OF-RUN SYNC already fast-forwarded the tree to origin/main before
+  #  the deploy, so local main is current by the time we get here.)
   exit "$(( VERIFY_FAILS > 0 ? 1 : 0 ))"
 }
 

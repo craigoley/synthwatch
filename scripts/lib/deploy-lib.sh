@@ -447,3 +447,24 @@ script_differs_from_ref() {
 cors_origins_tokens() {
   sed -nE 's/^[[:space:]]*allowedOrigins:[[:space:]]*([A-Za-z0-9_]+).*/\1/p'
 }
+
+# ── start-of-run tree-sync policy (concern: run current logic by construction) ─────────────────────────────
+# tree_sync_decision <branch> <local_sha> <origin_sha> <is_ancestor 0|1> <dirty 0|1> : the PURE policy the
+# START-OF-RUN SYNC block in deploy.sh implements — kept here so it's unit-tested (the block computes the git
+# facts + acts; this decides). Prints exactly one verdict:
+#   not-main  → the checkout isn't on 'main'                          → ABORT (never reset a feature branch)
+#   current   → local == origin/main (or origin unresolvable)         → proceed as-is
+#   ff        → local is strictly BEHIND origin/main + tree clean      → fast-forward (reset --hard) + re-exec
+#   dirty     → behind, but uncommitted TRACKED changes               → ABORT (fast-forward would discard work)
+#   diverged  → local has commit(s) NOT on origin (ahead/squash-left) → proceed, NEVER auto-reset (preserve work)
+# is_ancestor = 1 iff local_sha is an ancestor-or-equal of origin_sha (git merge-base --is-ancestor).
+tree_sync_decision() {
+  local branch="$1" lsha="$2" osha="$3" is_anc="$4" dirty="$5"
+  [[ "${branch}" != "main" ]] && { echo "not-main"; return; }
+  [[ -z "${osha}" || "${lsha}" == "${osha}" ]] && { echo "current"; return; }
+  if [[ "${is_anc}" == "1" ]]; then
+    [[ "${dirty}" == "1" ]] && { echo "dirty"; return; }
+    echo "ff"; return
+  fi
+  echo "diverged"
+}
