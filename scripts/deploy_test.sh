@@ -188,6 +188,23 @@ expect_eq "common-sha both-current picks newest" "aaa111111111111111111111111111
 # No overlap -> empty (deploy.sh fails hard on this).
 expect_eq "common-sha no-overlap is empty" "" \
   "$(newest_common_sha 'aaa1111111111111111111111111111111111111' 'zzz9999999999999999999999999999999999999')"
+
+# ---------------------------------------------------------------------------
+# ★ sha_in_tags — the pipe-free membership shared by pick_sha (--sha override, deploy.sh:302/304) and
+# newest_common_sha. MUST-GO-RED (the SIGPIPE sibling of the #279/#281 sweep): a SHA at the TOP of a LARGE
+# tag list is the exact input the old `printf '%s\n' "$tags" | grep -qxF "$sha"` got wrong — grep -q matches
+# line 1 and closes the pipe, SIGPIPE-ing the still-writing printf, so under `set -o pipefail` the pipeline
+# returns 141 EVEN ON A MATCH → the `|| fail` fires → a valid `--sha` deploy is falsely REFUSED. It MUST match.
+SHA_HIT='aaa1111111111111111111111111111111111111'
+BIG_TAGS="$(printf '%s\n' "${SHA_HIT}"; seq 5000)"
+if sha_in_tags "${SHA_HIT}" "${BIG_TAGS}"; then green "PASS  sha_in_tags finds a SHA at the top of a large list (SIGPIPE-safe — the --sha must-go-red)"; else red "FAIL  sha_in_tags missed an early SHA in a large list — the SIGPIPE false-negative regressed (a valid --sha deploy would be refused)!"; FAILS=$((FAILS + 1)); fi
+# ★ Cannot vacuously pass: an ABSENT sha, an EMPTY sha, and an EMPTY list must ALL flunk (never shrug).
+if sha_in_tags "notpresent00000000000000000000000000000" "${BIG_TAGS}"; then red "FAIL  sha_in_tags matched a SHA that is NOT in the list (vacuous pass)"; FAILS=$((FAILS + 1)); else green "PASS  sha_in_tags flunks an absent SHA"; fi
+if sha_in_tags "" "${BIG_TAGS}"; then red "FAIL  sha_in_tags matched an EMPTY sha (grep -xF '' would vacuously match an empty line — must be rejected)"; FAILS=$((FAILS + 1)); else green "PASS  sha_in_tags flunks an empty sha (no vacuous match)"; fi
+if sha_in_tags "${SHA_HIT}" ""; then red "FAIL  sha_in_tags matched against an EMPTY tag list"; FAILS=$((FAILS + 1)); else green "PASS  sha_in_tags flunks an empty tag list"; fi
+# newest_common_sha (deploy-lib.sh:115 site) is SIGPIPE-safe too: the common SHA at the TOP of a large migrate list.
+expect_eq "common-sha finds an early match in a large migrate list (SIGPIPE-safe)" "${SHA_HIT}" \
+  "$(newest_common_sha "${SHA_HIT}" "${BIG_TAGS}")"
 # Both bicep params derive from the ONE resolved SHA -> identical :SHA suffix (never split).
 RUNNER_IMG="reg.io/synthwatch-runner:bbb2222222222222222222222222222222222222"
 MIGRATE_IMG="reg.io/synthwatch-migrate:bbb2222222222222222222222222222222222222"

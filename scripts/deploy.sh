@@ -299,9 +299,12 @@ pick_sha() {
   if [[ -n "${SHA_OVERRIDE}" ]]; then
     # ★ BUG 1: even an explicit SHA must exist in BOTH repos, or the deploy half-applies.
     c_yellow "Using --sha override: ${SHA_OVERRIDE}" >&2
-    printf '%s\n' "${runner_tags}"  | grep -qxF "${SHA_OVERRIDE}" \
+    # ★ Pipe-free membership (sha_in_tags), NOT `printf | grep -qxF`: under `set -o pipefail` the pipe
+    # SIGPIPEs on an early match → pipeline 141 → this `|| fail` fires EVEN WHEN THE SHA IS PRESENT,
+    # falsely refusing a valid --sha deploy (the #279/#281 SIGPIPE class; sibling of the line-280 fix).
+    sha_in_tags "${SHA_OVERRIDE}" "${runner_tags}" \
       || fail "${RUNNER_REPO}:${SHA_OVERRIDE:0:12} not in registry — nothing to deploy."
-    printf '%s\n' "${migrate_tags}" | grep -qxF "${SHA_OVERRIDE}" \
+    sha_in_tags "${SHA_OVERRIDE}" "${migrate_tags}" \
       || fail "${MIGRATE_REPO}:${SHA_OVERRIDE:0:12} not in registry — would split runner/migrate. Refusing."
     printf '%s' "${SHA_OVERRIDE}"
     return

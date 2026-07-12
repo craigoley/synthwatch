@@ -101,6 +101,17 @@ confirm_drop() {
 }
 
 # ---------------------------------------------------------------------------
+# sha_in_tags — exact-line membership of a SHA in a newline tag list, PIPE-FREE.
+# ★ A here-string, NOT `printf '%s\n' "$tags" | grep -qxF "$sha"`: under `set -o pipefail` grep -q
+# short-circuits on the first match + closes the pipe, SIGPIPE-ing the still-writing printf, so the
+# pipeline returns 141 EVEN ON A MATCH — a flaky false-negative (the #279/#281 SIGPIPE class; a match at
+# the TOP of a large list reproduces it deterministically). An EMPTY sha FLUNKS — never a vacuous match
+# (`grep -xF ''` matches empty lines, so it must be rejected explicitly).
+sha_in_tags() { # <sha> <newline-separated tag list>
+  [[ -n "$1" ]] && grep -qxF "$1" <<<"$2"
+}
+
+# ---------------------------------------------------------------------------
 # newest_common_sha — BUG 1 fix. The runner and migrate images are built together for the
 # same commit; the auto-pick must deploy a SHA that exists in BOTH repos, or a deploy can
 # half-apply (runner job rolls to SHA, migrate job's update to a not-yet-pushed migrate:SHA
@@ -111,8 +122,8 @@ newest_common_sha() {
   local runner_tags="$1" migrate_tags="$2" t
   while IFS= read -r t || [[ -n "${t}" ]]; do
     [[ -z "${t}" ]] && continue
-    # Exact-line membership test against the migrate tag list.
-    if printf '%s\n' "${migrate_tags}" | grep -qxF "${t}"; then
+    # Exact-line membership test against the migrate tag list (pipe-free — see sha_in_tags).
+    if sha_in_tags "${t}" "${migrate_tags}"; then
       printf '%s' "${t}"
       return 0
     fi
