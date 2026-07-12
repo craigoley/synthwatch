@@ -1015,39 +1015,62 @@ $$;
 COMMENT ON FUNCTION slo_status(bigint, timestamptz, timestamptz) IS
     'Per-check SLO over [p_from, p_to): target, error-budget (run-weighted), consumed, remaining, burn_rate=(down/total)/(1-target). Zero rows if no slo_target.';
 
--- cost_projection(rate) — the SINGLE shared cost model (0069) both /reports/cost (api) and the narrative
--- fact pack (runner) call, so their $ figures are identical by construction. projected = avg_s ×
--- (2,592,000/interval) × regions × rate; measured = Σsec_7d × rate × 30/7; divergence = measured/projected
--- (flag > 1.5). Sum projected_raw/measured_raw for the fleet total, then round.
+-- cost_projection(rate) — the SINGLE shared cost model (0069, +run-count columns 0078) both /reports/cost
+-- (api) and the narrative fact pack (runner) call, so their $ figures are identical by construction.
+-- projected = avg_s × (2,592,000/interval) × regions × rate; measured = Σsec_7d × rate × 30/7; divergence =
+-- measured/projected (flag > 1.5). Sum projected_raw/measured_raw for the fleet total, then round. The rate
+-- is a DERIVED $/active-second (two ACA meters × the live allocation — see runner/costModel.ts), NOT a
+-- single "vCPU rate". divergence = run_count_7d / expected is a PURE run-count ratio (duration cancels), so
+-- the count columns attribute a flag to config-change/confirmation/sandbox — NEVER retries (0078).
 CREATE OR REPLACE FUNCTION cost_projection(p_rate numeric)
 RETURNS TABLE (
-    check_id         bigint,
-    source_key       text,
-    check_name       text,
-    kind             text,
-    interval_seconds integer,
-    region_count     integer,
-    avg_duration_s   double precision,
-    projected        numeric,
-    measured         numeric,
-    divergence       numeric,
-    divergence_flag  boolean,
-    projected_raw    numeric,
-    measured_raw     numeric
+    check_id              bigint,
+    source_key            text,
+    check_name            text,
+    kind                  text,
+    interval_seconds      integer,
+    region_count          integer,
+    avg_duration_s        double precision,
+    projected             numeric,
+    measured              numeric,
+    divergence            numeric,
+    divergence_flag       boolean,
+    projected_raw         numeric,
+    measured_raw          numeric,
+    run_count_7d          integer,
+    confirmation_count_7d integer,
+    sandbox_count_7d      integer,
+    run_count_recent      integer,
+    run_count_prior       integer
 )
 LANGUAGE sql
 STABLE
 AS $$
-    WITH base AS (
+    WITH run_stats AS (
+        SELECT r.check_id,
+               (avg(r.duration_ms) / 1000.0)::float8 AS avg_duration_s,
+               (sum(r.duration_ms) / 1000.0)::float8 AS sum_duration_s_7d,
+               count(*)::int AS run_count_7d,
+               count(*) FILTER (WHERE r.confirmation_of_run_id IS NOT NULL)::int AS confirmation_count_7d,
+               count(*) FILTER (WHERE r.sandbox)::int AS sandbox_count_7d,
+               count(*) FILTER (WHERE r.started_at >  now() - interval '3.5 days')::int AS run_count_recent,
+               count(*) FILTER (WHERE r.started_at <= now() - interval '3.5 days')::int AS run_count_prior
+          FROM runs r
+         WHERE r.started_at > now() - interval '7 days'
+           AND r.duration_ms IS NOT NULL
+         GROUP BY r.check_id
+    ),
+    base AS (
         SELECT c.id AS check_id, c.source_key, c.name AS check_name, c.kind, c.interval_seconds,
                (SELECT count(*)::int FROM check_locations cl WHERE cl.check_id = c.id) AS region_count,
-               ((SELECT avg(r.duration_ms) FROM runs r
-                   WHERE r.check_id = c.id AND r.started_at > now() - interval '7 days'
-                     AND r.duration_ms IS NOT NULL) / 1000.0)::float8 AS avg_duration_s,
-               ((SELECT sum(r.duration_ms) FROM runs r
-                   WHERE r.check_id = c.id AND r.started_at > now() - interval '7 days'
-                     AND r.duration_ms IS NOT NULL) / 1000.0)::float8 AS sum_duration_s_7d
+               rs.avg_duration_s, rs.sum_duration_s_7d,
+               coalesce(rs.run_count_7d, 0)          AS run_count_7d,
+               coalesce(rs.confirmation_count_7d, 0) AS confirmation_count_7d,
+               coalesce(rs.sandbox_count_7d, 0)      AS sandbox_count_7d,
+               coalesce(rs.run_count_recent, 0)      AS run_count_recent,
+               coalesce(rs.run_count_prior, 0)       AS run_count_prior
           FROM checks c
+          LEFT JOIN run_stats rs ON rs.check_id = c.id
          WHERE c.enabled
     ),
     scored AS (
@@ -1064,11 +1087,12 @@ AS $$
            round(s.p_raw, 2), round(s.m_raw, 2),
            CASE WHEN s.p_raw > 0 THEN round(s.m_raw / s.p_raw, 3) ELSE NULL END,
            CASE WHEN s.p_raw > 0 THEN round(s.m_raw / s.p_raw, 3) > 1.5 ELSE false END,
-           s.p_raw, s.m_raw
+           s.p_raw, s.m_raw,
+           s.run_count_7d, s.confirmation_count_7d, s.sandbox_count_7d, s.run_count_recent, s.run_count_prior
       FROM scored s
 $$;
 COMMENT ON FUNCTION cost_projection(numeric) IS
-    'Shared cost model (0069): per-check projected/measured/divergence for a $/vCPU-s rate. Called by /reports/cost (api) + the narrative fact pack (runner) so figures match. Sum projected_raw/measured_raw for the fleet total, then round.';
+    'Shared cost model (0069, +run-count columns 0078): per-check projected/measured/divergence for a given $/active-second rate. Called by /reports/cost (api) + the narrative fact pack (runner) so figures match. Sum projected_raw/measured_raw for the fleet total, then round. divergence = run_count_7d / expected (a pure run-count ratio: duration cancels) — attribute a flag from the count columns, NEVER retries.';
 
 -- slo_burn_status (0055): the SHARED, location-aware SLO burn STATE — reproduces the runner's
 -- maybeBurnAlert threshold decision EXACTLY (read == page). STATE ONLY (no dispatch suppressors). See

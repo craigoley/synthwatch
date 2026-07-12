@@ -11,6 +11,7 @@
 // Opt-in on AZURE_OPENAI_* (same as RCA): absent => the job no-ops (Layer 3 dark, zero cost).
 import { pool } from './db.js';
 import { aoaiConfigured, chatCompletionContent, extractJson, DEFAULT_DEPLOYMENT } from './aoai.js';
+import { costRatePerActiveSecond } from './costModel.js';
 
 const WINDOW = '7d';
 const WINDOW_DAYS = 7;
@@ -47,7 +48,7 @@ export interface CostFact {
   projected: number;
   measured: number;
   divergence: number | null;
-  divergenceFlag: boolean; // divergence > 1.5 — retries/slowdowns inflating cost (a LEADING indicator)
+  divergenceFlag: boolean; // divergence > 1.5 — EXTRA runs vs the current schedule (config-change straddle / confirmation / sandbox); a pure run-count ratio, NOT retries (0078)
   availabilityPct: number | null; // this window, so the model can spot unreliable-AND-expensive intersections
 }
 
@@ -177,13 +178,11 @@ async function periodFacts(
 const r2 = (n: number) => Math.round(n * 100) / 100;
 const r3 = (n: number) => Math.round(n * 1000) / 1000;
 
-/** The $/vCPU-second rate — the SAME config var the api's CostRate reads, same default (0.00003), so the
- *  runner's cost facts and /reports/cost use ONE rate source. ★ If the rate is ever overridden, set
- *  COST_RATE_PER_VCPU_SECOND on BOTH the api app and the runner jobs, or the two diverge. */
-function costRate(): number {
-  const n = Number(process.env.COST_RATE_PER_VCPU_SECOND);
-  return Number.isFinite(n) && n > 0 ? n : 0.00003;
-}
+// The $/active-second rate is DERIVED (two ACA meters × the live deploy-stamped allocation) in the ONE
+// shared place — runner/costModel.ts. The api's CostRate.cs mirrors the same derivation, so the runner's
+// cost facts and /reports/cost use one rate model (no magic scalar). A resize re-prices automatically;
+// verify() asserts the stamped SYNTHWATCH_RUNNER_CPU/MEMORY_GIB match the live container resources.
+const costRate = costRatePerActiveSecond;
 
 /** Cost facts from the SHARED cost_projection() fn (figures MATCH /reports/cost by construction). Fleet total
  *  + notable monitors (fleet scope), or just this monitor's figures (monitor scope). Availability is joined

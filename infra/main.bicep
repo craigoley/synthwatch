@@ -652,6 +652,19 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
               value: '1'
             }
             {
+              // ★ COST MODEL — the runner (browser) job allocation being PRICED, deploy-stamped so the
+              // two-meter ACA cost model (runner/costModel.ts ↔ api CostRate.cs) reads the LIVE shape and
+              // re-prices automatically on a resize instead of silently drifting (the 0.00003 blended-rate
+              // bug — 0.00003 was the 1.0cpu/2Gi blend, now 2× wrong at 2.0cpu/4Gi). MUST equal this job's
+              // container resources.cpu above; verify() asserts stamped-env == live-resources (must-go-red).
+              name: 'SYNTHWATCH_RUNNER_CPU'
+              value: '2.0'
+            }
+            {
+              name: 'SYNTHWATCH_RUNNER_MEMORY_GIB'
+              value: '4'
+            }
+            {
               // RCA via Azure OpenAI (MI auth — no key). Declared so a redeploy can't
               // wipe RCA off (the cutover-wipe bug). rcaEnabled() needs ENDPOINT+DEPLOYMENT.
               name: 'AZURE_OPENAI_ENDPOINT'
@@ -845,6 +858,19 @@ resource centralusJob 'Microsoft.App/jobs@2024-03-01' = {
               value: '1'
             }
             {
+              // ★ COST MODEL — the runner (browser) job allocation being PRICED, deploy-stamped so the
+              // two-meter ACA cost model (runner/costModel.ts ↔ api CostRate.cs) reads the LIVE shape and
+              // re-prices automatically on a resize instead of silently drifting (the 0.00003 blended-rate
+              // bug — 0.00003 was the 1.0cpu/2Gi blend, now 2× wrong at 2.0cpu/4Gi). MUST equal this job's
+              // container resources.cpu above; verify() asserts stamped-env == live-resources (must-go-red).
+              name: 'SYNTHWATCH_RUNNER_CPU'
+              value: '2.0'
+            }
+            {
+              name: 'SYNTHWATCH_RUNNER_MEMORY_GIB'
+              value: '4'
+            }
+            {
               // RCA via Azure OpenAI (MI auth). Identical to the primary job — both
               // regions open incidents, so both need RCA. Declared so a redeploy
               // preserves it.
@@ -1031,6 +1057,19 @@ resource westus2Job 'Microsoft.App/jobs@2024-03-01' = {
               // Universal deployed marker — see the primary job's SYNTHWATCH_DEPLOYED comment.
               name: 'SYNTHWATCH_DEPLOYED'
               value: '1'
+            }
+            {
+              // ★ COST MODEL — the runner (browser) job allocation being PRICED, deploy-stamped so the
+              // two-meter ACA cost model (runner/costModel.ts ↔ api CostRate.cs) reads the LIVE shape and
+              // re-prices automatically on a resize instead of silently drifting (the 0.00003 blended-rate
+              // bug — 0.00003 was the 1.0cpu/2Gi blend, now 2× wrong at 2.0cpu/4Gi). MUST equal this job's
+              // container resources.cpu above; verify() asserts stamped-env == live-resources (must-go-red).
+              name: 'SYNTHWATCH_RUNNER_CPU'
+              value: '2.0'
+            }
+            {
+              name: 'SYNTHWATCH_RUNNER_MEMORY_GIB'
+              value: '4'
             }
             {
               // RCA via Azure OpenAI (MI auth). Identical to the other jobs — every region
@@ -1312,6 +1351,17 @@ resource narrativeJob 'Microsoft.App/jobs@2024-03-01' = {
               // Universal deployed marker — see the primary job's SYNTHWATCH_DEPLOYED comment.
               name: 'SYNTHWATCH_DEPLOYED'
               value: '1'
+            }
+            {
+              // ★ COST MODEL — the narrative job COMPUTES fleet cost (costFacts), so it carries the RUNNER
+              // (browser) allocation being priced, NOT its own aux 0.25/0.5. Deploy-stamped 2.0/4 to match the
+              // runner jobs' resources; verify() asserts it equals the primary runner job's live cpu/memory.
+              name: 'SYNTHWATCH_RUNNER_CPU'
+              value: '2.0'
+            }
+            {
+              name: 'SYNTHWATCH_RUNNER_MEMORY_GIB'
+              value: '4'
             }
             // AOAI — the SAME config the runner jobs carry. This IS the Layer-3 opt-in:
             // present => narratives generate; absent => narrativeMain no-ops (dark).

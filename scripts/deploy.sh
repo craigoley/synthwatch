@@ -898,6 +898,34 @@ verify() {
     done
   fi
 
+  # ★ COST-MODEL ALLOCATION: the deploy-stamped SYNTHWATCH_RUNNER_CPU/MEMORY_GIB (the cost model's live
+  # allocation — runner/costModel.ts) must match the REAL container resources, or the two-meter rate silently
+  # drifts on a resize (the whole point of the 0.00003 blended-rate bug: the model read NO allocation). This is
+  # the guard that makes the deploy-stamp trustworthy — it compares the LIVE job's env against the LIVE job's
+  # resources (two independent reads), so stamping a wrong value FAILS the deploy (must-go-red). The 3
+  # browser-runner jobs carry their OWN allocation, so env must equal their own cpu/memory; the narrative job
+  # PRICES the runner workload (its own resources are aux 0.25/0.5), so its env must equal the PRIMARY runner
+  # job's live allocation. mem is stored GiB-only ('4'), resources report '4Gi' — strip the unit to compare.
+  local acpu amem lcpu lmem
+  acpu="$(job_cpu "${RUNNER_JOB}")"                 # authoritative live runner allocation
+  amem="$(job_memory "${RUNNER_JOB}")"; amem="${amem%Gi}"
+  for jn in "${RUNNER_JOB}" "${CENTRALUS_RUNNER_JOB}" "${WESTUS2_RUNNER_JOB}"; do
+    lcpu="$(job_env_value "${jn}" SYNTHWATCH_RUNNER_CPU)"
+    num_eq "$(job_cpu "${jn}")" "${lcpu}" && ok=1 || ok=0
+    check "${ok}" "${jn} SYNTHWATCH_RUNNER_CPU='${lcpu}' (expect == live cpu $(job_cpu "${jn}") — cost model reads the live allocation)"
+    lmem="$(job_env_value "${jn}" SYNTHWATCH_RUNNER_MEMORY_GIB)"
+    v="$(job_memory "${jn}")"; v="${v%Gi}"
+    num_eq "${v}" "${lmem}" && ok=1 || ok=0
+    check "${ok}" "${jn} SYNTHWATCH_RUNNER_MEMORY_GIB='${lmem}' (expect == live memory ${v}Gi)"
+  done
+  # Narrative job: prices the RUNNER workload → env must equal the primary runner job's live allocation.
+  lcpu="$(job_env_value "${NARRATIVE_JOB}" SYNTHWATCH_RUNNER_CPU)"
+  num_eq "${acpu}" "${lcpu}" && ok=1 || ok=0
+  check "${ok}" "${NARRATIVE_JOB} SYNTHWATCH_RUNNER_CPU='${lcpu}' (expect == runner ${acpu} — it prices the runner workload, not its own aux shape)"
+  lmem="$(job_env_value "${NARRATIVE_JOB}" SYNTHWATCH_RUNNER_MEMORY_GIB)"
+  num_eq "${amem}" "${lmem}" && ok=1 || ok=0
+  check "${ok}" "${NARRATIVE_JOB} SYNTHWATCH_RUNNER_MEMORY_GIB='${lmem}' (expect == runner ${amem}Gi)"
+
   # ★ Concern A: RBAC role assignments + blob CORS the TEMPLATE declares must be live (the memory-drop class:
   # #270's MI Storage Blob Delegator + blob CORS could silently not land while verify reported success).
   verify_rbac
