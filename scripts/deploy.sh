@@ -790,7 +790,14 @@ verify_cors() {
   local tmpl storage_acct origins live o
   tmpl="$(cat "${TEMPLATE}" 2>/dev/null || true)"
   if [[ -z "${tmpl}" ]]; then flunk "cors: could not read the template ${TEMPLATE}"; return; fi
-  if ! printf '%s' "${tmpl}" | grep -q "corsRules"; then
+  # ★ Detect declared CORS with a pure-bash predicate (template_declares_cors), NOT `printf '%s' "$tmpl" | grep
+  # -q corsRules`. Under `set -o pipefail` grep -q short-circuits on the FIRST match + closes the pipe, so
+  # printf takes SIGPIPE and the PIPELINE returns 141 (printf's), not 0 (grep's); `! <pipeline>` then inverts
+  # that to "no CORS" — a VACUOUS PASS precisely WHEN corsRules IS present (the 2026-07-12 false pass + the
+  # "printf: write error: Broken pipe" noise). A pure-bash match has no pipe → it reads the true presence and
+  # can never SIGPIPE, so "declares no CORS" is a reliable, RARE state (never a parse miss). A DECLARED block
+  # that then can't be parsed FLUNKS below (never a silent pass).
+  if ! template_declares_cors "${tmpl}"; then
     pass "cors: template declares no blob CORS — nothing to assert"
     return
   fi

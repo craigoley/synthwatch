@@ -574,6 +574,38 @@ FIX
 )"
 expect_eq "cors_origins_tokens finds BOTH rules' origin params" "dashboardCorsOrigins previewCorsOrigins" "$(printf '%s' "${CORS_FIXTURE}" | cors_origins_tokens | tr '\n' ' ' | sed 's/ $//')"
 
+# ★ template_declares_cors — the detection that gates verify_cors. THE 2026-07-12 BUG: verify_cors used
+# `printf '%s' "$tmpl" | grep -q corsRules`; under `set -o pipefail` grep -q short-circuited on the match and
+# SIGPIPE'd printf, so the pipeline returned 141 and `! <pipeline>` read as "no CORS" — a VACUOUS PASS exactly
+# WHEN CORS was present (+ the broken-pipe). template_declares_cors is the pure-bash, pipe-free replacement.
+if template_declares_cors "${CORS_FIXTURE}"; then green "PASS  template_declares_cors detects a declared corsRules block"; else red "FAIL  template_declares_cors missed a declared corsRules block (CORS would go UNVERIFIED)"; FAILS=$((FAILS + 1)); fi
+if template_declares_cors "param x string = 'y'"; then red "FAIL  template_declares_cors false-positived on a CORS-less template"; FAILS=$((FAILS + 1)); else green "PASS  template_declares_cors: no corsRules → the rare, explicit 'nothing to assert' state"; fi
+# ★ MUST-GO-RED (the SIGPIPE regression): corsRules at the TOP of a LARGE template — the exact input the old
+# `printf | grep -q` got wrong (early match → SIGPIPE → false "no CORS"). Detection MUST still see it. If
+# template_declares_cors is ever reverted to an internal `printf | grep -q`, this fails under pipefail.
+BIG_CORS="$(printf 'corsRules\n'; seq 5000)"
+if template_declares_cors "${BIG_CORS}"; then green "PASS  template_declares_cors detects early CORS in a large template (SIGPIPE-safe — the 2026-07-12 must-go-red)"; else red "FAIL  template_declares_cors missed early corsRules in a large template — the SIGPIPE vacuous-pass regressed!"; FAILS=$((FAILS + 1)); fi
+# ★ MUST-GO-RED (declared CORS, LIVE empty → verify FLUNKS): the declared origin is read from the bicep and
+# checked against the LIVE list; an empty live list (CORS not landed) MUST flunk — the exact silent not-landed
+# shape verify_cors exists to catch, over the real declared-origin → contains_line path.
+CORS_DECLARED_ORIGIN="$(printf '%s' "${RBAC_FIXTURE}" | bicep_param_array dashboardCorsOrigins | sed -n 1p)"
+if printf '' | contains_line "${CORS_DECLARED_ORIGIN}"; then red "FAIL  CORS must-go-red: a DECLARED origin matched an EMPTY live list (live CORS not landed would PASS!)"; FAILS=$((FAILS + 1)); else green "PASS  CORS must-go-red: a declared origin absent from live CORS FLUNKS verify"; fi
+# ★ MUST-GO-RED (parse failure → FAIL, not PASS): a template that DECLARES corsRules but whose rule has NO
+# allowedOrigins param token is UNPARSEABLE — template_declares_cors is TRUE (enters the assert branch) while
+# cors_origins_tokens is EMPTY, which verify_cors turns into a flunk ("declares corsRules but no allowedOrigins
+# param token parsed"), never a vacuous pass.
+CORS_UNPARSEABLE="$(cat <<'FIX'
+cors: {
+  corsRules: [
+    {
+      allowedMethods: [ 'GET', 'HEAD' ]
+    }
+  ]
+}
+FIX
+)"
+if template_declares_cors "${CORS_UNPARSEABLE}" && [[ -z "$(printf '%s' "${CORS_UNPARSEABLE}" | cors_origins_tokens)" ]]; then green "PASS  parse-miss: declared corsRules + no origin token → verify_cors flunks (not a vacuous pass)"; else red "FAIL  parse-miss handling regressed (an unparseable corsRules could vacuously pass)"; FAILS=$((FAILS + 1)); fi
+
 # contains_line — the tested comparator behind the RBAC + CORS live assertions.
 if printf 'AcrPull\nStorage Blob Delegator\n' | contains_line "Storage Blob Delegator"; then green "PASS  contains_line finds an exact role"; else red "FAIL  contains_line should find the role"; FAILS=$((FAILS + 1)); fi
 # ★ MUST-GO-RED: a declared role/origin ABSENT from the live list MUST flunk (a silent not-landed grant/CORS

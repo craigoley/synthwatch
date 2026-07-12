@@ -448,6 +448,18 @@ cors_origins_tokens() {
   sed -nE 's/^[[:space:]]*allowedOrigins:[[:space:]]*([A-Za-z0-9_]+).*/\1/p'
 }
 
+# template_declares_cors <bicep-text> : exit 0 IFF the bicep declares a blob-service corsRules block. Takes the
+# template as an ARGUMENT (not stdin) DELIBERATELY. The old inline `printf '%s' "$tmpl" | grep -q corsRules`
+# under `set -o pipefail` made grep -q short-circuit on the FIRST match and close the pipe, so printf took
+# SIGPIPE and the PIPELINE's status became 141 (printf's), not 0 (grep's) — and `! <pipeline>` inverted that to
+# "no CORS": a VACUOUS PASS precisely WHEN corsRules WAS present (it matched early), plus the "printf: write
+# error: Broken pipe" noise. A pure-bash `[[ == *…* ]]` has no subprocess / pipe / early-exit, so it reads the
+# TRUE presence and can never SIGPIPE — "template declares no CORS" becomes a reliable, RARE state, never a
+# parse miss masquerading as a pass. (Same fix shape as the #155 tag-membership here-string.)
+template_declares_cors() {
+  [[ "$1" == *corsRules* ]]
+}
+
 # ── start-of-run tree-sync policy (concern: run current logic by construction) ─────────────────────────────
 # tree_sync_decision <branch> <local_sha> <origin_sha> <is_ancestor 0|1> <dirty 0|1> : the PURE policy the
 # START-OF-RUN SYNC block in deploy.sh implements — kept here so it's unit-tested (the block computes the git
