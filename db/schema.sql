@@ -189,6 +189,15 @@ CREATE TABLE checks (
                        CONSTRAINT checks_environment_vocab
                        CHECK (environment IN ('prod', 'staging', 'dev')),
 
+    -- Per-check ENV OVERRIDE (env PR-3, mirrors 0074_checks_environment_override.sql). DASHBOARD-OWNED:
+    -- NULL = no override → use the derived `environment` (manifest ?? domain-inference ?? 'prod', PR-2). A
+    -- value WINS over the derived env. ★ In NEITHER reconcile allow-list (like archived_at) → a manifest
+    -- apply / re-infer / backfill can NEVER clobber it. Readers coalesce: effective env =
+    -- coalesce(environment_override, environment). Set/cleared via PUT /api/checks/{id}/environment.
+    environment_override TEXT
+                       CONSTRAINT checks_environment_override_vocab
+                       CHECK (environment_override IN ('prod', 'staging', 'dev')),
+
     -- S2 host-rewrite FROM origin (mirrors 0060_checks_rewrite_from_origin.sql, pre-prod-arc S3). When set,
     -- the runner rewrites requests whose origin == this to the check's OWN target_url origin (the preview
     -- env), so a pre-prod check reuses a prod spec WITHOUT editing it. NULL = no rewrite (S2 inert).

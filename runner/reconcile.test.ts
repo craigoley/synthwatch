@@ -234,6 +234,7 @@ test('apply upsert NEVER writes dashboard-owned columns', () => {
     'slo_target',
     'assertions',
     'archived_at', // ★ 0071: reversible archive is DASHBOARD-OWNED — reconcile must never touch it.
+    'environment_override', // ★ 0074: the per-check env override is DASHBOARD-OWNED — reconcile must never touch it.
   ];
   for (const c of dashboardOwned) {
     assert.ok(!insertColumns.includes(c), `${c} must not be inserted`);
@@ -255,6 +256,30 @@ test('★ archived_at is dashboard-owned: absent from every reconcile write allo
     'archived_at must NOT be seed-only',
   );
   assert.ok(!CHANGED_UPDATE_COLUMNS.includes('archived_at'), 'archived_at must NOT be in the changed-field UPDATE set');
+});
+
+// ★ 0074 OVERRIDE SAFETY (the load-bearing invariant of env PR-3): environment_override must be in NEITHER
+// git-write allow-list, so a manifest apply / re-infer / backfill is STRUCTURALLY incapable of writing it —
+// a deliberate dashboard override can NEVER be clobbered by reconcile (the exact archived_at guarantee). If
+// someone adds environment_override to an allow-list, this test goes RED (and the feature would be broken).
+test('★ environment_override is dashboard-owned: absent from every reconcile write allow-list (survives reconcile)', () => {
+  assert.ok(
+    !(GIT_AUTHORITATIVE_COLUMNS as readonly string[]).includes('environment_override'),
+    'environment_override must NOT be git-authoritative (else every apply/re-infer would clobber a manual override)',
+  );
+  assert.ok(
+    !(SEED_ONLY_COLUMNS as readonly string[]).includes('environment_override'),
+    'environment_override must NOT be seed-only',
+  );
+  assert.ok(
+    !CHANGED_UPDATE_COLUMNS.includes('environment_override'),
+    'environment_override must NOT be in the changed-field UPDATE set',
+  );
+  // And it never appears in a rendered apply upsert's columns or SQL.
+  const { insertColumns, updateColumns, text } = buildApplyUpsert(monitor());
+  assert.ok(!insertColumns.includes('environment_override'), 'environment_override must not be inserted');
+  assert.ok(!updateColumns.includes('environment_override'), 'environment_override must not be updated');
+  assert.ok(!text.includes('environment_override'), 'environment_override must not appear in the upsert SQL');
 });
 
 test('apply upsert conflict-targets source_key and seeds the right values', () => {
