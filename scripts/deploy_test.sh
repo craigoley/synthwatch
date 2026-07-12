@@ -509,6 +509,87 @@ if guard "${GG_OLD}" "${GG_NEW}"; then green "PASS  guard: template (NEW) is new
 if guard "${GG_NEW}" "${GG_OLD}"; then red "FAIL  guard must-go-red: a STALE template (older than the image) was ACCEPTED — the #253 drop would ship!"; FAILS=$((FAILS + 1)); else green "PASS  guard must-go-red: stale template (older than image) is REFUSED"; fi
 rm -rf "${GITGUARD_DIR}"
 
+# ===========================================================================
+# L. ★ Concern A — template-derived RBAC + CORS parsers (verify_rbac / verify_cors read the EXPECTED role
+#    assignments + CORS origins FROM the bicep, so verify stays correct as they change — never a hand-curated
+#    subset). A mini-bicep fixture with two roleAssignments (an API-MI grant on storage + a runner-MI acrPull)
+#    exercises the parser; contains_line is the must-go-red comparator behind the live assertions.
+# ===========================================================================
+RBAC_FIXTURE="$(cat <<'FIX'
+param apiManagedIdentityPrincipalId string = '67f2bd0c-1334-42a7-b521-3005064d7171'
+param identityName string = 'synthwatch-runner-id'
+param storageAccountName string = 'synthwatche24e33105c'
+param dashboardCorsOrigins array = [
+  'https://synthwatch-dashboard.vercel.app'
+  'https://preview.example.app'
+]
+var storageBlobDelegatorRoleId = 'db58b8e5-c6ad-4a2a-8342-4190687cbf4a'
+var acrPullRoleId = '7f951dda-4ed3-4680-a7ca-43fe172d538d'
+resource apiBlobDelegatorAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(storage.id, apiManagedIdentityPrincipalId, storageBlobDelegatorRoleId)
+  scope: storage
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', storageBlobDelegatorRoleId)
+    principalId: apiManagedIdentityPrincipalId
+    principalType: 'ServicePrincipal'
+  }
+}
+resource acrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(acr.id, identity.id, acrPullRoleId)
+  scope: acr
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', acrPullRoleId)
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+FIX
+)"
+expect_eq "bicep_var role GUID" "db58b8e5-c6ad-4a2a-8342-4190687cbf4a" "$(printf '%s' "${RBAC_FIXTURE}" | bicep_var storageBlobDelegatorRoleId)"
+expect_eq "bicep_param principalId literal" "67f2bd0c-1334-42a7-b521-3005064d7171" "$(printf '%s' "${RBAC_FIXTURE}" | bicep_param apiManagedIdentityPrincipalId)"
+expect_eq "bicep_param identityName" "synthwatch-runner-id" "$(printf '%s' "${RBAC_FIXTURE}" | bicep_param identityName)"
+expect_eq "bicep_param_array first origin" "https://synthwatch-dashboard.vercel.app" "$(printf '%s' "${RBAC_FIXTURE}" | bicep_param_array dashboardCorsOrigins | sed -n 1p)"
+expect_eq "bicep_param_array second origin" "https://preview.example.app" "$(printf '%s' "${RBAC_FIXTURE}" | bicep_param_array dashboardCorsOrigins | sed -n 2p)"
+# The two assignments, TSV, in declaration order.
+expect_eq "role_assignments_from_template row 1" "storageBlobDelegatorRoleId	apiManagedIdentityPrincipalId	storage" "$(printf '%s' "${RBAC_FIXTURE}" | role_assignments_from_template | sed -n 1p)"
+expect_eq "role_assignments_from_template row 2" "acrPullRoleId	identity.properties.principalId	acr" "$(printf '%s' "${RBAC_FIXTURE}" | role_assignments_from_template | sed -n 2p)"
+expect_eq "role_assignments count" "2" "$(printf '%s' "${RBAC_FIXTURE}" | role_assignments_from_template | grep -c .)"
+
+# contains_line — the tested comparator behind the RBAC + CORS live assertions.
+if printf 'AcrPull\nStorage Blob Delegator\n' | contains_line "Storage Blob Delegator"; then green "PASS  contains_line finds an exact role"; else red "FAIL  contains_line should find the role"; FAILS=$((FAILS + 1)); fi
+# ★ MUST-GO-RED: a declared role/origin ABSENT from the live list MUST flunk (a silent not-landed grant/CORS
+# would otherwise pass — the memory-drop class).
+if printf 'AcrPull\nStorage Blob Data Reader\n' | contains_line "Storage Blob Delegator"; then red "FAIL  contains_line must-go-red: a MISSING role was accepted (a silent not-landed grant would PASS!)"; FAILS=$((FAILS + 1)); else green "PASS  contains_line must-go-red: a missing role FLUNKS verify"; fi
+if printf '' | contains_line "https://synthwatch-dashboard.vercel.app"; then red "FAIL  contains_line empty-live wrongly matched (empty CORS would pass)"; FAILS=$((FAILS + 1)); else green "PASS  contains_line empty live list != anything (empty CORS FLUNKS)"; fi
+# ★ REGRESSION: a SINGLE live value with NO trailing newline — the exact shape `printf '%s' "$(az … -o tsv)"`
+# yields for a one-item result — MUST still be found. (A naive `while read` drops an unterminated final line,
+# which false-flunked a live AcrPull/Delegator grant during live validation.)
+if printf '%s' "OnlyRoleNoNewline" | contains_line "OnlyRoleNoNewline"; then green "PASS  contains_line finds a lone value with no trailing newline"; else red "FAIL  contains_line drops an unterminated final line (would false-flunk a live grant!)"; FAILS=$((FAILS + 1)); fi
+
+# ===========================================================================
+# M. ★ Concern B — script_differs_from_ref: the stale-deploy-script guard's tested core. deploy.sh executes
+#    the LOCAL copy of itself while deploying origin/main's template; a script differing from origin/main runs
+#    OLD logic. Build a throwaway repo, commit a script, then edit the local copy → must read STALE.
+# ===========================================================================
+SCRIPTGUARD_DIR="$(mktemp -d -t synthwatch-scriptguard.XXXXXX)"
+git -C "${SCRIPTGUARD_DIR}" init -q
+git -C "${SCRIPTGUARD_DIR}" config user.email t@example.test
+git -C "${SCRIPTGUARD_DIR}" config user.name test
+mkdir -p "${SCRIPTGUARD_DIR}/scripts"
+printf 'echo v1\n' > "${SCRIPTGUARD_DIR}/scripts/deploy.sh"
+git -C "${SCRIPTGUARD_DIR}" add scripts/deploy.sh
+git -C "${SCRIPTGUARD_DIR}" commit -qm v1
+# Simulate origin/main == the committed v1.
+git -C "${SCRIPTGUARD_DIR}" update-ref refs/remotes/origin/main HEAD
+# Identical local copy → NOT stale.
+if script_differs_from_ref "${SCRIPTGUARD_DIR}" origin/main scripts/deploy.sh; then red "FAIL  script guard: identical script read as stale"; FAILS=$((FAILS + 1)); else green "PASS  script guard: identical local script is current"; fi
+# ★ MUST-GO-RED: edit the local copy so it lags origin/main → MUST read STALE (else deploy.sh runs old logic).
+printf 'echo v0-STALE\n' > "${SCRIPTGUARD_DIR}/scripts/deploy.sh"
+if script_differs_from_ref "${SCRIPTGUARD_DIR}" origin/main scripts/deploy.sh; then green "PASS  script guard must-go-red: a stale local deploy.sh is DETECTED (deploy would abort)"; else red "FAIL  script guard must-go-red: a STALE deploy.sh read as current — it would silently run OLD logic!"; FAILS=$((FAILS + 1)); fi
+# A ref that lacks the path → not "stale" (can't compare) — the caller logs a skip, never a false abort.
+if script_differs_from_ref "${SCRIPTGUARD_DIR}" origin/main scripts/nonexistent.sh; then red "FAIL  script guard: a ref-missing path wrongly read as stale"; FAILS=$((FAILS + 1)); else green "PASS  script guard: a ref-missing path is not stale (skip, no false abort)"; fi
+rm -rf "${SCRIPTGUARD_DIR}"
+
 echo
 if [[ "${FAILS}" -eq 0 ]]; then
   green "ALL TESTS PASSED"
