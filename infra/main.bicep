@@ -473,6 +473,40 @@ resource apiReconcileJobStart 'Microsoft.Authorization/roleAssignments@2022-04-0
   }
 }
 
+// ★ CONFIRMATION-RETRY (0077 / D1): let the RUNNER's own managed identity START the runner job it is running as
+// (its `jobs/start` ARM call for a failed browser/multistep check's confirmation run — a dedicated fresh
+// execution with the full 660s to itself). One assignment per regional runner job, each scoped to JUST that job
+// (least-privilege): a runner in region R fires jobs/start on its OWN job (CONTAINER_APP_JOB_NAME), so each job
+// needs its shared UAMI granted start on itself. Same role (Container Apps Jobs Operator) as the API grants
+// above. Best-effort at the app layer (a missing grant → next-tick drain), but declared so verify() asserts it.
+resource runnerSelfStart 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(job.id, identity.id, jobsOperatorRoleId)
+  scope: job
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', jobsOperatorRoleId)
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+resource runnerSelfStartCentralus 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(centralusJob.id, identity.id, jobsOperatorRoleId)
+  scope: centralusJob
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', jobsOperatorRoleId)
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+resource runnerSelfStartWestus2 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(westus2Job.id, identity.id, jobsOperatorRoleId)
+  scope: westus2Job
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', jobsOperatorRoleId)
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Container Apps managed environment, wired to Log Analytics.
 // ---------------------------------------------------------------------------
@@ -592,6 +626,16 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
               // ★ Must land WITH db/ops/relabel_default_to_eastus2.sql at cutover.
               name: 'SYNTHWATCH_LOCATION'
               value: location
+            }
+            {
+              // ★ ARM coordinates for confirmation-retry's SELF jobs/start (0077 / jobTrigger.ts). subscription
+              // + RG are identical for every runner job; the job to start is CONTAINER_APP_JOB_NAME (ACA-injected).
+              name: 'AZURE_SUBSCRIPTION_ID'
+              value: subscription().subscriptionId
+            }
+            {
+              name: 'AZURE_RESOURCE_GROUP'
+              value: resourceGroup().name
             }
             {
               // ★ Universal deployed-environment marker — present on EVERY job in this template
@@ -787,6 +831,15 @@ resource centralusJob 'Microsoft.App/jobs@2024-03-01' = {
               value: centralusLocation
             }
             {
+              // ★ ARM coordinates for confirmation-retry's SELF jobs/start (0077 / jobTrigger.ts).
+              name: 'AZURE_SUBSCRIPTION_ID'
+              value: subscription().subscriptionId
+            }
+            {
+              name: 'AZURE_RESOURCE_GROUP'
+              value: resourceGroup().name
+            }
+            {
               // Universal deployed marker — see the primary job's SYNTHWATCH_DEPLOYED comment.
               name: 'SYNTHWATCH_DEPLOYED'
               value: '1'
@@ -964,6 +1017,15 @@ resource westus2Job 'Microsoft.App/jobs@2024-03-01' = {
               // The vantage label for this region — claims/runs as 'westus2' (the 3rd quorum vote).
               name: 'SYNTHWATCH_LOCATION'
               value: westus2Location
+            }
+            {
+              // ★ ARM coordinates for confirmation-retry's SELF jobs/start (0077 / jobTrigger.ts).
+              name: 'AZURE_SUBSCRIPTION_ID'
+              value: subscription().subscriptionId
+            }
+            {
+              name: 'AZURE_RESOURCE_GROUP'
+              value: resourceGroup().name
             }
             {
               // Universal deployed marker — see the primary job's SYNTHWATCH_DEPLOYED comment.

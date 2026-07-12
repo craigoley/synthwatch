@@ -348,7 +348,16 @@ CREATE TABLE runs (
     -- on-demand validation run (skips evaluate() — no incident/alert/SLO). Stamps the run so a resumed
     -- monitor's historical sandbox runs stay distinguishable (badge + optional SLO exclusion). DEFAULT
     -- false = a normal run.
-    sandbox        BOOLEAN NOT NULL DEFAULT false
+    sandbox        BOOLEAN NOT NULL DEFAULT false,
+    -- Confirmation-retry (mirrors 0077). Browser/multistep only: a failed SCHEDULED run enqueues ONE
+    -- confirmation run in a FRESH ACA execution (fresh 660s) that OWNS the verdict.
+    --   confirmation_of_run_id — set on the CONFIRMATION run, points at the original it is confirming.
+    --   superseded_by_run_id   — set on the ORIGINAL when its confirmation PASSED (⇒ it was a transient). The
+    --     read-side health filters (sla_availability, slo_status, aggregateVerdict, rollup, status page) exclude
+    --     WHERE this IS NOT NULL, so a transient stays VISIBLE in run history but never moves a health signal.
+    -- Both self-FKs are ON DELETE SET NULL so 90d row-retention (purging the pair together) is never blocked.
+    confirmation_of_run_id BIGINT REFERENCES runs(id) ON DELETE SET NULL,
+    superseded_by_run_id   BIGINT REFERENCES runs(id) ON DELETE SET NULL
 );
 
 -- Hot path: "latest N runs for this check, newest first" (status pages, the
@@ -598,7 +607,11 @@ CREATE TABLE run_requests (
     -- though the check is disabled, writing a visible runs row + trace but SKIPPING evaluate() (no incident/
     -- alert/SLO) and never resuming the check. DEFAULT false = a normal request (still rejected for a
     -- disabled check by the `AND c.enabled` claim gates).
-    sandbox      BOOLEAN     NOT NULL DEFAULT false
+    sandbox      BOOLEAN     NOT NULL DEFAULT false,
+    -- CONFIRMATION run of a failed scheduled browser/multistep check (mirrors 0077). true → drainRunRequests
+    -- runs it as the confirmation that OWNS the verdict (links the new run to the original via
+    -- runs.confirmation_of_run_id). Per-request flavor flag, mirroring `sandbox`. DEFAULT false = a normal request.
+    confirmation BOOLEAN     NOT NULL DEFAULT false
 );
 CREATE INDEX run_requests_pending_idx ON run_requests (requested_at) WHERE status = 'pending';
 -- Idempotency: at most one pending request per check (re-clicks coalesce).
@@ -840,6 +853,9 @@ AS $$
           -- skipped evaluate() — not a scheduled health signal, so it must never move availability. In the
           -- JOIN (not a WHERE) so a check whose only window runs are sandbox keeps its LEFT-JOIN null-run row.
           AND NOT r.sandbox
+          -- SUPERSEDED-TRANSIENT EXCLUSION (0077): a failed run whose confirmation PASSED — it was transient, so
+          -- it must never move availability. Same rail as the sandbox exclusion above.
+          AND r.superseded_by_run_id IS NULL
     -- MAINTENANCE-WINDOW EXCLUSION (additive anti-join, mirrors 0004): drop runs
     -- that fall inside an active window for this check (check_id = c.id) OR a
     -- fleet-wide window (check_id IS NULL). Uncovered runs keep mw.id NULL and
@@ -965,6 +981,9 @@ AS $$
                ON r.check_id   = c.id
               AND r.started_at >= p_from
               AND r.started_at <  p_to
+              -- SUPERSEDED-TRANSIENT EXCLUSION (0077): a confirmed-transient failure must not consume the error
+              -- budget (mirror the sla_availability exclusion; the confirmation run is the one that counts).
+              AND r.superseded_by_run_id IS NULL
         LEFT JOIN maintenance_windows mw
                ON (mw.check_id = c.id OR mw.check_id IS NULL)
               AND r.started_at >= mw.starts_at

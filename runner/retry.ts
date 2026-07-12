@@ -36,8 +36,27 @@ function isRetryable(status: string): boolean {
  * pages nothing, and Craig just re-fires. (Also stops a hard-failing validation running 4× — cf. the
  * b2c stale-selector run that hit retry_count=3.)
  */
-export function effectiveRetries(retries: number, alreadyFailing: boolean, sandbox = false): number {
-  return alreadyFailing || sandbox ? 0 : retries;
+export function effectiveRetries(
+  retries: number,
+  alreadyFailing: boolean,
+  sandbox = false,
+  confirmByRerun = false,
+): number {
+  // ★ CONFIRM-BY-RERUN (0077, D2/D6): browser/multistep checks confirm a failure in a FRESH ACA execution
+  // (fresh 660s) rather than an in-run loop — 3 × ~5-min attempts in ONE execution blew the replicaTimeout
+  // into a strand. So the in-run fast-retry is OFF for those kinds (retries → 0, one honest attempt); the
+  // confirmation IS the retry. In-run fast-retry stays for cheap http/net/ssl checks (their budget fits in
+  // seconds — spinning a whole new pod would be wasteful).
+  return alreadyFailing || sandbox || confirmByRerun ? 0 : retries;
+}
+
+/**
+ * Confirm-by-rerun eligibility (0077, D2). A failed SCHEDULED run of these kinds enqueues ONE confirmation run
+ * in a fresh execution instead of retrying in-run. Browser + multistep are the expensive, transient-prone,
+ * budget-blowing flows; cheap kinds (http/ssl/dns/tcp/ping) keep the in-run fast-retry (see effectiveRetries).
+ */
+export function confirmByRerunEligible(kind: string): boolean {
+  return kind === 'browser' || kind === 'multistep';
 }
 
 export async function runWithRetry<T extends { status: string }>(

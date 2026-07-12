@@ -72,7 +72,7 @@ import {
   type RunMetrics,
 } from './metrics.js';
 import { isExpectationError } from './errors.js';
-import { runWithRetry, effectiveRetries } from './retry.js';
+import { runWithRetry, effectiveRetries, confirmByRerunEligible } from './retry.js';
 import { DUE_PREDICATE_SQL } from './duePredicate.js';
 import { withDeadline } from './timeBudget.js';
 import { enforceProdGuard } from './prodGuard.js';
@@ -374,8 +374,13 @@ async function drainRunRequests(): Promise<number> {
   // request may claim a PAUSED check — a NORMAL request (sandbox=false) still requires enabled (unchanged).
   // ★ ARCHIVE (0071): same shape — an ARCHIVED check refuses a NORMAL on-demand run but a SANDBOX request
   // may still validate it (mirrors the paused precedent; sandbox never opens incidents/alerts/SLO).
-  const { rows: pending } = await pool.query<{ id: number; check_id: number; sandbox: boolean }>(
-    `SELECT rr.id, rr.check_id, rr.sandbox
+  const { rows: pending } = await pool.query<{
+    id: number;
+    check_id: number;
+    sandbox: boolean;
+    confirmation: boolean;
+  }>(
+    `SELECT rr.id, rr.check_id, rr.sandbox, rr.confirmation
        FROM run_requests rr
        JOIN check_locations cl ON cl.check_id = rr.check_id AND cl.location = $1
        JOIN checks c           ON c.id = rr.check_id AND (c.enabled OR rr.sandbox)
@@ -385,7 +390,7 @@ async function drainRunRequests(): Promise<number> {
     [LOCATION],
   );
   let ran = 0;
-  for (const { id, check_id, sandbox } of pending) {
+  for (const { id, check_id, sandbox, confirmation } of pending) {
     // Atomically claim THIS request — only one tick/replica wins (a concurrent claim updates 0 rows).
     // We claim only AFTER confirming (above) this runner can run it, so a claimed row always runs here.
     const { rowCount: won } = await pool.query(
@@ -411,7 +416,28 @@ async function drainRunRequests(): Promise<number> {
     // and run it. Null only on a tiny race (disabled between the SELECT and now) — already consumed, fine.
     const check = await forceClaim(check_id, sandbox);
     if (!check) continue;
-    console.log(`[run-now] force-running check ${check.id} "${check.name}" (on-demand${sandbox ? ', SANDBOX — paused, evaluate() skipped' : ''})`);
+
+    // ★ CONFIRMATION request (0077): resolve the ORIGINAL run this confirms — the latest awaiting failed run
+    // for this check AT THIS LOCATION (status fail/error, not itself a confirmation, not yet superseded). It is
+    // unambiguous: a confirmation is enqueued the instant a healthy check fails (D5 stops a failing check from
+    // enqueuing), and there is at most one pending confirmation per check. Null (original already resolved) →
+    // run as a normal forced run (harmless — evaluate() runs). runOne stamps runs.confirmation_of_run_id with it.
+    let confirmationOfRunId: number | null = null;
+    if (confirmation) {
+      const { rows: orig } = await pool.query<{ id: number }>(
+        `SELECT id FROM runs
+          WHERE check_id = $1 AND location = $2 AND status IN ('fail', 'error')
+            AND confirmation_of_run_id IS NULL AND superseded_by_run_id IS NULL
+          ORDER BY started_at DESC LIMIT 1`,
+        [check_id, LOCATION],
+      );
+      confirmationOfRunId = orig[0]?.id ?? null;
+    }
+    console.log(
+      `[run-now] force-running check ${check.id} "${check.name}" (on-demand` +
+        `${sandbox ? ', SANDBOX — paused, evaluate() skipped' : ''}` +
+        `${confirmation ? `, CONFIRMATION of run ${confirmationOfRunId ?? '?'} — owns the verdict` : ''})`,
+    );
     // ★ B5: per-iteration try/catch — a throw on ONE on-demand run must NOT abort the remaining drains.
     // Previously a runOne throw propagated out of the loop (caught only at the main-level .catch), dropping
     // every still-pending request this tick. The request was claimed 'done' atomically above (the race-
@@ -419,7 +445,7 @@ async function drainRunRequests(): Promise<number> {
     // so a failed run stays consumed and the check re-runs on its normal cron cadence; the failure is
     // logged here rather than silently aborting the siblings.
     try {
-      await runOne(check, sandbox);
+      await runOne(check, sandbox, confirmationOfRunId);
       ran++;
     } catch (err) {
       // ★ Mirror the due-loop (#162): record to the QUERYABLE runner_errors sink, not stdout-only. An
@@ -460,15 +486,18 @@ async function forceClaim(id: number, sandbox = false): Promise<Check | null> {
   return rows[0] ?? null;
 }
 
-async function runOne(check: Check, sandbox = false): Promise<void> {
+async function runOne(check: Check, sandbox = false, confirmationOfRunId: number | null = null): Promise<void> {
   // Insert the run row as 'running' (in-flight) so the StepRecorder has a run_id
   // to attach steps to, and the SLA "exclude running" clause has real data. A
   // hard crash before the terminal update is reaped to 'error' (see main()).
   const { rows } = await pool.query<{ id: number }>(
     // ★ sandbox (0065): stamp the row so a paused-monitor validation run stays distinguishable from a real
     // run after the monitor is resumed (badge + optional SLO exclusion). Normal runs → false (unchanged).
-    `INSERT INTO runs (check_id, started_at, status, location, sandbox) VALUES ($1, now(), 'running', $2, $3) RETURNING id`,
-    [check.id, LOCATION, sandbox],
+    // ★ confirmation_of_run_id (0077): set when this run is a CONFIRMATION of an earlier failed run — it links
+    // the pair so the confirmation can mark the original superseded (transient) or open the incident (confirmed).
+    `INSERT INTO runs (check_id, started_at, status, location, sandbox, confirmation_of_run_id)
+     VALUES ($1, now(), 'running', $2, $3, $4) RETURNING id`,
+    [check.id, LOCATION, sandbox, confirmationOfRunId],
   );
   const runId = rows[0].id;
   // Best-effort context for the global handler: a fatal during this run is attributed to (check, run).
@@ -478,7 +507,7 @@ async function runOne(check: Check, sandbox = false): Promise<void> {
   // guarantees a throw BEFORE that write doesn't strand the row in 'running' ~30 min until the reaper.
   const state = { finalized: false };
   try {
-    await runOneInner(check, runId, state, sandbox);
+    await runOneInner(check, runId, state, sandbox, confirmationOfRunId);
   } finally {
     // No double-write: state.finalized + `WHERE status='running'` make this a NO-OP once the terminal
     // write ran. Best-effort + own-catch — a finally that throws would hide the original error.
@@ -500,6 +529,7 @@ async function runOneInner(
   runId: number,
   state: { finalized: boolean },
   sandbox = false,
+  confirmationOfRunId: number | null = null,
 ): Promise<void> {
   const errorOutcome = (msg: string): Outcome => ({
     status: 'error',
@@ -534,11 +564,19 @@ async function runOneInner(
   const alreadyFailing = await hasOpenIncident(check.id);
   // ★ sandbox suppresses fast-retry too: a paused-monitor validation wants the TRUE first-attempt
   // outcome (evaluate() is skipped, so there's no page to confirm) — see effectiveRetries.
-  const retries = effectiveRetries(check.retries, alreadyFailing, sandbox);
+  // ★ CONFIRM-BY-RERUN (0077, D2): browser/multistep confirm a failure in a FRESH execution, not an in-run
+  // loop — so their in-run fast-retry is OFF (retries → 0). The confirmation IS the retry. This is what
+  // stops the 3 × ~5-min in-ONE-execution strand; http/net/ssl keep the in-run fast-retry.
+  const confirmEligible = confirmByRerunEligible(check.kind);
+  const retries = effectiveRetries(check.retries, alreadyFailing, sandbox, confirmEligible);
   const maxAttempts = retries + 1;
   if (sandbox && check.retries > 0) {
     console.log(
       `[runner] check ${check.id} "${check.name}" SANDBOX validation — single attempt (fast-retry skipped, true first-attempt state).`,
+    );
+  } else if (confirmEligible && check.retries > 0 && confirmationOfRunId == null) {
+    console.log(
+      `[runner] check ${check.id} "${check.name}" ${check.kind} — in-run fast-retry OFF; a failure confirms by re-run in a fresh execution (0077).`,
     );
   } else if (alreadyFailing && check.retries > 0) {
     console.log(
@@ -760,7 +798,10 @@ async function runOneInner(
   // guard: without it a paused monitor pages — the "C" failure). Nothing flips checks.enabled either. (OTel
   // below is telemetry, not an alert/incident/SLO write — left on.) SLO rollups don't see this run: the
   // paused check is excluded by the reports' `WHERE c.enabled` filter (and #188 excludes staging).
-  await applyRunSideEffects(check, run, sandbox);
+  // ★ CONFIRMATION-RETRY (0077): the seam decides — (A) a confirmation run OWNS the verdict (pass → mark the
+  // original superseded; fail → open the incident), (B) a normal scheduled failure on a healthy browser/
+  // multistep check DEFERS (skip evaluate, enqueue ONE fresh-execution confirmation), or (C) today's behavior.
+  await applyRunSideEffects(check, run, { sandbox, alreadyFailing, confirmationOfRunId });
 
   console.log(
     `[runner] check ${check.id} "${check.name}" -> ${status}` +
