@@ -361,3 +361,81 @@ mem_eq() {
 image_covered_by_template() {
   git merge-base --is-ancestor "$1" "$2" 2>/dev/null
 }
+
+# ── template-derived RBAC + CORS expectations (verify() concern A) ─────────────────────────────────────────
+# verify() must assert what the TEMPLATE DECLARES (data-driven), not a hand-curated subset that only grows
+# after a failure (the memory-drop class). These pure parsers pull the expected role assignments + CORS
+# origins straight from the materialized bicep; verify() resolves them live + FLUNKS on any that isn't there.
+
+# bicep_var <name> : stdin = bicep → the value of `var <name> = '<value>'` (e.g. a role-definition GUID). Empty
+# if absent (a flunk, never a set-e abort — like bicep_field).
+bicep_var() {
+  sed -nE "s/^var $1 = '([^']+)'.*/\1/p" | head -1
+}
+
+# bicep_param <name> : stdin = bicep → the default of `param <name> string = '<value>'` (the materialized
+# template carries every param's default literal). Empty if absent.
+bicep_param() {
+  sed -nE "s/^param $1 string = '([^']+)'.*/\1/p" | head -1
+}
+
+# bicep_param_array <name> : stdin = bicep → each quoted string inside `param <name> array = [ … ]`, one per
+# line (e.g. the CORS allowed-origins list). Empty if absent.
+bicep_param_array() {
+  awk -v name="$1" '
+    $0 ~ ("^param " name " array = \\[") { inblk=1; next }
+    inblk && /^\]/ { inblk=0 }
+    inblk { print }
+  ' | grep -oE "'[^']+'" | sed "s/'//g"
+}
+
+# role_assignments_from_template : stdin = bicep → one TSV line per Microsoft.Authorization/roleAssignments
+# resource: `<roleDefVarName>\t<principalToken>\t<scopeToken>` — the raw bicep tokens (verify() resolves each
+# to a live GUID / principalId / scope id, and FLUNKS an unknown token so a NEW assignment can't slip past
+# unasserted). Parses each top-level resource block (its closing `}` is at column 0; nested braces are
+# indented). Emits nothing for a malformed block (missing a field), which a count check in verify() catches.
+role_assignments_from_template() {
+  awk '
+    /^resource[[:space:]].*Microsoft\.Authorization\/roleAssignments/ { inblk=1; rv=""; pr=""; sc=""; next }
+    inblk {
+      if (index($0, "roleDefinitionId:") && index($0, "roleDefinitions")) {
+        line=$0; sub(/.*roleDefinitions[^,]*,[[:space:]]*/, "", line); sub(/\).*/, "", line); rv=line
+      } else if ($0 ~ /^[[:space:]]*principalId:/ && pr=="") {
+        line=$0; sub(/^[[:space:]]*principalId:[[:space:]]*/, "", line); sub(/[[:space:]].*/, "", line); pr=line
+      } else if ($0 ~ /^[[:space:]]*scope:/ && sc=="") {
+        line=$0; sub(/^[[:space:]]*scope:[[:space:]]*/, "", line); sub(/[[:space:]].*/, "", line); sc=line
+      }
+      if ($0 ~ /^}/) { if (rv!="" && pr!="" && sc!="") print rv "\t" pr "\t" sc; inblk=0 }
+    }
+  '
+}
+
+# contains_line <needle> : stdin = a newline list → exit 0 IFF <needle> is an EXACT line. Empty stdin → 1 (a
+# value that must be present but the live list is empty MUST flunk, never silently pass — same teeth as
+# num_eq/mem_eq). The tested comparator behind verify()'s RBAC + CORS assertions.
+contains_line() {
+  local needle="$1" line
+  # `|| [[ -n "${line}" ]]` processes a FINAL line with no trailing newline — the shape `printf '%s' "$live"`
+  # produces for a single-item az result. Without it a lone live role/origin (no newline) is silently skipped
+  # → a real grant/CORS rule reads as MISSING (false flunk) — or worse, the last of several is never checked.
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ "${line}" == "${needle}" ]] && return 0
+  done
+  return 1
+}
+
+# ── stale-deploy-script guard (concern B) ──────────────────────────────────────────────────────────────────
+# deploy.sh DEPLOYS origin/main's template + image, but EXECUTES the local working-tree copy of ITSELF (and
+# its libs). If those are stale vs origin/main, the deploy silently runs OLD logic — merged fixes that are NOT
+# running (#254's secret removal, #268's resource-reconcile were merged but not executing). Being behind on
+# the SCRIPT is never benign; the template is materialized from origin, the script is not.
+#
+# script_differs_from_ref <repo> <ref> <relpath> : exit 0 IFF <repo>/<relpath> (the running copy) differs in
+# CONTENT from <ref>:<relpath> — i.e. STALE/edited vs the ref. Exit 1 if identical OR the ref lacks the path
+# (can't compare → not "stale"; the caller logs a skip). CONTENT compare, so a tree behind only on UNRELATED
+# files is not flagged. The tested core of assert_deploy_scripts_current.
+script_differs_from_ref() {
+  local repo="$1" ref="$2" relpath="$3"
+  git -C "${repo}" cat-file -e "${ref}:${relpath}" 2>/dev/null || return 1   # ref lacks it → not stale
+  ! diff -q <(git -C "${repo}" show "${ref}:${relpath}") "${repo}/${relpath}" >/dev/null 2>&1
+}

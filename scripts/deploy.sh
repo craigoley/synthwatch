@@ -333,6 +333,26 @@ pick_sha() {
 # for HEAD"). ★ We NEVER touch the working tree (no reset/checkout): target origin/main, WARN if local
 # differs, leave local commits untouched. Sets TARGET_HEAD, which pick_sha uses as `head`.
 # ---------------------------------------------------------------------------
+# ★ Concern B: refuse to run a STALE copy of the deploy scripts. deploy.sh executes the LOCAL working-tree
+# copy of itself (+ scripts/lib), but deploys origin/main's template — so a local copy that lags origin/main
+# runs OLD deploy logic while claiming success (the #254/#268 "merged but not executing" mystery). Compare by
+# CONTENT (script_differs_from_ref), so a tree behind only on UNRELATED files is fine; a divergent SCRIPT
+# aborts loudly. Runs right after the origin fetch. Requires origin/main fetched (the caller just did).
+assert_deploy_scripts_current() {
+  local p stale=""
+  for p in scripts/deploy.sh scripts/lib/deploy-lib.sh scripts/lib/whatif-halts.jq; do
+    if script_differs_from_ref "${ROOT}" origin/main "${p}"; then stale+="${p} "; fi
+  done
+  if [[ -n "${stale}" ]]; then
+    fail "STALE deploy scripts vs origin/main: ${stale}
+  Running them would deploy with OLD logic — merged fixes (e.g. #268's resource-reconcile, this RBAC/CORS
+  verify) would NOT run while the deploy still reports success. Being behind on unrelated files is benign;
+  being behind on the deploy SCRIPT is never benign. Fix, then re-run ./scripts/deploy.sh:
+      git -C '${ROOT}' fetch origin && git -C '${ROOT}' reset --hard origin/main"
+  fi
+  c_green "Deploy scripts are current with origin/main (deploy.sh + lib + what-if classifier)." >&2
+}
+
 sync_target_to_origin() {
   c_bold "Fetching origin (the deploy target is origin/main, not local HEAD)…" >&2
   git fetch --quiet origin 2>/dev/null \
@@ -340,6 +360,13 @@ sync_target_to_origin() {
   local origin_head local_head state
   origin_head="$(git rev-parse origin/main 2>/dev/null)" \
     || fail "cannot resolve origin/main — is the 'origin' remote configured with a 'main' branch?"
+
+  # ★ STALE-SCRIPT GUARD (concern B): abort BEFORE any deploy work — and before the benign "behind origin"
+  # NOTE below — if the RUNNING deploy scripts differ from origin/main. deploy.sh deploys origin/main's
+  # template but executes the LOCAL copy of itself; a stale local copy silently runs OLD logic (the #254/#268
+  # "merged but not executing" trap). Being behind on the SCRIPT is never benign, unlike the template.
+  assert_deploy_scripts_current
+
   local_head="$(git rev-parse HEAD 2>/dev/null || echo '')"
   state="$(git_drift_state "${local_head}" "${origin_head}")"
   DRIFT_STATE="${state}"   # hoisted for the post-deploy sync offer (offer_local_sync)
@@ -352,7 +379,8 @@ sync_target_to_origin() {
       # and nothing diverged, so this is a calm green NOTE, not an alarming yellow WARN (which is
       # reserved for the 'diverged' case below — local commits that are NOT on origin).
       c_green "NOTE: local main is behind origin/main (benign, fast-forwardable) — deploying origin/main ${origin_head:0:12}." >&2
-      c_green "      ('git pull' to catch up — not required; the deploy always targets origin.)" >&2 ;;
+      c_green "      (Benign for the TEMPLATE + files — the deploy SCRIPTS were confirmed current above, else we'd" >&2
+      c_green "       have aborted. 'git pull' to catch up — not required; the deploy always targets origin.)" >&2 ;;
     stale)
       # ★ BENIGN squash-merge leftover: local main has commit(s) that aren't literally on origin, but
       # git_drift_state confirmed every one is ALREADY on origin as an equivalent patch (the PR merged
@@ -671,6 +699,88 @@ reconcile_resources() {
   done
 }
 
+# ★ Concern A — RBAC: assert every role assignment the TEMPLATE DECLARES is live (data-driven, like the
+# config-value checks — never a hand-curated subset that only grows after a failure). For each
+# Microsoft.Authorization/roleAssignments resource in the materialized bicep, resolve its role name (from the
+# GUID var), principal, and scope, then `az role assignment list` and FLUNK if the role isn't present live.
+# An UNKNOWN principal/scope token FLUNKS (never silently skips) so a new assignment can't slip past
+# unasserted. Sets ok/flunk via the same check() plumbing as the rest of verify().
+verify_rbac() {
+  local tmpl sub_id p_api id_name storage_acct acr_name rows
+  tmpl="$(cat "${TEMPLATE}" 2>/dev/null || true)"
+  if [[ -z "${tmpl}" ]]; then flunk "rbac: could not read the template ${TEMPLATE}"; return; fi
+  sub_id="$(az account show --query id -o tsv 2>/dev/null || true)"
+  if [[ -z "${sub_id}" ]]; then flunk "rbac: could not resolve the subscription id (az account show)"; return; fi
+  p_api="$(printf '%s' "${tmpl}" | bicep_param apiManagedIdentityPrincipalId)"
+  id_name="$(printf '%s' "${tmpl}" | bicep_param identityName)"
+  storage_acct="$(printf '%s' "${tmpl}" | bicep_param storageAccountName)"
+  acr_name="$(printf '%s' "${tmpl}" | bicep_param acrName)"
+  rows="$(printf '%s' "${tmpl}" | role_assignments_from_template)"
+  if [[ -z "${rows}" ]]; then flunk "rbac: template declares NO role assignments (parser broke or bicep changed shape)"; return; fi
+
+  local roleVar principalTok scopeTok roleGuid roleName principalId scopeId live
+  while IFS=$'\t' read -r roleVar principalTok scopeTok; do
+    [[ -z "${roleVar}" ]] && continue
+    roleGuid="$(printf '%s' "${tmpl}" | bicep_var "${roleVar}")"
+    if [[ -z "${roleGuid}" ]]; then flunk "rbac ${roleVar}: role GUID not found in template"; continue; fi
+    roleName="$(az role definition list --name "${roleGuid}" --query "[0].roleName" -o tsv 2>/dev/null </dev/null || true)"
+    if [[ -z "${roleName}" ]]; then flunk "rbac ${roleVar} (${roleGuid}): could not resolve role name (az)"; continue; fi
+    case "${principalTok}" in
+      apiManagedIdentityPrincipalId) principalId="${p_api}" ;;
+      identity.properties.principalId) principalId="$(az identity show -n "${id_name}" -g "${RG}" --query principalId -o tsv 2>/dev/null </dev/null || true)" ;;
+      *) flunk "rbac '${roleName}': UNKNOWN principal token '${principalTok}' — verify() needs a resolver (refusing to skip)"; continue ;;
+    esac
+    if [[ -z "${principalId}" ]]; then flunk "rbac '${roleName}': could not resolve principal '${principalTok}'"; continue; fi
+    case "${scopeTok}" in
+      storage)      scopeId="/subscriptions/${sub_id}/resourceGroups/${RG}/providers/Microsoft.Storage/storageAccounts/${storage_acct}" ;;
+      acr)          scopeId="/subscriptions/${sub_id}/resourceGroups/${RG}/providers/Microsoft.ContainerRegistry/registries/${acr_name}" ;;
+      job)          scopeId="/subscriptions/${sub_id}/resourceGroups/${RG}/providers/Microsoft.App/jobs/${RUNNER_JOB}" ;;
+      reconcileJob) scopeId="/subscriptions/${sub_id}/resourceGroups/${RG}/providers/Microsoft.App/jobs/${RECONCILE_JOB}" ;;
+      *) flunk "rbac '${roleName}': UNKNOWN scope token '${scopeTok}' — verify() needs a resolver (refusing to skip)"; continue ;;
+    esac
+    # Match (role, scope) over ALL of the principal's assignments, scope compared LOWERCASED — `az role
+    # assignment list --scope` string-matches EXACTLY and Azure stores mixed casing (resourcegroups vs
+    # resourceGroups), so an exact-scope filter false-flunks a grant that IS live. `</dev/null` keeps az from
+    # eating the while-loop's here-string.
+    local scope_lc live_scopes
+    scope_lc="$(printf '%s' "${scopeId}" | tr '[:upper:]' '[:lower:]')"
+    live_scopes="$(az role assignment list --assignee "${principalId}" --all --query "[?roleDefinitionName=='${roleName}'].scope" -o tsv 2>/dev/null </dev/null | tr '[:upper:]' '[:lower:]' || true)"
+    if printf '%s' "${live_scopes}" | contains_line "${scope_lc}"; then
+      pass "rbac: '${roleName}' on ${scopeTok} for ${principalTok} (${principalId:0:8}…)"
+    else
+      flunk "rbac: '${roleName}' MISSING live on ${scopeTok} for ${principalTok} (${principalId:0:8}…) — the bicep declares it; the deploy did NOT land it"
+    fi
+  done <<< "${rows}"
+}
+
+# ★ Concern A — BLOB CORS: if the template declares blob-service CORS rules, assert the LIVE blob service has
+# each declared allowed-origin. Expected origins are read FROM the template (the allowedOrigins param the
+# corsRules reference), so this stays correct as origins change. Live corsRules was `[]` before #270 — the
+# exact silent pre-state to catch.
+verify_cors() {
+  local tmpl storage_acct origins_tok origins live o
+  tmpl="$(cat "${TEMPLATE}" 2>/dev/null || true)"
+  if [[ -z "${tmpl}" ]]; then flunk "cors: could not read the template ${TEMPLATE}"; return; fi
+  if ! printf '%s' "${tmpl}" | grep -q "corsRules"; then
+    pass "cors: template declares no blob CORS — nothing to assert"
+    return
+  fi
+  storage_acct="$(printf '%s' "${tmpl}" | bicep_param storageAccountName)"
+  origins_tok="$(printf '%s' "${tmpl}" | sed -nE 's/^[[:space:]]*allowedOrigins:[[:space:]]*([A-Za-z0-9_]+).*/\1/p' | head -1)"
+  if [[ -z "${origins_tok}" ]]; then flunk "cors: template declares corsRules but the allowedOrigins token didn't parse"; return; fi
+  origins="$(printf '%s' "${tmpl}" | bicep_param_array "${origins_tok}")"
+  if [[ -z "${origins}" ]]; then flunk "cors: could not resolve origins from param '${origins_tok}'"; return; fi
+  live="$(az storage account blob-service-properties show -n "${storage_acct}" -g "${RG}" --query "cors.corsRules[].allowedOrigins[]" -o tsv 2>/dev/null || true)"
+  while IFS= read -r o; do
+    [[ -z "${o}" ]] && continue
+    if printf '%s' "${live}" | contains_line "${o}"; then
+      pass "cors: blob service allows origin ${o}"
+    else
+      flunk "cors: blob service does NOT allow origin ${o} (live corsRules empty/missing it) — the bicep declares it; the deploy did NOT land it"
+    fi
+  done <<< "${origins}"
+}
+
 verify() {
   c_bold "Verifying what landed…"
 
@@ -745,6 +855,11 @@ verify() {
       check "${ok}" "${jn} memory='${v}' (expect ${exp:-<none in template>})"
     done
   fi
+
+  # ★ Concern A: RBAC role assignments + blob CORS the TEMPLATE declares must be live (the memory-drop class:
+  # #270's MI Storage Blob Delegator + blob CORS could silently not land while verify reported success).
+  verify_rbac
+  verify_cors
 
   # ★ BUG 2: EVERY job must be on the intended image — not just the runner job. A correct
   # deploy puts the migrate job on migrate:SHA and every other job on runner:SHA. The old
