@@ -19,6 +19,7 @@
 // IDENTITY: manifest `id` -> checks.source_key (NOT flow_name — they deliberately differ).
 import { assertValidSpecPath, fetchContentsAtMain } from './specfetch/fetchSpec.js';
 import { parseOrigin } from './specfetch/hostRewrite.js';
+import { resolveEnvironment, type EnvDomainMap } from './envDomainMap.js';
 
 /** A monitor entry from synthwatch-monitors' manifest.json (kind is browser-only today). */
 export interface Monitor {
@@ -315,6 +316,7 @@ export function computeDrift(
   monitors: Monitor[],
   managedChecks: ManagedCheck[],
   specRunnable: SpecRunnability,
+  envMap: EnvDomainMap = [],
 ): DriftRow[] {
   const byId = new Map(monitors.map((m) => [m.id, m]));
   const byKey = new Map(managedChecks.map((c) => [c.source_key, c]));
@@ -358,9 +360,10 @@ export function computeDrift(
       diff.target_url = { git: m.target, live: existing.target_url };
     }
     if (existing.flow_name !== flow) diff.flow_name = { git: flow, live: existing.flow_name };
-    // Pre-prod-arc S3 (0059/0060): the manifest owns environment + rewrite_from_origin. Manifest omits
-    // environment => 'prod' (the DB default); omits rewrite_from_origin => null (no rewrite).
-    const gitEnv = m.environment ?? 'prod';
+    // Pre-prod-arc S3 (0059/0060) + env PR-2: the effective environment is manifest.environment ?? inferred
+    // from the target host (env_domain_map) ?? 'prod' (DB default). An explicit manifest env still WINS;
+    // inference fills the gap so drift/apply tag a preview/dev host correctly without a manifest edit.
+    const gitEnv = resolveEnvironment(m.environment, m.target, envMap);
     if (existing.environment !== gitEnv) diff.environment = { git: gitEnv, live: existing.environment };
     const gitRewrite = m.rewrite_from_origin ?? null;
     if ((existing.rewrite_from_origin ?? null) !== gitRewrite) {
@@ -446,7 +449,7 @@ export const CHANGED_UPDATE_COLUMNS: readonly string[] = GIT_AUTHORITATIVE_COLUM
  *   - SEED_ONLY columns are insert-only (absent from the UPDATE SET).
  *   - DASHBOARD-OWNED columns appear nowhere (reconcile never writes them).
  */
-export function buildApplyUpsert(monitor: Monitor): {
+export function buildApplyUpsert(monitor: Monitor, envMap: EnvDomainMap = []): {
   text: string;
   values: unknown[];
   insertColumns: string[];
@@ -472,7 +475,7 @@ export function buildApplyUpsert(monitor: Monitor): {
     flow,
     monitor.sensitive ?? false, // sensitive
     JSON.stringify(monitor.redact_patterns ?? null), // redact_patterns (jsonb; assignment-cast from text)
-    monitor.environment ?? 'prod', // environment (0059) — DB has a NOT NULL DEFAULT 'prod'; explicit here too
+    resolveEnvironment(monitor.environment, monitor.target, envMap), // environment: manifest ?? inferred ?? 'prod'
     monitor.rewrite_from_origin ?? null, // rewrite_from_origin (0060) — null = no S2 rewrite
     monitor.suggestedIntervalSeconds ?? DEFAULT_INTERVAL_SECONDS,
     monitor.enabledByDefault ?? false,
@@ -507,6 +510,7 @@ export function buildApplyUpsert(monitor: Monitor): {
 export function buildChangedUpdate(
   monitor: Monitor,
   driftedFields: readonly string[],
+  envMap: EnvDomainMap = [],
 ): { text: string; values: unknown[]; updateColumns: string[] } {
   assertValidSpecPath(monitor.script);
   // Manifest values for the NON-redaction git-authoritative columns (the manifest is the source of truth, same
@@ -518,7 +522,7 @@ export function buildChangedUpdate(
     flow_name: flowNameFor(monitor),
     // Pre-prod-arc S3 git-auth columns (non-redaction → on the changed allow-list): the manifest is the
     // source of truth, same as buildApplyUpsert's INSERT values.
-    environment: monitor.environment ?? 'prod',
+    environment: resolveEnvironment(monitor.environment, monitor.target, envMap),
     rewrite_from_origin: monitor.rewrite_from_origin ?? null,
   };
   // SET only the columns that ACTUALLY drifted AND are on the changed allow-list (never sensitive/redact_patterns).
@@ -742,6 +746,7 @@ export function computeApplyPlan(
   monitors: Monitor[],
   drift: DriftRow[],
   activeLocations: string[],
+  envMap: EnvDomainMap = [],
 ): ApplyPlanRow[] {
   const byId = new Map(monitors.map((m) => [m.id, m]));
   const rows: ApplyPlanRow[] = [];
@@ -772,7 +777,7 @@ export function computeApplyPlan(
         });
         continue;
       }
-      const upsert = buildApplyUpsert(m);
+      const upsert = buildApplyUpsert(m, envMap);
       // ★ materialize-DISABLED: force `enabled` (the last insert column) to false regardless of the
       // manifest's enabledByDefault — activate only after a verified-clean run (the B10 close-out pattern).
       const values = [...upsert.values];
@@ -807,7 +812,7 @@ export function computeApplyPlan(
       // columns belong to the redaction_mismatch path. (The changed drift detail carries only non-redaction
       // git-auth fields to begin with — this SCOPES the statement to exactly those, so the exclusion is enforced
       // at emission, in ONE place, and the API executes the emitted text verbatim.)
-      const update = buildChangedUpdate(m, fields);
+      const update = buildChangedUpdate(m, fields, envMap);
       rows.push({
         source_key: d.source_key,
         drift_type: 'changed',
