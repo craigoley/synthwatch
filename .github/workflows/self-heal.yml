@@ -107,8 +107,9 @@ jobs:
           if [ -z "$fails" ]; then echo "go=false" >> "$GITHUB_OUTPUT"; exit 0; fi
           echo "go=true" >> "$GITHUB_OUTPUT"
           { echo "list<<HEALEOF"; printf '%s\n' "$fails"; echo "HEALEOF"; } >> "$GITHUB_OUTPUT"
-          # parity hit?
-          if printf '%s\n' "$fails" | grep -qE "$PARITY"; then echo "parity=true" >> "$GITHUB_OUTPUT"; else echo "parity=false" >> "$GITHUB_OUTPUT"; fi
+          # parity hit? (here-string, not `printf | grep -q`: a piped writer takes SIGPIPE when grep -q
+          # closes the pipe early, and under pipefail that flips the result — see guardrail 2's note.)
+          if grep -qE "$PARITY" <<<"$fails"; then echo "parity=true" >> "$GITHUB_OUTPUT"; else echo "parity=false" >> "$GITHUB_OUTPUT"; fi
 
       - name: Guardrail 1 — one attempt per PR
         id: g1
@@ -129,7 +130,7 @@ jobs:
           FAILS: ${{ steps.fails.outputs.list }}
         run: |
           set -euo pipefail
-          HIT=$(printf '%s\n' "$FAILS" | grep -E "$PARITY" || true)
+          HIT=$(grep -E "$PARITY" <<<"$FAILS" || true)
           BODY=$(printf '🛑 **Self-heal will NOT auto-fix a cross-repo parity gate.**\n\nRed parity check(s):\n%s\n\nA red parity gate may be CORRECT — it means two repos genuinely diverged. Auto-regenerating a fixture would destroy the exact signal it exists to raise. Human review required. @craigoley' "$(printf '%s\n' "$HIT" | sed 's/^/- /')")
           gh pr comment "$PR" --repo "$REPO" --body "$BODY"
 
@@ -198,10 +199,24 @@ jobs:
           NAMES=$(git diff --name-only "$HEAD_SHA".."$NEWOID")
           DIFF=$(git diff "$HEAD_SHA".."$NEWOID")
           BAD=""
-          printf '%s\n' "$NAMES" | grep -qE '(^|/)\.github/' && BAD="$BAD\n- touches .github/ (workflow / CI config)"
-          printf '%s\n' "$NAMES" | grep -qiE 'fixture|__snapshots__|\.snap$|golden|/schema\.sql$' && BAD="$BAD\n- edits a fixture / snapshot / golden file"
-          printf '%s\n' "$DIFF"  | grep -qE '^\+.*(eslint-disable|@ts-ignore|@ts-expect-error|// *nolint|# *type: *ignore|#pragma warning disable|SuppressMessage|<NoWarn>|NoWarn>|\bit\.skip\b|\bdescribe\.skip\b|\bxit\b|\btest\.skip\b|Fact\(Skip|\[Ignore\])' && BAD="$BAD\n- adds a suppression / skips a test / loosens a check"
+          # ★ HERE-STRINGS, not `printf | grep -q`. Under `set -o pipefail`, `grep -q` closes the pipe on the
+          # FIRST match; the writer (printf) then takes SIGPIPE (exit 141), which pipefail promotes to the
+          # pipeline's status — so `&& BAD=…` is SKIPPED exactly when a match exists in a >64KB diff. That fails
+          # OPEN: the suppression survives unreverted. A here-string has no writer process to SIGPIPE. `if/then`
+          # (not `&& … || …`) keeps it set -e safe. (CLAUDE.md: the #155/#279/#283 deploy.sh SIGPIPE trap.)
+          if grep -qE '(^|/)\.github/' <<<"$NAMES"; then BAD="$BAD\n- touches .github/ (workflow / CI config)"; fi
+          if grep -qiE 'fixture|__snapshots__|\.snap$|golden|/schema\.sql$' <<<"$NAMES"; then BAD="$BAD\n- edits a fixture / snapshot / golden file"; fi
+          if grep -qE '^\+.*(eslint-disable|@ts-ignore|@ts-expect-error|// *nolint|# *type: *ignore|#pragma warning disable|SuppressMessage|<NoWarn>|NoWarn>|\bit\.skip\b|\bdescribe\.skip\b|\bxit\b|\btest\.skip\b|Fact\(Skip|\[Ignore\])' <<<"$DIFF"; then BAD="$BAD\n- adds a suppression / skips a test / loosens a check"; fi
           if [ -n "$BAD" ]; then
+            # ★ Revert-safety (the reviewer's non-blocking note): only auto-revert if HEAD_SHA is still an
+            # ancestor AND every commit since it is a [self-heal] commit — else a human pushed concurrently, so
+            # comment instead of force-discarding their work (concurrency:cancel-in-progress already covers the
+            # common case; this is the belt).
+            NONHEAL=$(git log --format='%s' "$HEAD_SHA".."$NEWOID")
+            if ! git merge-base --is-ancestor "$HEAD_SHA" "$NEWOID" || grep -qvE '^\[self-heal\]' <<<"$NONHEAL"; then
+              gh pr comment "$PR" --repo "$REPO" --body "$(printf '🛑 **Self-heal found a weakening change but will NOT force-revert** — the branch has non-self-heal commits since CI ran, and discarding them could lose your work. The change would have:%b\n\nPlease remove it manually. @craigoley' "$BAD")"
+              exit 0
+            fi
             git push --force origin "$HEAD_SHA:refs/heads/$HEAD_BRANCH"
             gh pr comment "$PR" --repo "$REPO" --body "$(printf '🛑 **Self-heal REVERTED (guardrail 2: never weaken a check).** The automated fix would have:%b\n\nThat manufactures a green light wired to nothing, so it was force-reverted to %s. A human fix is required. @craigoley' "$BAD" "$HEAD_SHA")"
             exit 0
