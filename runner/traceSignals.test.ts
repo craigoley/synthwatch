@@ -80,12 +80,12 @@ test('console filter dedupes repeated lines', () => {
   assert.equal(extractConsole(dup, TARGET).messages.length, 1);
 });
 
-test('console messages are hard-capped at 40 for a pathological trace', () => {
+test('console messages are hard-capped at 80 for a pathological trace', () => {
   const lines = Array.from(
     { length: 500 },
     (_, i) => `{"type":"console","messageType":"error","text":"distinct site error number ${i}","location":{"url":"https://www.wegmans.com/p${i}"}}`,
   ).join('\n');
-  assert.ok(extractConsole(lines, TARGET).messages.length <= 40);
+  assert.ok(extractConsole(lines, TARGET).messages.length <= 80);
 });
 
 // ── Error-diff P1: resource-host classification (console) ───────────────────────────────────────────────
@@ -175,12 +175,43 @@ test('★ drop-policy MUST-GO-RED: an error is NEVER dropped in favour of an inf
 
 test('★ drop-policy: error-class truncation beyond the cap is VISIBLE via droppedError (not silent)', () => {
   const nd = Array.from(
-    { length: 50 },
+    { length: 100 },
     (_, i) => `{"type":"console","messageType":"error","text":"distinct site error ${i}","location":{"url":"https://www.wegmans.com/e${i}"}}`,
   ).join('\n');
   const c = extractConsole(nd, TARGET);
-  assert.equal(c.messages.length, 40); // capped
-  assert.equal(c.droppedError, 10); // 50 errors − 40 kept = 10, RECORDED (not silently lost)
+  assert.equal(c.messages.length, 80); // capped
+  assert.equal(c.droppedError, 20); // 100 errors − 80 kept = 20, RECORDED (not silently lost)
+  assert.equal(c.droppedFirstParty, 20); // all first-party here → the drop is first-party (the LOUD case)
+  assert.equal(c.droppedThirdParty, 0);
+});
+
+// ★★ MUST-GO-RED: the capture drop-policy ranks by FIRST-PARTY-NESS before severity, so at the cap THIRD-PARTY
+// is dropped FIRST and first-party — INCLUDING first-party WARNINGS — SURVIVES. Reverting to the old
+// severity-dominant score (which kept third-party errors above first-party warnings) makes this FAIL:
+// first-party warnings would be evicted to store doubleclick errors, so `droppedFirstParty` would be > 0.
+test('★★ MUST-GO-RED: third-party dropped BEFORE first-party at the cap (incl. first-party warnings survive)', () => {
+  const fpErrors = Array.from(
+    { length: 10 },
+    (_, i) => `{"type":"console","messageType":"error","text":"first-party API error ${i}","location":{"url":"https://www.wegmans.com/x${i}"}}`,
+  );
+  const fpWarnings = Array.from(
+    { length: 50 },
+    (_, i) => `{"type":"console","messageType":"warning","text":"first-party warning ${i}","location":{"url":"https://www.wegmans.com/w${i}"}}`,
+  );
+  const tpErrors = Array.from(
+    { length: 50 },
+    (_, i) => `{"type":"console","messageType":"error","text":"doubleclick tracker error ${i}","location":{"url":"https://ad.doubleclick.net/t${i}"}}`,
+  );
+  // 110 distinct error/warning-class messages (60 first-party, 50 third-party) → cap 80 must truncate 30.
+  const c = extractConsole([...fpErrors, ...fpWarnings, ...tpErrors].join('\n'), TARGET);
+  assert.equal(c.messages.length, 80);
+  // EVERY first-party message survives — the 10 errors AND all 50 warnings (60 total).
+  const survivingFirstParty = c.messages.filter((m) => m.origin === 'site').length;
+  assert.equal(survivingFirstParty, 60);
+  // The drop is entirely third-party (30 of the 50 doubleclick errors); NO first-party was lost.
+  assert.equal(c.droppedError, 30);
+  assert.equal(c.droppedThirdParty, 30);
+  assert.equal(c.droppedFirstParty, 0); // ← reverting the ranking flips this to 30 (first-party warnings evicted)
 });
 
 test('network summary: counts, top-N, third-party grouping (parity)', () => {

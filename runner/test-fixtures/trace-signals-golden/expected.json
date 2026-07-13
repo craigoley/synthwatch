@@ -194,20 +194,22 @@
         "text": "Uncaught TypeError: Cannot read properties of null (reading 'checkout')"
       },
       {
-        "level": "error",
-        "origin": "third-party",
-        "sourceHost": "realtime-c.astutebot.com",
-        "text": "WebSocket connection to 'wss://realtime-c.astutebot.com/eventHub' failed"
-      },
-      {
         "level": "warning",
         "origin": "site",
         "sourceHost": "www.wegmans.com",
         "text": "[Meta Pixel] - Duplicate Pixel ID: 376538596548029."
+      },
+      {
+        "level": "error",
+        "origin": "third-party",
+        "sourceHost": "realtime-c.astutebot.com",
+        "text": "WebSocket connection to 'wss://realtime-c.astutebot.com/eventHub' failed"
       }
     ],
     "droppedInfoLog": 2,
     "droppedExtensionNoise": 5,
-    "droppedError": 0
+    "droppedError": 0,
+    "droppedThirdParty": 0,
+    "droppedFirstParty": 0
   }
 }
