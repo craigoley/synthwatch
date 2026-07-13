@@ -152,6 +152,11 @@ CREATE TABLE checks (
     slo_target            REAL CHECK (slo_target IS NULL OR (slo_target > 0 AND slo_target < 1)),
     last_burn_notified_at TIMESTAMPTZ,
 
+    -- MONITOR trust budget (0080). "this monitor may be MONITOR-SIDE flaky ≤ X% of scheduled runs." NULL ⇒ the
+    -- FLEET DEFAULT (2%, in flake_status) — NOT opt-in like slo_target (a per-monitor value overrides). ★
+    -- DASHBOARD-OWNED: in NEITHER reconcile write allow-list, so a manifest apply can never clobber an override.
+    flake_target          NUMERIC CHECK (flake_target IS NULL OR (flake_target >= 0 AND flake_target < 1)),
+
     -- Most-recent-passing browser screenshot baseline (mirrors 0017). A stable
     -- per-check Blob key (baselines/check-<id>.png) overwritten on each passing
     -- browser run; RCA reads this as the visual-diff baseline. NULL = none yet.
@@ -1022,6 +1027,91 @@ $$;
 
 COMMENT ON FUNCTION slo_status(bigint, timestamptz, timestamptz) IS
     'Per-check SLO over [p_from, p_to): target, error-budget (run-weighted), consumed, remaining, burn_rate=(down/total)/(1-target). Zero rows if no slo_target.';
+
+-- ---------------------------------------------------------------------------
+-- flake_status: per-check MONITOR trust budget over a window (0080). Mirrors slo_status' algebra
+--   budget = target × N · consumed · remaining · burn_rate = (consumed/N)/target
+-- but N = SCHEDULED runs (denominator INCLUDES superseded transients — they ARE scheduled ticks that flaked;
+-- EXCLUDES confirmations + sandbox + maintenance), and consumed = MONITOR-SIDE transients ONLY. service_side +
+-- indeterminate are surfaced, NEVER consumed. Fleet default 2% via COALESCE; a row for EVERY check (fleet-
+-- default, not opt-in). ★ READ-ONLY — no write path to alerts/routing; a breach surfaces a directed task, never
+-- a mute. (GRANT EXECUTE to "synthwatch-api" via the migration / ops, mirroring slo_status.)
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION flake_status(p_check_id bigint, p_from timestamptz, p_to timestamptz)
+RETURNS TABLE (
+    check_id          bigint,
+    flake_target      numeric,
+    target_is_default boolean,
+    window_from       timestamptz,
+    window_to         timestamptz,
+    scheduled_runs    bigint,
+    monitor_side      bigint,
+    service_side      bigint,
+    indeterminate     bigint,
+    budget            numeric,
+    consumed          bigint,
+    remaining         numeric,
+    remaining_pct     numeric,
+    burn_rate         numeric
+)
+LANGUAGE sql
+STABLE
+AS $$
+    WITH agg AS (
+        SELECT
+            c.id AS check_id,
+            -- ★ FLEET DEFAULT 2% (0.02) — justified by the measured flap distribution (p95 ≤0.016% → ~125×
+            -- headroom; worst non-service flapper 1.1%) + stage-1 spurious-red bands (elevated 1%, flaky 5%).
+            COALESCE(c.flake_target, 0.02)::numeric AS flake_target,
+            (c.flake_target IS NULL)                AS target_is_default,
+            count(*) FILTER (
+                WHERE r.confirmation_of_run_id IS NULL AND NOT r.sandbox) AS scheduled_runs,
+            count(*) FILTER (
+                WHERE r.superseded_by_run_id IS NOT NULL AND r.transient_class = 'monitor-side'
+                  AND r.confirmation_of_run_id IS NULL AND NOT r.sandbox) AS monitor_side,
+            count(*) FILTER (
+                WHERE r.superseded_by_run_id IS NOT NULL AND r.transient_class = 'service-side'
+                  AND r.confirmation_of_run_id IS NULL AND NOT r.sandbox) AS service_side,
+            count(*) FILTER (
+                WHERE r.superseded_by_run_id IS NOT NULL AND r.transient_class = 'indeterminate'
+                  AND r.confirmation_of_run_id IS NULL AND NOT r.sandbox) AS indeterminate
+        FROM checks c
+        LEFT JOIN runs r
+               ON r.check_id   = c.id
+              AND r.started_at >= p_from
+              AND r.started_at <  p_to
+        LEFT JOIN maintenance_windows mw
+               ON (mw.check_id = c.id OR mw.check_id IS NULL)
+              AND r.started_at >= mw.starts_at
+              AND r.started_at <  mw.ends_at
+        WHERE c.id = p_check_id
+          AND mw.id IS NULL
+        GROUP BY c.id, c.flake_target
+    )
+    SELECT
+        check_id,
+        flake_target,
+        target_is_default,
+        p_from AS window_from,
+        p_to   AS window_to,
+        scheduled_runs,
+        monitor_side,
+        service_side,
+        indeterminate,
+        flake_target * scheduled_runs                    AS budget,
+        monitor_side                                     AS consumed,
+        flake_target * scheduled_runs - monitor_side     AS remaining,
+        CASE WHEN flake_target * scheduled_runs > 0
+             THEN round(1 - monitor_side::numeric / (flake_target * scheduled_runs), 6)
+             END                                         AS remaining_pct,
+        CASE WHEN scheduled_runs > 0 AND flake_target > 0
+             THEN round((monitor_side::numeric / scheduled_runs) / flake_target, 4)
+             ELSE 0 END                                  AS burn_rate
+    FROM agg
+$$;
+
+COMMENT ON FUNCTION flake_status(bigint, timestamptz, timestamptz) IS
+    'Per-check MONITOR trust budget over [p_from, p_to): consumed = MONITOR-SIDE transients ONLY (service-side + indeterminate surfaced, never consumed). budget = flake_target × scheduled_runs; fleet default 2% via COALESCE. READ-ONLY — never mutes an alert; a breach surfaces a directed monitor-health task.';
 
 -- cost_projection(rate) — the SINGLE shared cost model (0069, +run-count columns 0078) both /reports/cost
 -- (api) and the narrative fact pack (runner) call, so their $ figures are identical by construction.

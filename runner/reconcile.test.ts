@@ -232,6 +232,7 @@ test('apply upsert NEVER writes dashboard-owned columns', () => {
     'alert_profile_id',
     'min_fail_locations',
     'slo_target',
+    'flake_target', // ★ 0080: the monitor trust budget is DASHBOARD-OWNED — reconcile must never touch it.
     'assertions',
     'archived_at', // ★ 0071: reversible archive is DASHBOARD-OWNED — reconcile must never touch it.
     'environment_override', // ★ 0074: the per-check env override is DASHBOARD-OWNED — reconcile must never touch it.
@@ -280,6 +281,22 @@ test('★ environment_override is dashboard-owned: absent from every reconcile w
   assert.ok(!insertColumns.includes('environment_override'), 'environment_override must not be inserted');
   assert.ok(!updateColumns.includes('environment_override'), 'environment_override must not be updated');
   assert.ok(!text.includes('environment_override'), 'environment_override must not appear in the upsert SQL');
+});
+
+// ★ 0080 FLAKE-BUDGET SAFETY (mirrors 0071/0074): flake_target is DASHBOARD-OWNED and must be in NEITHER git-write
+// allow-list, so a manifest apply is STRUCTURALLY incapable of writing it — a deliberate per-monitor budget
+// override can NEVER be clobbered by reconcile. If someone adds flake_target to an allow-list this goes RED.
+test('★ flake_target is dashboard-owned: absent from every reconcile write allow-list (survives apply)', () => {
+  assert.ok(
+    !(GIT_AUTHORITATIVE_COLUMNS as readonly string[]).includes('flake_target'),
+    'flake_target must NOT be git-authoritative (else every apply would clobber a dashboard budget override)',
+  );
+  assert.ok(!(SEED_ONLY_COLUMNS as readonly string[]).includes('flake_target'), 'flake_target must NOT be seed-only');
+  assert.ok(!CHANGED_UPDATE_COLUMNS.includes('flake_target'), 'flake_target must NOT be in the changed-field UPDATE set');
+  const { insertColumns, updateColumns, text } = buildApplyUpsert(monitor());
+  assert.ok(!insertColumns.includes('flake_target'), 'flake_target must not be inserted');
+  assert.ok(!updateColumns.includes('flake_target'), 'flake_target must not be updated');
+  assert.ok(!text.includes('flake_target'), 'flake_target must not appear in the upsert SQL');
 });
 
 test('apply upsert conflict-targets source_key and seeds the right values', () => {
