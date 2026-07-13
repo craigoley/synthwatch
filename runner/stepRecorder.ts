@@ -116,6 +116,15 @@ export class StepRecorder {
     } catch (err) {
       console.warn(`[steps] run ${this.runId} step ${index} running-marker skipped (non-fatal):`, err);
     }
+    // ★ Playwright library-level tracing GROUP — turns this synthwatch step into a NAMED, time-bounded window
+    // in trace.trace (a {before,after} pair, method:"tracingGroup", title=name, on the same monotonic clock as
+    // console events' `time`). A later extractor (PR-b) can then pair a captured console error to the step it
+    // fired inside — PURELY from the zip, no DB, no wall-clock bridge. This PR emits the window ONLY; it changes
+    // no output shape and touches no consumer.
+    // ★★ INSTRUMENTATION MUST NEVER FAIL THE THING IT OBSERVES: a tracing failure turning a green check RED
+    // would be a monitor LYING about its target — the exact class this platform refuses. So group() opens in a
+    // swallowing helper, and groupEnd() runs in a `finally` (balanced on pass, fail, AND throw) — also swallowing.
+    await this.traceGroup(name);
     try {
       const result = await body();
       await this.record(index, name, 'pass', Date.now() - start, null);
@@ -132,6 +141,32 @@ export class StepRecorder {
       await this.record(index, name, status, Date.now() - start, persisted);
       this.failedStep = name;
       throw err;
+    } finally {
+      await this.traceGroupEnd();
+    }
+  }
+
+  /**
+   * Open a Playwright tracing group for the step — NON-FATAL by construction (instrumentation must never fail
+   * the run it observes). Silent no-op when there is no page (`this.page` short-circuits — a future non-browser
+   * recorder) or when tracing was never started (tracing.start() is non-fatal at index.ts; group() then throws
+   * "Tracing is not started", which we swallow). Mirrors the tracing.start() non-fatal precedent (index.ts:1100).
+   */
+  private async traceGroup(name: string): Promise<void> {
+    try {
+      await this.page?.context()?.tracing.group(name);
+    } catch (err) {
+      console.warn(`[steps] run ${this.runId} tracing.group('${name}') skipped (non-fatal):`, err);
+    }
+  }
+
+  /** Close the step's tracing group — same non-fatal contract as traceGroup. An unbalanced end is tolerated by
+   *  Playwright (tracing.stop auto-closes any still-open group), so a swallowed group() never desyncs the tree. */
+  private async traceGroupEnd(): Promise<void> {
+    try {
+      await this.page?.context()?.tracing.groupEnd();
+    } catch (err) {
+      console.warn(`[steps] run ${this.runId} tracing.groupEnd skipped (non-fatal):`, err);
     }
   }
 
