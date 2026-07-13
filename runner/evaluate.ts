@@ -13,6 +13,11 @@ import { dispatchAlerts, resolveChannels } from './alerts.js';
 import { rcaEnabled, runRca } from './rca.js';
 import { confirmByRerunEligible, usesDedicatedExecution } from './retry.js';
 import { fireRunnerJobStart } from './jobTrigger.js';
+import { classifyTransient, type TraceSignalsLike } from './transientClass.js';
+
+/** Last-N settled runs used as the anti-flap baseline for transient classification (mirrors the API
+ *  ErrorDiff.BaselineRuns=4 — a first-party failure present across recent runs is persistent, not "new"). */
+const TRANSIENT_BASELINE_RUNS = 4;
 
 interface OpenIncident {
   id: number;
@@ -879,6 +884,34 @@ export interface RunSideEffectContext {
   confirmationOfRunId: number | null;
 }
 
+/**
+ * ★ B3-2 stage 2: classify a just-superseded transient (its OWN failing-run signals vs the last-N settled
+ * baseline) and persist `runs.transient_class`. Same-location baseline keeps it apples-to-apples for a
+ * multi-location check. INDETERMINATE when the failing run captured no signals (http/dns/ssl, or a strand).
+ */
+async function classifyAndPersistTransient(check: Check, originalRunId: number): Promise<void> {
+  const orig = await pool.query<{ trace_signals: TraceSignalsLike | null; location: string | null; started_at: Date }>(
+    `SELECT trace_signals, location, started_at FROM runs WHERE id = $1`,
+    [originalRunId],
+  );
+  if (orig.rowCount === 0) return;
+  const { trace_signals, location, started_at } = orig.rows[0];
+
+  // Baseline: the last-N SETTLED runs (same location) strictly before the transient, newest first. jsonb →
+  // pg returns trace_signals already parsed.
+  const base = await pool.query<{ trace_signals: TraceSignalsLike | null }>(
+    `SELECT trace_signals FROM runs
+      WHERE check_id = $1 AND status <> 'running' AND started_at < $2 AND id <> $3
+        AND (($4::text IS NULL AND location IS NULL) OR location = $4)
+      ORDER BY started_at DESC LIMIT $5`,
+    [check.id, started_at, originalRunId, location, TRANSIENT_BASELINE_RUNS],
+  );
+
+  const cls = classifyTransient(trace_signals, base.rows.map((r) => r.trace_signals));
+  await pool.query(`UPDATE runs SET transient_class = $2 WHERE id = $1`, [originalRunId, cls]);
+  console.log(`[confirm] check ${check.id} transient run ${originalRunId} classified ${cls}.`);
+}
+
 export async function applyRunSideEffects(
   check: Check,
   run: RunRecord,
@@ -893,6 +926,16 @@ export async function applyRunSideEffects(
       // read-side health filters exclude superseded_by_run_id IS NOT NULL). Done BEFORE evaluate so
       // aggregateVerdict/rollup already exclude it.
       await pool.query(`UPDATE runs SET superseded_by_run_id = $2 WHERE id = $1`, [ctx.confirmationOfRunId, run.id]);
+      // ★ B3-2 stage 2: classify the now-superseded transient monitor-side / service-side / indeterminate, so
+      // B3-3's flake budget can burn ONLY monitor-side ones (a service-side transient is a real, if brief,
+      // outage — it must not penalise the monitor that caught it). Best-effort: a failure here must NEVER block
+      // the supersede (the health-critical write above already landed).
+      await classifyAndPersistTransient(check, ctx.confirmationOfRunId).catch((err) =>
+        console.warn(
+          `[confirm] check ${check.id} transient-classification failed (non-fatal):`,
+          err instanceof Error ? err.message : err,
+        ),
+      );
       console.log(
         `[confirm] check ${check.id} "${check.name}" confirmation PASSED — original run ${ctx.confirmationOfRunId} was transient (superseded, no incident).`,
       );
