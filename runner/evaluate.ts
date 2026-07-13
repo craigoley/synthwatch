@@ -477,7 +477,14 @@ async function failingLocationNames(check: Check): Promise<string[]> {
               row_number() OVER (PARTITION BY location ORDER BY started_at DESC) AS rn,
               max(started_at) OVER (PARTITION BY location) AS loc_last
          FROM runs
+        -- Mirror aggregateVerdict's window EXACTLY (the docstring's "same definition" claim): a superseded
+        -- transient (self-healed blip) and a confirmation run (re-check of a failure already here) are not
+        -- independent observations, so both must be excluded or the location NAMES listed in the alert email
+        -- can disagree with the `failing` COUNT ("from X of Y locations") in mixed confirmation/scheduled
+        -- histories.
         WHERE check_id = $1 AND status NOT IN ('running', 'infra_error')
+          AND superseded_by_run_id IS NULL
+          AND confirmation_of_run_id IS NULL
      )
      SELECT location
        FROM recent
