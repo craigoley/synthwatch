@@ -106,33 +106,72 @@ nodeTest('confirmation FAIL → incident opens, original not superseded, no furt
   }
 });
 
-// D5: an ALREADY-FAILING check does NOT enqueue a confirmation — it opens/refreshes immediately (bounds the 2×
-// cost, kills the retry-storm). D6: a sandbox run enqueues nothing (early return). D2: an http check does not
-// defer (in-run retry keeps its cheap budget) — it evaluates immediately.
-nodeTest('D5 already-failing + D6 sandbox + D2 http: none DEFER (no confirmation enqueued)', { skip: SKIP }, async () => {
-  const browser = await makeCheck('__confirm_nodefer_browser__', 'browser');
-  const http = await makeCheck('__confirm_nodefer_http__', 'http');
+// ★★ MUST-GO-RED (the WHOLE point of the change): a healthy HTTP failure now DEFERS exactly like a browser one
+// — evaluate() SKIPPED (no incident), one pending confirmation enqueued, the failed run persists. Before the
+// eligibility extension http went STRAIGHT to evaluate (an incident on the first unconfirmed blip, and NEVER a
+// superseded transient → structurally flap-blind). Reverting confirmByRerunEligible flips this red.
+nodeTest('healthy HTTP failure DEFERS: no incident, one pending confirmation, the failed run persists (was flap-blind)', { skip: SKIP }, async () => {
+  const check = await makeCheck('__confirm_http_defer__', 'http');
   try {
-    // already-failing browser → branch C (evaluate), no confirmation
-    const r1 = await seedRun(browser.id, 'fail');
-    await applyRunSideEffects(browser, r1, { sandbox: false, alreadyFailing: true, confirmationOfRunId: null });
-    assert.equal(await pendingConfirmations(browser.id), 0, 'D5: an already-failing check does NOT enqueue a confirmation');
-    assert.equal(await openIncidentCount(browser.id), 1, 'D5: an already-failing failure opens the incident immediately');
-
-    // sandbox → early return, nothing
-    await pool.query(`DELETE FROM incidents WHERE check_id = $1`, [browser.id]);
-    const r2 = await seedRun(browser.id, 'fail');
-    await applyRunSideEffects(browser, r2, { sandbox: true, alreadyFailing: false, confirmationOfRunId: null });
-    assert.equal(await pendingConfirmations(browser.id), 0, 'D6: a sandbox run enqueues no confirmation');
-    assert.equal(await openIncidentCount(browser.id), 0, 'D6: a sandbox run opens no incident');
-
-    // http failure → NOT confirm-eligible → evaluate immediately, no confirmation
-    const r3 = await seedRun(http.id, 'fail');
-    await applyRunSideEffects(http, r3, healthy);
-    assert.equal(await pendingConfirmations(http.id), 0, 'D2: an http check does NOT defer to a confirmation run');
-    assert.equal(await openIncidentCount(http.id), 1, 'D2: an http failure opens the incident (in-run retry path, not confirm-by-rerun)');
+    const run = await seedRun(check.id, 'error');
+    await applyRunSideEffects(check, run, healthy);
+    assert.equal(await openIncidentCount(check.id), 0, 'an UNCONFIRMED http failure must NOT open an incident');
+    assert.equal(await pendingConfirmations(check.id), 1, 'an http failure now enqueues exactly one confirmation');
+    assert.equal(await runExists(run.id), true, 'the failed http run STAYS VISIBLE, awaiting confirmation');
+    assert.equal(await supersededBy(run.id), null, 'not yet superseded — the confirmation has not run');
   } finally {
-    await pool.query(`DELETE FROM checks WHERE id = ANY($1::bigint[])`, [[browser.id, http.id]]);
+    await pool.query(`DELETE FROM checks WHERE id = $1`, [check.id]);
+  }
+});
+
+// The full HTTP flap lifecycle: confirmation PASS → the transient is superseded (the flap signal that has been
+// ZERO for http forever now EXISTS) and NO incident opens; confirmation FAIL → the incident opens as today.
+nodeTest('HTTP confirmation PASS → superseded (flap signal exists), FAIL → incident opens', { skip: SKIP }, async () => {
+  const passing = await makeCheck('__confirm_http_pass__', 'http');
+  const failing = await makeCheck('__confirm_http_fail__', 'http');
+  try {
+    const orig1 = await seedRun(passing.id, 'error');
+    const conf1 = await seedRun(passing.id, 'pass', orig1.id);
+    await applyRunSideEffects(passing, conf1, { sandbox: false, alreadyFailing: false, confirmationOfRunId: orig1.id });
+    assert.equal(await supersededBy(orig1.id), conf1.id, 'transient http original marked superseded by its confirmation');
+    assert.equal(await openIncidentCount(passing.id), 0, 'a confirmed-transient http failure opens NO incident');
+
+    const orig2 = await seedRun(failing.id, 'error');
+    const conf2 = await seedRun(failing.id, 'error', orig2.id);
+    await applyRunSideEffects(failing, conf2, { sandbox: false, alreadyFailing: false, confirmationOfRunId: orig2.id });
+    assert.equal(await openIncidentCount(failing.id), 1, 'a CONFIRMED http failure opens the incident');
+    assert.equal(await supersededBy(orig2.id), null, 'a confirmed http failure is real — the original is NOT superseded');
+    assert.equal(await pendingConfirmations(failing.id), 0, 'a confirmation NEVER enqueues another (D4)');
+  } finally {
+    await pool.query(`DELETE FROM checks WHERE id = ANY($1::bigint[])`, [[passing.id, failing.id]]);
+  }
+});
+
+// D5 (the cost guard — has teeth for http: the kitting APIs fail 150-290×/month) + D6 (sandbox), for HTTP and
+// browser alike: an already-failing or sandbox run enqueues NOTHING. Without D5, a constantly-failing http check
+// would enqueue a confirmation on EVERY tick — doubling its cost forever.
+nodeTest('D5 already-failing + D6 sandbox suppress the confirmation for HTTP and browser', { skip: SKIP }, async () => {
+  const http = await makeCheck('__confirm_http_d5__', 'http');
+  const browser = await makeCheck('__confirm_browser_d5__', 'browser');
+  try {
+    // ★ D5 for the NEW kind: already-failing http → straight to evaluate, NO confirmation (bounds the 2× cost).
+    const r1 = await seedRun(http.id, 'error');
+    await applyRunSideEffects(http, r1, { sandbox: false, alreadyFailing: true, confirmationOfRunId: null });
+    assert.equal(await pendingConfirmations(http.id), 0, 'D5: an already-failing http check does NOT enqueue a confirmation');
+    assert.equal(await openIncidentCount(http.id), 1, 'D5: an already-failing http failure opens the incident immediately');
+
+    // ★ D6 for the new kind: a sandbox http run enqueues nothing (early return, before the confirm branch).
+    const r2 = await seedRun(http.id, 'error');
+    await applyRunSideEffects(http, r2, { sandbox: true, alreadyFailing: false, confirmationOfRunId: null });
+    assert.equal(await pendingConfirmations(http.id), 0, 'D6: a sandbox http run enqueues no confirmation');
+
+    // browser unchanged (the proven path): already-failing → no confirmation, incident opens.
+    const r3 = await seedRun(browser.id, 'fail');
+    await applyRunSideEffects(browser, r3, { sandbox: false, alreadyFailing: true, confirmationOfRunId: null });
+    assert.equal(await pendingConfirmations(browser.id), 0, 'D5 browser unchanged');
+    assert.equal(await openIncidentCount(browser.id), 1, 'D5 browser unchanged');
+  } finally {
+    await pool.query(`DELETE FROM checks WHERE id = ANY($1::bigint[])`, [[http.id, browser.id]]);
   }
 });
 
@@ -151,6 +190,27 @@ nodeTest('rollup down_count EXCLUDES a superseded transient', { skip: SKIP }, as
       `SELECT down_count, up_count FROM daily_check_rollup WHERE check_id = $1 AND day = $2`, [check.id, day]);
     assert.equal(rows[0].down_count, 0, 'the superseded transient must NOT count as down');
     assert.equal(rows[0].up_count, 1, 'only the passing confirmation counts as up');
+  } finally {
+    await pool.query(`DELETE FROM checks WHERE id = $1`, [check.id]);
+  }
+});
+
+// ★ READ-SIDE, for HTTP: the rollup exclusion is kind-agnostic (it filters superseded_by_run_id IS NULL, no
+// kind gate — same as sla_availability / slo_status / aggregateVerdict / status-page), so an http superseded
+// transient is excluded from availability exactly like a browser one. Measured for http, as #278 did for browser.
+nodeTest('rollup down_count EXCLUDES a superseded HTTP transient (read-side is kind-agnostic)', { skip: SKIP }, async () => {
+  const check = await makeCheck('__confirm_rollup_http__', 'http');
+  try {
+    const original = await seedRun(check.id, 'error');
+    const confirmation = await seedRun(check.id, 'pass', original.id);
+    await pool.query(`UPDATE runs SET superseded_by_run_id = $2 WHERE id = $1`, [original.id, confirmation.id]);
+
+    const day = new Date().toISOString().slice(0, 10);
+    await computeRollupForDay(check.id, day);
+    const { rows } = await pool.query<{ down_count: number; up_count: number }>(
+      `SELECT down_count, up_count FROM daily_check_rollup WHERE check_id = $1 AND day = $2`, [check.id, day]);
+    assert.equal(rows[0].down_count, 0, 'the superseded http transient must NOT count as down');
+    assert.equal(rows[0].up_count, 1, 'only the passing http confirmation counts as up');
   } finally {
     await pool.query(`DELETE FROM checks WHERE id = $1`, [check.id]);
   }

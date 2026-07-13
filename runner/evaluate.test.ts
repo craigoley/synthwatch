@@ -128,19 +128,19 @@ test('B1 silent-null: a healthy captured LCP within budget → PASS; over budget
   assert.equal(perfBudgetVerdict(c, 'pass', metrics({ lcpMs: 4000 }), false, 'default').status, 'warn');
 });
 
-// ── confirm-by-rerun deferral decision (0077, pure) ─────────────────────────────────────────────
-// A healthy browser/multistep failure DEFERS to a fresh-execution confirmation; everything else does not.
-test('shouldConfirmByRerun: healthy browser/multistep fail or error → DEFER', () => {
-  for (const kind of ['browser', 'multistep'] as const) {
+// ── confirm-by-rerun deferral decision (0077, extended, pure) ─────────────────────────────────────
+// A healthy failure of ANY confirm-eligible kind DEFERS to a confirmation; everything else does not.
+test('shouldConfirmByRerun: healthy fail/error of EVERY kind → DEFER (http/ssl/dns no longer excluded)', () => {
+  for (const kind of ['browser', 'multistep', 'http', 'ssl', 'dns', 'tcp', 'ping'] as const) {
     for (const status of ['fail', 'error']) {
-      assert.equal(shouldConfirmByRerun(check({ kind }), status, false), true, `${kind}/${status}`);
+      assert.equal(shouldConfirmByRerun(check({ kind }), status, false), true, `${kind}/${status} must DEFER`);
     }
   }
 });
-test('shouldConfirmByRerun: NOT for pass/warn, NOT for http/ssl, NOT when already-failing (D2/D5)', () => {
+test('shouldConfirmByRerun: NOT for pass/warn/infra_error, NOT when already-failing (D5) — for http too', () => {
   assert.equal(shouldConfirmByRerun(check({ kind: 'browser' }), 'pass', false), false);
-  assert.equal(shouldConfirmByRerun(check({ kind: 'browser' }), 'warn', false), false);
-  assert.equal(shouldConfirmByRerun(check({ kind: 'browser' }), 'infra_error', false), false);
-  assert.equal(shouldConfirmByRerun(check({ kind: 'http' }), 'fail', false), false); // in-run retry keeps http
-  assert.equal(shouldConfirmByRerun(check({ kind: 'browser' }), 'fail', true), false); // already-failing → immediate
+  assert.equal(shouldConfirmByRerun(check({ kind: 'http' }), 'warn', false), false);
+  assert.equal(shouldConfirmByRerun(check({ kind: 'http' }), 'infra_error', false), false); // not a site outage
+  assert.equal(shouldConfirmByRerun(check({ kind: 'http' }), 'fail', true), false); // ★ D5: already-failing http → immediate, no confirm
+  assert.equal(shouldConfirmByRerun(check({ kind: 'browser' }), 'fail', true), false); // D5 browser unchanged
 });
