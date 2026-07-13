@@ -11,7 +11,7 @@ import { pool, type Check, type RunRecord, type TerminalStatus } from './db.js';
 import type { RunMetrics } from './metrics.js';
 import { dispatchAlerts, resolveChannels } from './alerts.js';
 import { rcaEnabled, runRca } from './rca.js';
-import { confirmByRerunEligible } from './retry.js';
+import { confirmByRerunEligible, usesDedicatedExecution } from './retry.js';
 import { fireRunnerJobStart } from './jobTrigger.js';
 
 interface OpenIncident {
@@ -938,11 +938,15 @@ export function shouldConfirmByRerun(check: Check, status: string, alreadyFailin
 }
 
 /**
- * Enqueue ONE confirmation run for a just-failed scheduled check + fire a dedicated fresh execution (0077).
- * The run_requests INSERT is the DURABLE enqueue (the one-pending-per-check partial unique index coalesces, so
- * a concurrent enqueue is a safe no-op); ARM jobs/start is the immediacy optimization (best-effort — the next
- * cron tick drains the pending request if it fails). The confirmation, when drained, links back to the original
- * via drainRunRequests's "latest awaiting original" lookup.
+ * Enqueue ONE confirmation run for a just-failed scheduled check (0077). The run_requests INSERT is the DURABLE
+ * enqueue (the one-pending-per-check partial unique index coalesces, so a concurrent enqueue is a safe no-op);
+ * the confirmation, when drained, links back to the original via drainRunRequests's "latest awaiting original".
+ *
+ * ★ Two confirmation mechanisms (usesDedicatedExecution): browser/multistep fire an ARM jobs/start for a
+ * DEDICATED fresh execution (immediacy — they can't ride a shared tick's budget and may be on long intervals).
+ * Cheap sub-second kinds (http/ssl/dns/tcp/ping) SKIP jobs/start and let the next 5-minute cron tick's drain run the
+ * confirmation — no dedicated pod (a fresh ~10-30 s pod for a ~200 ms check is ~98% overhead). The enqueue is
+ * identical either way; only the "fire it now vs let the next tick drain it" step differs.
  */
 async function enqueueConfirmationRun(check: Check, run: RunRecord): Promise<void> {
   await pool.query(
@@ -950,11 +954,15 @@ async function enqueueConfirmationRun(check: Check, run: RunRecord): Promise<voi
        ON CONFLICT (check_id) WHERE status = 'pending' DO NOTHING`,
     [check.id],
   );
+  const dedicated = usesDedicatedExecution(check.kind);
   console.log(
     `[confirm] check ${check.id} "${check.name}" down (${run.status}) on run ${run.id} — enqueued a confirmation ` +
-      `run (fresh execution); evaluate() DEFERRED until it settles. The failed run is visible, awaiting confirmation.`,
+      `run (${dedicated ? 'dedicated fresh execution' : 'next-tick drain, no dedicated pod'}); evaluate() DEFERRED ` +
+      `until it settles. The failed run is visible, awaiting confirmation.`,
   );
-  await fireRunnerJobStart().catch((err) =>
-    console.warn('[confirm] jobs/start failed (non-fatal; the next cron tick drains the pending confirmation):', err),
-  );
+  if (dedicated) {
+    await fireRunnerJobStart().catch((err) =>
+      console.warn('[confirm] jobs/start failed (non-fatal; the next cron tick drains the pending confirmation):', err),
+    );
+  }
 }

@@ -42,20 +42,50 @@ export function effectiveRetries(
   sandbox = false,
   confirmByRerun = false,
 ): number {
-  // ★ CONFIRM-BY-RERUN (0077, D2/D6): browser/multistep checks confirm a failure in a FRESH ACA execution
-  // (fresh 660s) rather than an in-run loop — 3 × ~5-min attempts in ONE execution blew the replicaTimeout
-  // into a strand. So the in-run fast-retry is OFF for those kinds (retries → 0, one honest attempt); the
-  // confirmation IS the retry. In-run fast-retry stays for cheap http/net/ssl checks (their budget fits in
-  // seconds — spinning a whole new pod would be wasteful).
+  // ★ CONFIRM-BY-RERUN (0077, D2): a confirm-eligible kind confirms a failure with a SEPARATE run (a fresh ACA
+  // execution for browser/multistep; the next cron tick's drain for cheap kinds — see confirmByRerunEligible +
+  // usesDedicatedExecution), NOT an in-run loop. So the in-run fast-retry is OFF for those kinds (retries → 0,
+  // one honest attempt); the CONFIRMATION is the retry. Keeping BOTH would double-confirm (an in-run retry AND
+  // a rerun). This is the ONE retries→0 rule — every confirm-eligible kind rides it (no parallel mechanism).
   return alreadyFailing || sandbox || confirmByRerun ? 0 : retries;
 }
 
 /**
- * Confirm-by-rerun eligibility (0077, D2). A failed SCHEDULED run of these kinds enqueues ONE confirmation run
- * in a fresh execution instead of retrying in-run. Browser + multistep are the expensive, transient-prone,
- * budget-blowing flows; cheap kinds (http/ssl/dns/tcp/ping) keep the in-run fast-retry (see effectiveRetries).
+ * Confirm-by-rerun eligibility (0077, extended). A failed SCHEDULED run of an eligible kind confirms via ONE
+ * separate run instead of retrying in-run — so EVERY check gets a flakiness signal (runs.superseded_by_run_id).
+ *
+ * ★ Originally browser/multistep ONLY (D2), which left http/dns/ssl STRUCTURALLY flap-blind: in 90 days they
+ * logged ZERO superseded transients — not "few", impossible — so any flake budget built on that would hand them
+ * a vacuously-perfect "0% flake" (a NEW vacuous-green, the anti-pattern this platform refuses). D2's exclusion
+ * argued against the COST of a fresh POD for a 2-second check — NOT against confirmation. A rerun of a ~200ms
+ * http check is seconds, and cheap kinds don't even need a pod (they ride the next-tick drain — see
+ * usesDedicatedExecution), so the expensive-flow reasoning simply doesn't apply. Every kind is eligible.
+ * (An allowlist, not `return true`: a FUTURE expensive kind should be a deliberate decision, not a default.)
  */
 export function confirmByRerunEligible(kind: string): boolean {
+  return (
+    kind === 'browser' ||
+    kind === 'multistep' ||
+    kind === 'http' ||
+    kind === 'ssl' ||
+    kind === 'dns' ||
+    kind === 'tcp' ||
+    kind === 'ping'
+  );
+}
+
+/**
+ * How a confirm-eligible kind runs its confirmation:
+ *   • DEDICATED fresh execution (ARM jobs/start) — browser/multistep. Their 3×~5-min budget can't ride a shared
+ *     tick (the strand 0077 fixed), and they may be on long intervals, so waiting for the next scheduled tick is
+ *     too slow — a fresh execution starts within seconds.
+ *   • NEXT-TICK DRAIN (no dedicated pod) — cheap sub-second kinds (http/ssl/dns/tcp/ping). The runner's 5-minute
+ *     cron drains pending run_requests at the START of every tick (index.ts), so the confirmation runs within ≤5 min
+ *     with ZERO extra pods. A fresh pod (~10-30 s startup) for a ~200 ms check is ~98% pod overhead — wildly
+ *     disproportionate, and the sequential-budget problem that FORCED a fresh execution for browser (3×5 min >
+ *     660 s replicaTimeout) does not exist for a sub-second check. Measured p50: http 216 ms, dns 39 ms, ssl 78 ms.
+ */
+export function usesDedicatedExecution(kind: string): boolean {
   return kind === 'browser' || kind === 'multistep';
 }
 

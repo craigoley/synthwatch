@@ -4,7 +4,7 @@
 // so a retried-away 'fail' is discarded identically to a retried-away 'error'.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { runWithRetry, effectiveRetries, confirmByRerunEligible } from './retry.js';
+import { runWithRetry, effectiveRetries, confirmByRerunEligible, usesDedicatedExecution } from './retry.js';
 
 type R = { status: string; attempt: number };
 
@@ -121,17 +121,30 @@ test('effectiveRetries: non-sandbox is UNCHANGED (default arg = full retry prese
   assert.equal(effectiveRetries(2, false, false), 2);
 });
 
-// ── confirm-by-rerun (0077): browser/multistep confirm a failure in a FRESH execution, so their IN-RUN
-// fast-retry is OFF (retries → 0). The confirmation IS the retry — this is what stops the 3×5-min strand.
+// ── confirm-by-rerun (0077, extended): a confirm-eligible kind confirms a failure with a SEPARATE run, so its
+// IN-RUN fast-retry is OFF (retries → 0) — the confirmation IS the retry (never both = double-confirm).
 test('effectiveRetries: confirmByRerun forces 0 retries (confirm-eligible kind → single in-run attempt)', () => {
-  assert.equal(effectiveRetries(2, false, false, true), 0); // browser/multistep → 1 attempt, confirm by re-run
+  assert.equal(effectiveRetries(2, false, false, true), 0); // confirm-eligible → 1 attempt, confirm by re-run
   assert.equal(effectiveRetries(2, false, true, false), 0); // still 0 when only sandbox is set
-  assert.equal(effectiveRetries(2, false, false, false), 2); // http/net/ssl keep the in-run fast-retry
+  assert.equal(effectiveRetries(2, false, false, false), 2); // a NON-confirm-eligible caller keeps in-run retry
 });
-test('confirmByRerunEligible: browser + multistep only', () => {
-  assert.equal(confirmByRerunEligible('browser'), true);
-  assert.equal(confirmByRerunEligible('multistep'), true);
-  for (const k of ['http', 'ssl', 'dns', 'tcp', 'ping']) assert.equal(confirmByRerunEligible(k), false);
+
+// ★★ MUST-GO-RED (the whole point): EVERY kind is confirm-eligible now — no kind is structurally flap-blind.
+// Before, http/ssl/dns/tcp/ping returned FALSE → they never produced a superseded transient → a vacuous "0% flake".
+test('confirmByRerunEligible: EVERY check kind is eligible (no flap-blind kind → no vacuous-green)', () => {
+  for (const k of ['browser', 'multistep', 'http', 'ssl', 'dns', 'tcp', 'ping']) {
+    assert.equal(confirmByRerunEligible(k), true, `${k} must be confirm-eligible`);
+  }
+});
+
+// The confirmation MECHANISM differs by cost: browser/multistep get a dedicated fresh execution (jobs/start);
+// cheap sub-second kinds ride the next cron tick's drain (no dedicated pod). Reverting either flips this.
+test('usesDedicatedExecution: only the expensive flows fire a dedicated execution; cheap kinds drain next-tick', () => {
+  assert.equal(usesDedicatedExecution('browser'), true);
+  assert.equal(usesDedicatedExecution('multistep'), true);
+  for (const k of ['http', 'ssl', 'dns', 'tcp', 'ping']) {
+    assert.equal(usesDedicatedExecution(k), false, `${k} must confirm via the next-tick drain, not a dedicated pod`);
+  }
 });
 
 // ── retry_count telemetry (0048): `attempts` = how many tries to reach the verdict ──────────────
