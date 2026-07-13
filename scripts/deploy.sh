@@ -81,15 +81,66 @@ readonly ROOT
 # --help / -h is READ-ONLY — skip the sync entirely (no fetch, no tree mutation, no re-exec) so a docs lookup
 # never touches the network or the working tree. --what-if-only DOES sync (it previews a real deploy, so it
 # should run the CURRENT classifier logic). This runs before arg parsing, so match the raw args.
+# Is the CURRENT branch fully merged into origin/main — i.e. is there NOTHING to lose by switching to main?
+# Two signals, because --is-ancestor alone FALSE-NEGATIVES on a squash-merge (the squash is a NEW commit, so
+# the branch tip isn't literally an ancestor of origin/main — the worktree recon hit exactly this):
+#   • --is-ancestor HEAD origin/main → every commit is literally upstream (a normal merge / fast-forward).
+#   • else `git cherry` PATCH-equivalence: it prints every commit not yet upstream with a leading '+'. NO '+'
+#     line ⟹ every commit's PATCH is already in origin/main (a squash-merged linear branch) ⟹ nothing to lose;
+#     ANY '+' ⟹ a commit whose patch is absent upstream = real unmerged/unpushed WORK → NOT safe.
+# Caller guarantees a clean tree + a resolvable origin/main. ★ When in doubt, return non-zero (REFUSE): a false
+# "safe" that discards work is far worse than a false refusal. The `git cherry` result is captured to a var and
+# matched with a here-string (NOT a pipe) so there is no upstream writer to SIGPIPE under pipefail (#279/#283).
+_branch_fully_merged() {
+  local _root="$1" _cherry
+  git -C "${_root}" merge-base --is-ancestor HEAD origin/main 2>/dev/null && return 0
+  _cherry="$(git -C "${_root}" cherry origin/main HEAD 2>/dev/null)" || return 1
+  if grep -q '^+' <<<"${_cherry}"; then return 1; fi  # a '+' line = an unmerged commit → NOT fully merged
+  return 0
+}
+
 if [[ -z "${SYNTHWATCH_DEPLOY_SYNCED:-}" && " $* " != *" --help "* && " $* " != *" -h "* ]]; then
   _branch="$(git -C "${ROOT}" symbolic-ref --quiet --short HEAD || echo '(detached)')"
-  if [[ "${_branch}" != "main" ]]; then
-    echo "deploy.sh: refusing to run on branch '${_branch}', not 'main'. deploy.sh fast-forwards the tree to" >&2
-    echo "  origin/main at start and will NOT reset your branch. Run 'git checkout main', then re-run." >&2
-    exit 1
-  fi
+  # Fetch FIRST — origin/main must be current both to evaluate "is this branch fully merged?" below AND for the
+  # on-main fast-forward that follows. A fetch on a path that ends up refusing is harmless (read-only).
   git -C "${ROOT}" fetch --quiet origin 2>/dev/null \
     || echo "deploy.sh: WARN 'git fetch origin' failed — proceeding against the last-fetched origin/main." >&2
+  if [[ "${_branch}" != "main" ]]; then
+    # Not on main. deploy.sh fast-forwards the tree to origin/main and re-execs, so it must NEVER strand work
+    # you'd lose by leaving this branch. But a leftover retro/feature branch that is CLEAN and FULLY MERGED has
+    # nothing to lose — refusing there is pure friction (the same class #273 removed by self-syncing main). So:
+    # clean AND fully-merged → auto-checkout main and proceed; dirty OR unmerged/unpushed → REFUSE (as before).
+    # "Dirty" = uncommitted changes to TRACKED files (untracked scratch survives a checkout, so it doesn't count).
+    _dirty="$(git -C "${ROOT}" status --porcelain --untracked-files=no 2>/dev/null)"
+    _om="$(git -C "${ROOT}" rev-parse origin/main 2>/dev/null || true)"
+    if [[ -n "${_dirty}" ]]; then
+      echo "deploy.sh: refusing to run on branch '${_branch}', not 'main' — it has UNCOMMITTED changes to tracked" >&2
+      echo "  files (real work at risk; switching to main would strand them). Commit or stash, then re-run:" >&2
+      echo "    git stash   (or git commit)   &&   ./scripts/deploy.sh" >&2
+      exit 1
+    elif [[ -z "${_om}" ]]; then
+      # origin/main unresolvable (never fetched / offline first run) — can't PROVE the branch is merged.
+      echo "deploy.sh: refusing to run on branch '${_branch}', not 'main' — cannot resolve origin/main to verify" >&2
+      echo "  it is fully merged (fetch may have failed). Run 'git checkout main', then re-run." >&2
+      exit 1
+    elif _branch_fully_merged "${ROOT}"; then
+      # Clean AND every commit already in origin/main (normal merge/ff via --is-ancestor, OR a squash-merge
+      # caught by patch-equivalence). Nothing to lose → switch to main.
+      git -C "${ROOT}" checkout --quiet main \
+        || { echo "deploy.sh: 'git checkout main' failed — aborting rather than deploy from '${_branch}'." >&2; exit 1; }
+      echo "deploy.sh: branch '${_branch}' is clean and fully merged into origin/main — switched to main." >&2
+      # Re-exec so we run MAIN's deploy.sh: this process parsed the branch's (merged, possibly older) copy into
+      # memory, and a mid-run checkout can't replace it — the same reason the fast-forward path re-execs (#273).
+      # Do NOT set SYNTHWATCH_DEPLOY_SYNCED — the fresh process is now on main and runs the normal fetch +
+      # fast-forward path from the top (which will pull main up to origin/main and re-exec once more if behind).
+      exec bash "${ROOT}/scripts/deploy.sh" "$@"
+    else
+      echo "deploy.sh: refusing to run on branch '${_branch}', not 'main' — it has commit(s) NOT in origin/main" >&2
+      echo "  (unpushed/unmerged work at risk). deploy.sh will NOT reset your branch. Push/merge it first, or run" >&2
+      echo "  'git checkout main', then re-run." >&2
+      exit 1
+    fi
+  fi
   _origin="$(git -C "${ROOT}" rev-parse origin/main 2>/dev/null || true)"
   _local="$(git -C "${ROOT}" rev-parse HEAD 2>/dev/null || true)"
   if [[ -n "${_origin}" && "${_local}" != "${_origin}" ]]; then

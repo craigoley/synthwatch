@@ -484,18 +484,32 @@ template_declares_cors() {
 }
 
 # ── start-of-run tree-sync policy (concern: run current logic by construction) ─────────────────────────────
-# tree_sync_decision <branch> <local_sha> <origin_sha> <is_ancestor 0|1> <dirty 0|1> : the PURE policy the
-# START-OF-RUN SYNC block in deploy.sh implements — kept here so it's unit-tested (the block computes the git
-# facts + acts; this decides). Prints exactly one verdict:
-#   not-main  → the checkout isn't on 'main'                          → ABORT (never reset a feature branch)
+# tree_sync_decision <branch> <local_sha> <origin_sha> <is_ancestor 0|1> <dirty 0|1> [merged 0|1] : the PURE
+# policy the START-OF-RUN SYNC block in deploy.sh implements — kept here so it's unit-tested (the block computes
+# the git facts + acts; this decides). Prints exactly one verdict:
+#   ── NOT on main (leftover retro/feature branch): switch iff there's NOTHING to lose, else refuse ──
+#   not-main-dirty     → uncommitted TRACKED changes            → ABORT (switching to main would strand work)
+#   not-main-unverified→ origin/main unresolvable (fetch failed)→ ABORT (can't PROVE it's merged — when in doubt)
+#   switch-main        → clean AND fully merged into origin/main→ auto-checkout main + re-exec (nothing to lose)
+#   not-main-unmerged  → clean but has commit(s) NOT upstream   → ABORT (unpushed/unmerged work at risk)
+#   ── on main: the fast-forward self-sync (unchanged) ──
 #   current   → local == origin/main (or origin unresolvable)         → proceed as-is
 #   ff        → local is strictly BEHIND origin/main + tree clean      → fast-forward (reset --hard) + re-exec
 #   dirty     → behind, but uncommitted TRACKED changes               → ABORT (fast-forward would discard work)
 #   diverged  → local has commit(s) NOT on origin (ahead/squash-left) → proceed, NEVER auto-reset (preserve work)
 # is_ancestor = 1 iff local_sha is an ancestor-or-equal of origin_sha (git merge-base --is-ancestor).
+# merged (not-main only) = 1 iff the branch is fully merged into origin/main — HEAD reachable from origin/main
+#   (normal merge/ff) OR every commit patch-equivalent upstream (a squash-merge, which --is-ancestor misses).
+#   deploy.sh derives it from `--is-ancestor HEAD origin/main` OR a `git cherry` with no '+' line. Defaults 0
+#   (the safe default: refuse rather than switch) so a caller that omits it never mistakenly auto-switches.
 tree_sync_decision() {
-  local branch="$1" lsha="$2" osha="$3" is_anc="$4" dirty="$5"
-  [[ "${branch}" != "main" ]] && { echo "not-main"; return; }
+  local branch="$1" lsha="$2" osha="$3" is_anc="$4" dirty="$5" merged="${6:-0}"
+  if [[ "${branch}" != "main" ]]; then
+    [[ "${dirty}" == "1" ]] && { echo "not-main-dirty"; return; }        # real uncommitted work → refuse first
+    [[ -z "${osha}" ]] && { echo "not-main-unverified"; return; }        # can't confirm merged → refuse
+    [[ "${merged}" == "1" ]] && { echo "switch-main"; return; }          # clean + fully merged → auto-switch
+    echo "not-main-unmerged"; return                                     # clean but unmerged commits → refuse
+  fi
   [[ -z "${osha}" || "${lsha}" == "${osha}" ]] && { echo "current"; return; }
   if [[ "${is_anc}" == "1" ]]; then
     [[ "${dirty}" == "1" ]] && { echo "dirty"; return; }
