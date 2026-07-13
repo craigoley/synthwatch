@@ -710,7 +710,7 @@ async function runOneInner(
     try {
       // Extract trace_signals from the local zip while it's in hand. For a sensitive monitor the
       // redactor scrubs network URLs + console (session tokens / declared values) BEFORE persist.
-      const signals = extractTraceSignals(outcome.tracePath, check.target_url, redact);
+      const signals = await extractTraceSignals(outcome.tracePath, check.target_url, redact);
       if (signals) traceSignalsJson = JSON.stringify(signals);
     } catch (err) {
       console.warn(`[runner] run ${runId} trace-signals extraction skipped (non-fatal):`, err);

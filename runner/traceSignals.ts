@@ -7,7 +7,7 @@
 //   SAME console filter + extension denylist, SAME caps, SAME camelCase wire shape. The persisted JSON MUST
 //   match what GetTraceSignals returns so trace-diff + ai-insights agree on one schema. Do NOT diverge here;
 //   change both sides together. Pure + non-fatal: a missing entry / unparseable line yields an empty section.
-import AdmZip from 'adm-zip';
+import yauzl from 'yauzl';
 import { type Redactor, IDENTITY_REDACTOR } from './redact.js';
 import { isFirstParty } from './firstPartyHosts.js';
 
@@ -104,35 +104,93 @@ const UNCOMPRESSED_MIN_BYTES = 30_000;
 // ★ Hard cap on console messages so a pathological trace can't blow the downstream AOAI token budget.
 const MAX_CONSOLE_MESSAGES = 40;
 
+// The only two entries we read; everything else in the zip (the screencast resources/*.jpeg bulk) is skipped.
+const TRACE_NETWORK = 'trace.network';
+const TRACE_TRACE = 'trace.trace';
+
 /**
- * Open the trace zip + extract both sections. Non-fatal: a bad/locked zip → null (so trace_signals stays
- * null). A valid zip with no notable signals → a well-shaped, mostly-empty object (0 errors IS a signal).
- * Only reads the two small NDJSON entries (trace.network, trace.trace) — NOT the multi-MB resources/.
+ * Open the trace zip + extract both sections. Returns null when the zip is a VALID zip that simply isn't a
+ * Playwright trace (neither NDJSON entry present) — a legitimate, quiet outcome. A valid zip with no notable
+ * signals → a well-shaped, mostly-empty object (0 errors IS a signal).
+ *
+ * ★ STREAMING (was in-memory AdmZip): a long browser flow's trace is large, and `new AdmZip(zipPath)`
+ * `readFileSync`s the ENTIRE zip — screencast jpegs included — into a Buffer before reading a single entry.
+ * That was the peak, and it ran on EVERY traced run (before the streamed redacted-zip rebuild), stranding
+ * run #936920 (exit 137) once check 355's 5-min shop flow produced a ~124MB trace. This mirrors
+ * buildRedactedTraceZip (yauzl, #253): the zip is walked one entry at a time (lazyEntries); the two small
+ * NDJSON entries are the ONLY ones ever opened + decompressed, and each is turned into its compact summary
+ * and DROPPED the instant its stream ends — so peak memory is bounded to the LARGER of the two text entries,
+ * NOT the whole trace / the screencast bulk. Everything else is skipped WITHOUT a read stream (never
+ * decompressed). The extracted signals are BYTE-IDENTICAL to the AdmZip path (same Buffer→utf8 of the same
+ * two entries, same extractNetwork/extractConsole) — the golden-parity test is the byte contract.
+ *
+ * ★ FAIL LOUD, never silently empty: a corrupt / truncated / unreadable zip REJECTS with a clear error (the
+ * caller logs it, non-fatal, and trace_signals stays null) rather than resolving an all-zeros summary that
+ * would look like a successful empty extraction. Only a cleanly-read zip missing both entries resolves null.
  */
 export function extractTraceSignals(
   zipPath: string,
   targetUrl: string | null,
   redact: Redactor = IDENTITY_REDACTOR,
-): TraceSignals | null {
+): Promise<TraceSignals | null> {
   const targetHost = hostOf(targetUrl ?? '') || null;
-  try {
-    const zip = new AdmZip(zipPath);
-    const networkNdjson = entryText(zip, 'trace.network');
-    const traceNdjson = entryText(zip, 'trace.trace');
-    if (networkNdjson === null && traceNdjson === null) return null; // not a Playwright trace
-    return {
-      targetHost,
-      network: networkNdjson !== null ? extractNetwork(networkNdjson, targetHost) : EMPTY_NETWORK,
-      console: traceNdjson !== null ? extractConsole(traceNdjson, targetHost, redact) : EMPTY_CONSOLE,
+  return new Promise<TraceSignals | null>((resolve, reject) => {
+    let settled = false;
+    const fail = (err: Error, zip?: yauzl.ZipFile): void => {
+      if (settled) return;
+      settled = true;
+      try {
+        zip?.close();
+      } catch {
+        /* ignore */
+      }
+      reject(err); // LOUD: corrupt/unreadable zip — the caller warns + leaves trace_signals null.
     };
-  } catch {
-    return null; // bad zip / read error — non-fatal
-  }
-}
 
-function entryText(zip: AdmZip, name: string): string | null {
-  const e = zip.getEntry(name);
-  return e ? e.getData().toString('utf8') : null;
+    // Compact summaries, built + retained; the raw NDJSON text of each entry is dropped as soon as its
+    // extractor runs (below), so we never hold both raw texts — peak stays bounded to one entry.
+    let network: NetworkSummary | null = null;
+    let consoleSummary: ConsoleSummary | null = null;
+
+    yauzl.open(zipPath, { lazyEntries: true, autoClose: true }, (openErr, zip) => {
+      if (openErr || !zip) return fail(openErr ?? new Error(`trace zip unreadable: ${zipPath}`));
+
+      zip.on('error', (err: Error) => fail(err, zip));
+      zip.on('entry', (entry: yauzl.Entry) => {
+        const name = entry.fileName;
+        if (name !== TRACE_NETWORK && name !== TRACE_TRACE) {
+          zip.readEntry(); // skip WITHOUT opening a read stream — the jpeg bulk is never decompressed.
+          return;
+        }
+        zip.openReadStream(entry, (streamErr, rs) => {
+          if (streamErr || !rs) return fail(streamErr ?? new Error(`cannot read ${name} in ${zipPath}`), zip);
+          const chunks: Buffer[] = [];
+          rs.on('error', (err: Error) => fail(err, zip));
+          rs.on('data', (c: Buffer) => chunks.push(c));
+          rs.on('end', () => {
+            if (settled) return;
+            // Whole-entry decode (identical bytes to AdmZip getData().toString('utf8')), then run the
+            // extractor NOW and let the raw text + chunks go out of scope — only the compact summary survives.
+            const text = Buffer.concat(chunks).toString('utf8');
+            if (name === TRACE_NETWORK) network = extractNetwork(text, targetHost);
+            else consoleSummary = extractConsole(text, targetHost, redact);
+            zip.readEntry();
+          });
+        });
+      });
+      zip.on('end', () => {
+        if (settled) return;
+        settled = true;
+        if (network === null && consoleSummary === null) {
+          resolve(null); // valid zip, neither entry — not a Playwright trace (quiet, legitimate).
+          return;
+        }
+        resolve({ targetHost, network: network ?? EMPTY_NETWORK, console: consoleSummary ?? EMPTY_CONSOLE });
+      });
+
+      zip.readEntry(); // kick off the lazy walk
+    });
+  });
 }
 
 // ── network ───────────────────────────────────────────────────────────────────────────────────────────────
