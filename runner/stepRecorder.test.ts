@@ -61,3 +61,51 @@ test('a non-sensitive monitor persists the REAL per-step error (byte-for-byte un
   );
   assert.equal(steps[0].errorMessage, 'boom detail');
 });
+
+// ★★ THE LOAD-BEARING INVARIANT: the tracing-group instrumentation must NEVER fail the step it observes. A
+// page whose tracing.group()/groupEnd() THROW must not change the step's verdict — a green step stays green,
+// a red step reports the BODY's failure (never the tracing error). "If tracing.group started throwing tomorrow,
+// would any check go RED?" → NO, proven here.
+function throwingTracePage(): Page {
+  const tracing = {
+    group: async () => {
+      throw new Error('tracing.group boom');
+    },
+    groupEnd: async () => {
+      throw new Error('tracing.groupEnd boom');
+    },
+  };
+  return { context: () => ({ tracing }) } as unknown as Page;
+}
+function recorderWithPage(page: Page): { rec: StepRecorder; steps: RecordedStep[] } {
+  const steps: RecordedStep[] = [];
+  const rec = new StepRecorder(1, page, 'about:blank', async (s) => { steps.push(s); }, async () => {}, IDENTITY_REDACTOR);
+  return { rec, steps };
+}
+
+test('★ instrumentation never fails a PASS: throwing tracing.group + groupEnd leave a green step green', async () => {
+  const { rec, steps } = recorderWithPage(throwingTracePage());
+  const result = await rec.step('ok-step', async () => 'RESULT'); // must NOT throw despite tracing throwing
+  assert.equal(result, 'RESULT');
+  assert.equal(steps.length, 1);
+  assert.equal(steps[0].status, 'pass');
+});
+
+test('★ instrumentation never MASKS a real failure: a failing step rethrows the BODY error, not the tracing error', async () => {
+  const { rec, steps } = recorderWithPage(throwingTracePage());
+  await assert.rejects(
+    () => rec.step('bad-step', async () => { throw new ExpectationError('the REAL failure'); }),
+    (e: Error) => e.message === 'the REAL failure', // ← the body's error, NOT 'tracing.group boom'
+  );
+  assert.equal(steps[0].status, 'fail');
+  assert.equal(steps[0].errorMessage, 'the REAL failure');
+});
+
+// The no-page case (a future non-browser recorder) is a silent no-op — the existing `recorder()` helper builds
+// with a null page, so every test above already exercises `this.page?.…` short-circuiting without a throw.
+test('★ no-page recorder: group() is a silent no-op (the step runs normally)', async () => {
+  const { rec, steps } = recorder(IDENTITY_REDACTOR); // null page
+  const r = await rec.step('nop', async () => 42);
+  assert.equal(r, 42);
+  assert.equal(steps[0].status, 'pass');
+});
