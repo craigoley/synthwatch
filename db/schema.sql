@@ -828,6 +828,21 @@ COMMIT;
 
 BEGIN;
 
+-- ★ countable_run (0081): the ONE canonical "countable scheduled observation" — a real-result,
+-- non-superseded, non-confirmation, non-sandbox run. Defined before the functions below because SQL-
+-- language function bodies are validated against catalog objects at CREATE time. Consumed by
+-- sla_availability, slo_status (below), daily_check_rollup (runner/rollup.ts), and the incident verdict
+-- (runner/evaluate.ts aggregateVerdict + countConsecutiveDown). ★ flake_status deliberately does NOT
+-- use it — a flap IS a superseded run (see its comment below). Maintenance-window exclusion stays
+-- per-consumer (contextual: run.started_at vs each window's range).
+CREATE OR REPLACE VIEW countable_run AS
+    SELECT *
+      FROM runs
+     WHERE status NOT IN ('running', 'infra_error')
+       AND superseded_by_run_id IS NULL
+       AND confirmation_of_run_id IS NULL
+       AND NOT sandbox;
+
 CREATE OR REPLACE FUNCTION sla_availability(p_from timestamptz, p_to timestamptz)
 RETURNS TABLE (
     check_id         bigint,
@@ -858,17 +873,13 @@ AS $$
             4
         ) AS availability_pct
     FROM checks c
-    LEFT JOIN runs r
+    -- ★ countable_run (0081): status / superseded / confirmation / sandbox are now filtered by the view
+    -- (was an inline `LEFT JOIN runs r … AND NOT r.sandbox AND r.superseded_by_run_id IS NULL`, which
+    -- missed confirmation runs → a confirmed outage double-counted). One canonical predicate now.
+    LEFT JOIN countable_run r
            ON r.check_id   = c.id
           AND r.started_at >= p_from
           AND r.started_at <  p_to
-          -- SANDBOX EXCLUSION (0070): a paused monitor's on-demand validation persists a runs row but
-          -- skipped evaluate() — not a scheduled health signal, so it must never move availability. In the
-          -- JOIN (not a WHERE) so a check whose only window runs are sandbox keeps its LEFT-JOIN null-run row.
-          AND NOT r.sandbox
-          -- SUPERSEDED-TRANSIENT EXCLUSION (0077): a failed run whose confirmation PASSED — it was transient, so
-          -- it must never move availability. Same rail as the sandbox exclusion above.
-          AND r.superseded_by_run_id IS NULL
     -- MAINTENANCE-WINDOW EXCLUSION (additive anti-join, mirrors 0004): drop runs
     -- that fall inside an active window for this check (check_id = c.id) OR a
     -- fleet-wide window (check_id IS NULL). Uncovered runs keep mw.id NULL and
@@ -990,13 +1001,13 @@ AS $$
             count(*) FILTER (WHERE r.status IN ('pass', 'warn', 'fail', 'error')) AS total_runs,
             count(*) FILTER (WHERE r.status IN ('fail', 'error'))                 AS down_runs
         FROM checks c
-        LEFT JOIN runs r
+        -- ★ countable_run (0081): also excludes confirmation runs AND sandbox runs — BOTH were missing
+        -- here (only superseded was excluded), so a confirmed outage double-counted its burn and a paused
+        -- monitor's sandbox run consumed the error budget. slo_status drives paging, so this was the worst.
+        LEFT JOIN countable_run r
                ON r.check_id   = c.id
               AND r.started_at >= p_from
               AND r.started_at <  p_to
-              -- SUPERSEDED-TRANSIENT EXCLUSION (0077): a confirmed-transient failure must not consume the error
-              -- budget (mirror the sla_availability exclusion; the confirmation run is the one that counts).
-              AND r.superseded_by_run_id IS NULL
         LEFT JOIN maintenance_windows mw
                ON (mw.check_id = c.id OR mw.check_id IS NULL)
               AND r.started_at >= mw.starts_at
@@ -1036,6 +1047,9 @@ COMMENT ON FUNCTION slo_status(bigint, timestamptz, timestamptz) IS
 -- indeterminate are surfaced, NEVER consumed. Fleet default 2% via COALESCE; a row for EVERY check (fleet-
 -- default, not opt-in). ★ READ-ONLY — no write path to alerts/routing; a breach surfaces a directed task, never
 -- a mute. (GRANT EXECUTE to "synthwatch-api" via the migration / ops, mirroring slo_status.)
+-- ★ DELIBERATELY NOT a countable_run consumer (0081): the health paths exclude superseded transients, but
+-- here a superseded transient IS the flap being measured (the numerator selects superseded_by_run_id IS NOT
+-- NULL). Feeding it countable_run would zero the numerator and erase the signal. Do NOT "unify" this.
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION flake_status(p_check_id bigint, p_from timestamptz, p_to timestamptz)
 RETURNS TABLE (

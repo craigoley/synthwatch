@@ -424,23 +424,18 @@ async function aggregateVerdict(check: Check): Promise<Verdict> {
        SELECT location, status,
               row_number() OVER (PARTITION BY location ORDER BY started_at DESC) AS rn,
               max(started_at) OVER (PARTITION BY location) AS loc_last
-         FROM runs
-        -- infra_error excluded with running: it's "didn't run", neither up nor down. A
-        -- location producing only infra_error is NOT reporting (can't block OR cause paging).
-        -- ★ SUPERSEDED-TRANSIENT EXCLUSION (0077): a failed run whose confirmation PASSED was transient — it
-        -- must not count toward the failure window (else a self-resolving blip would still open an incident).
-        -- ★ CONFIRMATION EXCLUSION: a confirmation run is a RE-CHECK of a failure ALREADY in this window (the
-        -- scheduled run it confirms) — NOT an independent observation. Counting it double-counts one failure:
-        -- a real outage's [scheduled fail, confirmation fail] would fill a failure_threshold=2 window off ONE
-        -- confirmed scheduled failure, silently ~halving every threshold ≥ 2. The scheduled run stays in the
-        -- window (and, if its confirmation PASSED, is already dropped by the superseded clause above), so the
-        -- window counts exactly "consecutive confirmed SCHEDULED failures" — what failure_threshold has always
-        -- meant. Under-alerting-safe: the confirmation's evaluate() only runs AFTER the scheduled run it
-        -- confirms is durably committed (a prior execution persisted it, then enqueued this confirmation), so
-        -- the window is never short by one.
-        WHERE check_id = $1 AND status NOT IN ('running', 'infra_error')
-          AND superseded_by_run_id IS NULL
-          AND confirmation_of_run_id IS NULL
+         FROM countable_run
+        -- ★ countable_run (0081): the ONE canonical "countable scheduled observation" — status(not
+        -- running/infra) + non-superseded + non-confirmation + non-sandbox. This was inlined here (#295
+        -- added the confirmation exclusion) but MISSED the sandbox exclusion; the view adds it and shares
+        -- the exact definition with sla_availability / slo_status / rollup so all five count identically.
+        -- WHY confirmation is excluded: a confirmation run is a RE-CHECK of a failure already in this window
+        -- (the scheduled run it confirms), not an independent observation — counting it double-counts one
+        -- failure, silently ~halving every failure_threshold ≥ 2. The scheduled run it confirms stays in the
+        -- window (superseded only if its confirmation PASSED), so the window counts exactly "consecutive
+        -- confirmed SCHEDULED failures". Under-alerting-safe: the confirmation's evaluate() runs only after
+        -- the scheduled run it confirms is durably committed, so the window is never short by one.
+        WHERE check_id = $1
      ),
      per_loc AS (
        SELECT location,
@@ -643,18 +638,17 @@ async function countConsecutiveDown(
 ): Promise<number> {
   // Trailing consecutive down runs (optionally scoped to one location), used for
   // the single-location incident wording/count. Look back only as far as needed.
-  // ★ Same window as aggregateVerdict: only SCHEDULED, non-superseded runs. A confirmation run (a re-check of
-  // a failure already here) and a superseded transient (a self-healed blip) are not independent observations,
-  // so counting them made the DISPLAYED consecutive_failures larger than the number that actually triggered
-  // the incident (e.g. a threshold=1 incident showing consecutive_failures=2). Exclude both so the shown
-  // count matches the trigger.
+  // ★ countable_run (0081): the same canonical window as aggregateVerdict — non-superseded, non-confirmation,
+  // non-sandbox, real-result runs. A confirmation run (a re-check of a failure already here) and a superseded
+  // transient (a self-healed blip) are not independent observations, so counting them made the DISPLAYED
+  // consecutive_failures larger than the number that actually triggered the incident. Sourcing from the view
+  // also drops running/infra_error before the LIMIT, so N slots hold N real observations (an infra blip no
+  // longer consumes a slot). The JS loop's infra_error/running branches below are now unreachable but harmless.
   const { rows } = await pool.query<{
     status: 'pass' | 'warn' | 'fail' | 'error' | 'infra_error' | 'running';
   }>(
-    `SELECT status FROM runs
+    `SELECT status FROM countable_run
       WHERE check_id = $1 ${location ? 'AND location = $3' : ''}
-        AND superseded_by_run_id IS NULL
-        AND confirmation_of_run_id IS NULL
       ORDER BY started_at DESC
       LIMIT $2`,
     location ? [checkId, threshold, location] : [checkId, threshold],

@@ -40,20 +40,13 @@ export async function computeRollupForDay(checkId: number, day: string): Promise
   await pool.query(
     `WITH mw_excluded AS (
        SELECT r.id, r.status, r.duration_ms
-         FROM runs r
+         -- ★ countable_run (0081): the canonical predicate — status(not running/infra) + non-superseded +
+         -- non-confirmation + non-sandbox. Was inlined here (status/sandbox/superseded) but MISSED the
+         -- confirmation exclusion, so a confirmed outage double-counted in daily availability/down_count.
+         -- Now shared with sla_availability / slo_status / aggregateVerdict.
+         FROM countable_run r
         WHERE r.check_id = $1
           AND r.started_at >= $2 AND r.started_at < $3
-          -- infra_error excluded with running: "didn't run", neither up nor down (Option C).
-          -- (up/down counts already use explicit pass|warn / fail|error lists; this keeps it
-          -- out of any total/row selection too.)
-          AND r.status NOT IN ('running', 'infra_error')
-          -- sandbox excluded (0070): a paused monitor's on-demand validation is not a scheduled health
-          -- signal, so it never enters the daily availability/latency rollup — mirrors the sla_availability()
-          -- exclusion. A sandbox-only day → total_count=0 (correct "no counted runs", not a real row).
-          AND NOT r.sandbox
-          -- SUPERSEDED-TRANSIENT EXCLUSION (0077): a failed run whose confirmation PASSED was transient — it
-          -- must not enter the daily availability/down_count rollup. Mirrors the sandbox exclusion above.
-          AND r.superseded_by_run_id IS NULL
           AND NOT EXISTS (
             SELECT 1 FROM maintenance_windows mw
              WHERE (mw.check_id = r.check_id OR mw.check_id IS NULL)
