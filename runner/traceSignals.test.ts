@@ -2,12 +2,21 @@
 // SynthWatch.Api.Tests/TraceSignalsTests.cs, so a regression on either side is caught. The console
 // extension-noise filter is the load-bearing one. Plus the runner-wrapper semantics (null on no-trace /
 // corrupt zip, since trace_signals is nullable = "not extracted").
-import { test } from 'node:test';
+import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import AdmZip from 'adm-zip';
-import { writeFileSync, rmSync, mkdtempSync, readFileSync, existsSync } from 'node:fs';
+import yazl from 'yazl';
+import { writeFileSync, rmSync, mkdtempSync, readFileSync, existsSync, createWriteStream } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Readable } from 'node:stream';
+import { randomBytes } from 'node:crypto';
+import { createRequire } from 'node:module';
+
+// adm-zip reads a whole zip via `filetools.fs.readFileSync` — a property lookup on the shared CJS `require("fs")`
+// singleton. Grab THAT object (the ESM `import * as fs` namespace is a frozen wrapper adm-zip never sees) so the
+// memory-bound test below can spy on the whole-file read and prove the streaming extractor never performs it.
+const fsCjs = createRequire(import.meta.url)('node:fs') as typeof import('node:fs');
 import { extractNetwork, extractConsole, extractTraceSignals } from './traceSignals.js';
 import { makeRedactor, IDENTITY_REDACTOR } from './redact.js';
 
@@ -259,7 +268,7 @@ test('the mutation url is stored RAW (not redacted), byte-matching C#', () => {
   assert.equal(n.mutations[0].url, 'https://www.wegmans.com/shop/cart?session=SECRET123&item=42');
 });
 
-test('extractTraceSignals parses a real zip (both streams) + derives targetHost from the URL', () => {
+test('extractTraceSignals parses a real zip (both streams) + derives targetHost from the URL', async () => {
   const zip = new AdmZip();
   zip.addFile('trace.network', Buffer.from(NETWORK_NDJSON));
   zip.addFile('trace.trace', Buffer.from(CONSOLE_NDJSON));
@@ -269,7 +278,7 @@ test('extractTraceSignals parses a real zip (both streams) + derives targetHost 
   const path = join(dir, 'trace.zip');
   zip.writeZip(path);
   try {
-    const sig = extractTraceSignals(path, 'https://www.wegmans.com/checkout');
+    const sig = await extractTraceSignals(path, 'https://www.wegmans.com/checkout');
     assert.ok(sig);
     assert.equal(sig.targetHost, 'www.wegmans.com'); // host of the target URL (no port), like Uri.Host
     assert.equal(sig.network.totalRequests, 5);
@@ -282,25 +291,28 @@ test('extractTraceSignals parses a real zip (both streams) + derives targetHost 
   }
 });
 
-test('extractTraceSignals is non-fatal: corrupt zip -> null (trace_signals stays null)', () => {
+// ★ Corrupt/truncated zip → REJECTS LOUDLY (was: swallowed to null). The caller's try/catch logs the error
+// and leaves trace_signals null — but the failure is now VISIBLE, and we never resolve an all-zeros summary
+// that would masquerade as a successful empty extraction. This is the streaming rewrite's fail-loud contract.
+test('extractTraceSignals rejects (loud) on a corrupt zip — never a silent empty signal set', async () => {
   const dir = tmpDir();
   const path = join(dir, 'bad.zip');
   writeFileSync(path, Buffer.from([1, 2, 3, 4])); // not a zip
   try {
-    assert.equal(extractTraceSignals(path, 'https://www.wegmans.com/'), null);
+    await assert.rejects(extractTraceSignals(path, 'https://www.wegmans.com/'), /.+/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test('extractTraceSignals -> null when the zip has no trace entries (not a Playwright trace)', () => {
+test('extractTraceSignals -> null when the zip has no trace entries (not a Playwright trace)', async () => {
   const zip = new AdmZip();
   zip.addFile('unrelated.txt', Buffer.from('hi'));
   const dir = tmpDir();
   const path = join(dir, 'empty.zip');
   zip.writeZip(path);
   try {
-    assert.equal(extractTraceSignals(path, 'https://www.wegmans.com/'), null);
+    assert.equal(await extractTraceSignals(path, 'https://www.wegmans.com/'), null);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -347,7 +359,7 @@ function goldenDir(): string {
   throw new Error(`golden fixture dir not found (tried: ${candidates.join(', ')})`);
 }
 
-test('★ golden parity: extractTraceSignals(golden input) === expected.json (the cross-repo contract with C#)', () => {
+test('★ golden parity: extractTraceSignals(golden input) === expected.json (the cross-repo contract with C#)', async () => {
   const dir = goldenDir();
   const zip = new AdmZip();
   zip.addFile('trace.network', readFileSync(join(dir, 'trace.network')));
@@ -358,11 +370,62 @@ test('★ golden parity: extractTraceSignals(golden input) === expected.json (th
   try {
     // The golden was captured with a NON-sensitive (identity) redactor, so the persisted url is raw — this is
     // exactly the shape the C# FromZip (no redactor) produces, so the two extractors must byte-match here.
-    const sig = extractTraceSignals(path, 'https://www.wegmans.com/checkout');
+    const sig = await extractTraceSignals(path, 'https://www.wegmans.com/checkout');
     const actual = JSON.parse(JSON.stringify(sig)); // normalize (drop undefined) for a structural compare
     const expected = JSON.parse(readFileSync(join(dir, 'expected.json'), 'utf8'));
     assert.deepEqual(actual, expected);
   } finally {
     rmSync(tdir, { recursive: true, force: true });
+  }
+});
+
+// ── ★ THE MEMORY BOUND (the run #936920 OOM regression guard) ────────────────────────────────────────────────
+// A long browser flow's trace is dominated by screencast jpegs (resources/*.jpeg); check 355's 5-min shop flow
+// is ~124MB. `new AdmZip(zipPath)` readFileSync's that ENTIRE file into a Buffer before reading one entry — the
+// peak that exit-137'd run #936920. The streaming extractor reads ONLY the two small NDJSON entries (positional
+// fd reads via yauzl) and must NEVER slurp the whole zip. A synchronous allocation peak can't be sampled from
+// the same thread, so we pin the mechanism directly: fs.readFileSync is never called on the zip path. Restoring
+// `new AdmZip(zipPath)` reintroduces that exact call (adm-zip: `filetools.fs.readFileSync(input)`) → red.
+function buildBigTraceZip(dir: string): Promise<string> {
+  const path = join(dir, 'big-trace.zip');
+  return new Promise<string>((resolve, reject) => {
+    const zf = new yazl.ZipFile();
+    zf.addBuffer(Buffer.from(NETWORK_NDJSON), 'trace.network');
+    zf.addBuffer(Buffer.from(CONSOLE_NDJSON), 'trace.trace');
+    // A ≥124MB INCOMPRESSIBLE screencast-bulk entry, STORED (compress:false) so the on-disk zip is genuinely
+    // ~130MB — the real OOM shape (jpegs don't deflate further). Fed from a generating stream, 1MB at a time,
+    // so BUILDING the fixture peaks at ~1MB: we must not OOM the test while proving the extractor won't.
+    const big = new Readable({ read() {} });
+    zf.addReadStream(big, 'resources/screencast.bin', { compress: false, size: 130 * 1024 * 1024 });
+    for (let i = 0; i < 130; i++) big.push(randomBytes(1024 * 1024));
+    big.push(null);
+    const ws = createWriteStream(path);
+    ws.on('error', reject);
+    zf.outputStream.pipe(ws).on('close', () => resolve(path)).on('error', reject);
+    zf.end();
+  });
+}
+
+test('★ memory bound: a ≥124MB trace is never slurped whole — only the two NDJSON entries are read (OOM #936920)', async () => {
+  const dir = tmpDir();
+  try {
+    const path = await buildBigTraceZip(dir);
+    const readSpy = mock.method(fsCjs, 'readFileSync'); // tracks calls; still calls through to the original.
+    try {
+      const sig = await extractTraceSignals(path, 'https://www.wegmans.com/checkout');
+      // Correctness is intact — the two small entries were read + parsed despite the 130MB neighbour.
+      assert.ok(sig);
+      assert.equal(sig.network.totalRequests, 5);
+      assert.equal(sig.console.messages.length, 3);
+      // THE BOUND: the ≥124MB zip file was NEVER read whole into memory. yauzl uses positional fd reads;
+      // `new AdmZip(zipPath)` would `readFileSync(path)` here → this assertion fails. Peak is bounded to the
+      // largest single NDJSON entry, not the screencast bulk — so peak memory does not scale with trace size.
+      const slurpedWholeZip = readSpy.mock.calls.some((c) => c.arguments[0] === path);
+      assert.equal(slurpedWholeZip, false, 'the trace zip must never be read whole into memory (AdmZip OOM regression)');
+    } finally {
+      readSpy.mock.restore();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
