@@ -67,6 +67,17 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # ★ FROM-SCRATCH REPLAY GUARD (the 0069/#284 class, shifted LEFT + made REQUIRED). db/schema.sql (the
+      # converged end state) + every migration replayed on top must converge — the exact model a fresh DB, a
+      # restore, and the synthwatch-api "Runner column parity" gate all use. A CREATE OR REPLACE FUNCTION that
+      # can't downgrade schema.sql's newer return type (Postgres needs a DROP first) fails HERE, on the runner PR
+      # that introduces the migration — instead of late + only on an unrelated api PR (where 0069 was found).
+      # Runs against a THROWAWAY DB so it can't disturb the integration-test DB seeded below.
+      - name: Migration replay guard (schema.sql + all migrations converge)
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c 'CREATE DATABASE replay_check;'
+          bash ../scripts/check-migration-replay.sh "postgres://postgres:postgres@localhost:5432/replay_check"
+
       # Seed the service DB with the full runner schema (tables + functions: sla_availability / slo_status /
       # slo_burn_status). psql ships on ubuntu-latest. ON_ERROR_STOP so any DDL failure fails the job.
       - name: Load the runner schema into Postgres
