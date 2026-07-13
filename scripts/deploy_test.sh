@@ -678,10 +678,10 @@ rm -rf "${SCRIPTGUARD_DIR}"
 
 # ===========================================================================
 # N. ★ START-OF-RUN tree-sync policy (tree_sync_decision) — the pure verdict the deploy.sh sync block acts on.
-#    Must-go-reds: a DIRTY behind tree ABORTS (never discards work); a not-main checkout ABORTS (never resets
-#    a feature branch); a clean behind tree FAST-FORWARDS; a diverged tree is PRESERVED (never auto-reset).
+#    ON MAIN: a DIRTY behind tree ABORTS (never discards work); a clean behind tree FAST-FORWARDS; a diverged
+#    tree is PRESERVED (never auto-reset). NOT ON MAIN: auto-switch to main ONLY when the branch is clean AND
+#    fully merged (nothing to lose); refuse when dirty, unmerged, or unverifiable (work at risk / when in doubt).
 # ===========================================================================
-expect_eq "tree_sync: not on main → abort"                 "not-main" "$(tree_sync_decision featureX aaa bbb 0 0)"
 expect_eq "tree_sync: local == origin → current"           "current"  "$(tree_sync_decision main aaa aaa 1 0)"
 expect_eq "tree_sync: origin unresolvable → current"       "current"  "$(tree_sync_decision main aaa '' 0 0)"
 expect_eq "tree_sync: behind + clean → fast-forward"       "ff"       "$(tree_sync_decision main aaa bbb 1 0)"
@@ -690,6 +690,18 @@ expect_eq "tree_sync: behind + clean → fast-forward"       "ff"       "$(tree_
 expect_eq "tree_sync must-go-red: behind + DIRTY → abort"  "dirty"    "$(tree_sync_decision main aaa bbb 1 1)"
 # ★ MUST-GO-RED: a diverged local (commit(s) not on origin) must be PRESERVED, never auto-reset.
 expect_eq "tree_sync must-go-red: diverged → preserve"     "diverged" "$(tree_sync_decision main aaa bbb 0 0)"
+
+# ── NOT-ON-MAIN auto-switch policy (the friction fix): switch iff clean AND fully merged; else refuse ──
+# THE COMMON CASE: a clean, fully-merged leftover branch (merged=1) has nothing to lose → auto-switch to main.
+expect_eq "tree_sync: not-main clean+merged → switch"      "switch-main"        "$(tree_sync_decision retro/x aaa bbb 0 0 1)"
+# ★ MUST-GO-RED (work at risk): uncommitted TRACKED changes on the branch → REFUSE, even if 'merged' were set.
+expect_eq "tree_sync must-go-red: not-main DIRTY → refuse" "not-main-dirty"     "$(tree_sync_decision retro/x aaa bbb 0 1 1)"
+# ★ MUST-GO-RED (work at risk): clean but has commit(s) NOT upstream (unpushed/unmerged) → REFUSE.
+expect_eq "tree_sync must-go-red: not-main unmerged→refuse" "not-main-unmerged" "$(tree_sync_decision retro/x aaa bbb 0 0 0)"
+# ★ MUST-GO-RED (when in doubt): origin/main unresolvable → can't PROVE merged → REFUSE (never a false 'safe').
+expect_eq "tree_sync must-go-red: not-main unverified→refuse" "not-main-unverified" "$(tree_sync_decision retro/x aaa '' 0 0 1)"
+# The 'merged' flag DEFAULTS to 0 (safe): a caller omitting it never auto-switches — it refuses as unmerged.
+expect_eq "tree_sync: not-main merged omitted → refuse"    "not-main-unmerged"  "$(tree_sync_decision retro/x aaa bbb 0 0)"
 
 echo
 if [[ "${FAILS}" -eq 0 ]]; then
