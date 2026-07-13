@@ -86,6 +86,105 @@ nodeTest('(d) failure_threshold>1 still debounces across consecutive scheduled r
   }
 });
 
+// Seed one run at a given age with an explicit status and optional confirmation link, returning the
+// RunRecord evaluate() consumes. `confirmationOf` set => this row is a CONFIRMATION of that scheduled run.
+async function seedRun(
+  checkId: number,
+  status: 'fail' | 'error' | 'pass',
+  minutesAgo: number,
+  confirmationOf: number | null = null,
+): Promise<RunRecord> {
+  const down = status !== 'pass';
+  const { rows } = await pool.query<{ id: number }>(
+    `INSERT INTO runs (check_id, status, started_at, finished_at, location, error_message, failed_step, confirmation_of_run_id)
+     VALUES ($1, $2, now() - make_interval(mins => $3::int), now() - make_interval(mins => $3::int),
+             'default', $4, $5, $6)
+     RETURNING id`,
+    [checkId, status, minutesAgo, down ? 'assertion missed' : null, down ? 'open the product' : null, confirmationOf],
+  );
+  return {
+    id: rows[0].id,
+    check_id: checkId,
+    status,
+    error_message: down ? 'assertion missed' : null,
+    failed_step: down ? 'open the product' : null,
+    screenshot_url: null,
+    location: 'default',
+  };
+}
+
+// ★★ THE BUG (must go RED on today's code, GREEN on the fix). failure_threshold=2. A confirmation run is a
+// re-check of a scheduled failure ALREADY in the window — not an independent observation. On today's code the
+// window counts BOTH the scheduled fail and its confirmation fail, so a SINGLE confirmed scheduled failure fills
+// a threshold-2 window and pages. That is the live over-alerting bug (#174/#175 opened on confirmation runs).
+// The window is ordered oldest→newest: S1(fail), C1(confirms S1, fail), S2(fail), C2(confirms S2, fail).
+nodeTest('threshold=2: ONE confirmed scheduled failure must NOT page; the SECOND opens the incident (live)', { skip: SKIP }, async () => {
+  const check = await makeCheck(2, '__eval_conf_thr2_e2e__');
+  try {
+    // First confirmed scheduled failure: scheduled S1 fails, its confirmation C1 also fails.
+    const s1 = await seedRun(check.id, 'fail', 40);
+    const c1 = await seedRun(check.id, 'fail', 35, s1.id);
+    // evaluate() runs from the CONFIRMATION run's applyRunSideEffects (branch A, evaluate.ts:950).
+    await evaluate(check, c1);
+    assert.equal(
+      await openIncidentCount(check.id),
+      0,
+      'ONE confirmed scheduled failure is 1 scheduled down run < threshold 2 → NO incident (was 1 on the buggy code)',
+    );
+
+    // Second confirmed scheduled failure: scheduled S2 fails, its confirmation C2 also fails.
+    const s2 = await seedRun(check.id, 'fail', 10);
+    const c2 = await seedRun(check.id, 'fail', 5, s2.id);
+    await evaluate(check, c2);
+    assert.equal(
+      await openIncidentCount(check.id),
+      1,
+      'TWO consecutive confirmed scheduled failures = threshold 2 → incident opens on the second',
+    );
+  } finally {
+    await pool.query(`DELETE FROM checks WHERE id = $1`, [check.id]);
+  }
+});
+
+// A self-healed transient (confirmation PASSED → original superseded) must contribute ZERO to the threshold.
+// threshold=2: superseded transient S1 + ONE later real confirmed scheduled failure S2 ⇒ still only 1 scheduled
+// down run in the window ⇒ NO incident. If the transient (or either confirmation) leaked in, this would open.
+nodeTest('threshold=2: a self-healed transient contributes ZERO — one later real failure still does not page (live)', { skip: SKIP }, async () => {
+  const check = await makeCheck(2, '__eval_conf_transient_e2e__');
+  try {
+    const s1 = await seedRun(check.id, 'fail', 40); // scheduled failure...
+    const c1 = await seedRun(check.id, 'pass', 35, s1.id); // ...whose confirmation PASSED (transient)
+    // Mirror branch A: the passing confirmation marks the original superseded (evaluate.ts:928).
+    await pool.query(`UPDATE runs SET superseded_by_run_id = $2 WHERE id = $1`, [s1.id, c1.id]);
+
+    // One later REAL confirmed scheduled failure.
+    const s2 = await seedRun(check.id, 'fail', 10);
+    const c2 = await seedRun(check.id, 'fail', 5, s2.id);
+    await evaluate(check, c2);
+    assert.equal(
+      await openIncidentCount(check.id),
+      0,
+      'superseded transient counts 0 → only S2 is down → 1 < threshold 2 → NO incident',
+    );
+  } finally {
+    await pool.query(`DELETE FROM checks WHERE id = $1`, [check.id]);
+  }
+});
+
+// ★ REGRESSION GUARD: threshold=1 is UNCHANGED. One confirmed scheduled failure still pages immediately (the
+// scheduled run alone fills the 1-slot window; the confirmation being excluded does not matter at N=1).
+nodeTest('threshold=1: one confirmed scheduled failure still opens the incident (unchanged) (live)', { skip: SKIP }, async () => {
+  const check = await makeCheck(1, '__eval_conf_thr1_e2e__');
+  try {
+    const s1 = await seedRun(check.id, 'fail', 10);
+    const c1 = await seedRun(check.id, 'fail', 5, s1.id);
+    await evaluate(check, c1);
+    assert.equal(await openIncidentCount(check.id), 1, 'threshold=1 unchanged: one confirmed failure pages immediately');
+  } finally {
+    await pool.query(`DELETE FROM checks WHERE id = $1`, [check.id]);
+  }
+});
+
 // A passing run (recovery), newest by default — drives evaluate() to resolve any open incident.
 async function seedPassRun(checkId: number, minutesAgo: number): Promise<RunRecord> {
   const { rows } = await pool.query<{ id: number }>(
