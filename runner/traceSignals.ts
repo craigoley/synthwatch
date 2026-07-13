@@ -64,6 +64,14 @@ export interface ConsoleSummary {
   // info log; this makes the REMAINING truncation (errors beyond the cap) HONEST instead of silent — a
   // diff over a silently-truncated error set would be unreliable. 0 = nothing preserved was dropped.
   droppedError: number;
+  // ★ droppedError SPLIT BY first-party-ness (droppedThirdParty + droppedFirstParty === droppedError). The
+  // drop-policy ranks first-party ABOVE third-party (see the score below), so at the cap third-party is
+  // dropped FIRST — droppedFirstParty is > 0 ONLY once ALL third-party is gone AND first-party alone still
+  // overflows the cap (a genuine first-party flood). This lets the panel be HONEST *and* INFORMATIVE: a
+  // truncation that lost only tracker noise ("N third-party dropped — first-party complete") is very
+  // different from one that lost first-party signal (stay LOUD). Both default 0 (older rows read as 0).
+  droppedThirdParty: number;
+  droppedFirstParty: number;
 }
 export interface TraceSignals {
   targetHost: string | null;
@@ -82,7 +90,14 @@ const EMPTY_NETWORK: NetworkSummary = {
   topThirdParties: [],
   mutations: [],
 };
-const EMPTY_CONSOLE: ConsoleSummary = { messages: [], droppedInfoLog: 0, droppedExtensionNoise: 0, droppedError: 0 };
+const EMPTY_CONSOLE: ConsoleSummary = {
+  messages: [],
+  droppedInfoLog: 0,
+  droppedExtensionNoise: 0,
+  droppedError: 0,
+  droppedThirdParty: 0,
+  droppedFirstParty: 0,
+};
 
 // ★ Browser-EXTENSION console noise — a trace captured/opened with extensions is NOT the monitored site.
 // Matched against the message text AND its source url. THE load-bearing correctness filter; ported VERBATIM.
@@ -102,7 +117,14 @@ const FAILED_CAP = 8;
 const THIRD_PARTY_CAP = 6;
 const UNCOMPRESSED_MIN_BYTES = 30_000;
 // ★ Hard cap on console messages so a pathological trace can't blow the downstream AOAI token budget.
-const MAX_CONSOLE_MESSAGES = 40;
+// Sized from the real distribution of check 355 (wegmans-full-shop-flow, the worst offender): first-party
+// (error+warning) peaks at 37/run and all error-class at 33/run, so 80 keeps EVERY first-party message with
+// >2× headroom (a first-party truncation would need an unprecedented 80+ first-party fingerprints) while
+// still capturing a healthy slice of third-party context. Row cost is trivial — ~245 B/message, so +40
+// messages is ~10 KB uncompressed (single-digit KB in the TOASTed jsonb the diff reads 5× per request).
+// Because the drop-policy ranks first-party first, the cap governs how much THIRD-PARTY is kept, not whether
+// first-party survives.
+const MAX_CONSOLE_MESSAGES = 80;
 
 // The only two entries we read; everything else in the zip (the screencast resources/*.jpeg bulk) is skipped.
 const TRACE_NETWORK = 'trace.network';
@@ -374,17 +396,36 @@ export function extractConsole(
     });
   }
 
-  // Bound the list, keeping the most relevant: the site's own errors/pageerrors first, then warnings/
-  // third-party. Composite score (error OR pageerror is the high bit, site the low bit); V8 sort is stable,
-  // so first-seen order is preserved within each tier. ★ `kept` holds ONLY error/warning/pageerror (info
-  // was excluded up front), so an error can never be dropped in favour of an info log; and droppedError
-  // records how many of these preserved messages the cap still truncated — making that truncation VISIBLE
-  // (a diff over a silently-truncated error set would be unreliable).
+  // Bound the list, ranking by FIRST-PARTY-NESS FIRST, then by severity — so the cap is spent on the errors
+  // a Wegmans monitor actually cares about, and tracker noise (doubleclick/emplifi/rlcdn) is dropped BEFORE a
+  // wegmans.com / *.wegmans.cloud message. ★ The high bit is `site` (first-party), the low bit is
+  // error/pageerror, giving the strict order:
+  //     first-party error/pageerror (3) > first-party warning (2) > third-party error/pageerror (1) > third-party warning (0)
+  // CSP violations are level 'error' classified by the REFUSED resource's host (P1), so a third-party CSP
+  // (rlcdn/doubleclick) folds into tier 1 and a first-party CSP into tier 3 — both correctly ranked by owner.
+  // info/log was already excluded up front (droppedInfoLog), so it never competes. V8 sort is stable → first-
+  // seen order is preserved within a tier. Previously the bits were reversed (severity high, site low), which
+  // kept THIRD-PARTY errors above FIRST-PARTY warnings — evicting real wegmans.com warnings to store tracker
+  // errors. First-party errors were already safe (they scored top either way), but first-party warnings were not.
   const score = (m: ConsoleMessage) =>
-    (m.level === 'error' || m.level === 'pageerror' ? 2 : 0) + (m.origin === 'site' ? 1 : 0);
-  const messages = [...kept].sort((a, b) => score(b) - score(a)).slice(0, MAX_CONSOLE_MESSAGES);
-  const droppedError = kept.length - messages.length;
-  return { messages, droppedInfoLog: droppedLevel, droppedExtensionNoise: droppedExt, droppedError };
+    (m.origin === 'site' ? 2 : 0) + (m.level === 'error' || m.level === 'pageerror' ? 1 : 0);
+  const ranked = [...kept].sort((a, b) => score(b) - score(a));
+  const messages = ranked.slice(0, MAX_CONSOLE_MESSAGES);
+  const dropped = ranked.slice(MAX_CONSOLE_MESSAGES); // the truncated tail — the LOWEST-ranked (third-party first)
+  const droppedError = dropped.length;
+  // Split the truncation by owner so the panel can distinguish "we dropped only noise" from "we dropped your
+  // signal". Because third-party ranks below all first-party, droppedFirstParty > 0 ⟹ every third-party was
+  // ALSO dropped AND first-party alone overflowed the cap — the only case that actually threatens the diff.
+  const droppedThirdParty = dropped.reduce((n, m) => n + (m.origin === 'third-party' ? 1 : 0), 0);
+  const droppedFirstParty = droppedError - droppedThirdParty;
+  return {
+    messages,
+    droppedInfoLog: droppedLevel,
+    droppedExtensionNoise: droppedExt,
+    droppedError,
+    droppedThirdParty,
+    droppedFirstParty,
+  };
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────────────────────────────────────
