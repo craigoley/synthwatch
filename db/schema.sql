@@ -357,7 +357,15 @@ CREATE TABLE runs (
     --     WHERE this IS NOT NULL, so a transient stays VISIBLE in run history but never moves a health signal.
     -- Both self-FKs are ON DELETE SET NULL so 90d row-retention (purging the pair together) is never blocked.
     confirmation_of_run_id BIGINT REFERENCES runs(id) ON DELETE SET NULL,
-    superseded_by_run_id   BIGINT REFERENCES runs(id) ON DELETE SET NULL
+    superseded_by_run_id   BIGINT REFERENCES runs(id) ON DELETE SET NULL,
+    -- B3-2 stage 2 (mirrors 0079): the classification of a SUPERSEDED transient — monitor-side (a monitor bug
+    -- cried wolf), service-side (a real, brief first-party outage the monitor caught), or indeterminate (no
+    -- signals to tell). Set ONLY on a superseded transient (evaluate.applyRunSideEffects); NULL otherwise.
+    -- B3-3's flake budget burns ONLY monitor-side transients — a service-side one is a real outage and must
+    -- not penalise the monitor that caught it. A SHARED column: the synthwatch-api fixture + EF entity mirror it.
+    transient_class TEXT
+        CONSTRAINT runs_transient_class_check
+        CHECK (transient_class IS NULL OR transient_class IN ('monitor-side', 'service-side', 'indeterminate'))
 );
 
 -- Hot path: "latest N runs for this check, newest first" (status pages, the
