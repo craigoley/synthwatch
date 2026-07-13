@@ -429,8 +429,18 @@ async function aggregateVerdict(check: Check): Promise<Verdict> {
         -- location producing only infra_error is NOT reporting (can't block OR cause paging).
         -- ★ SUPERSEDED-TRANSIENT EXCLUSION (0077): a failed run whose confirmation PASSED was transient — it
         -- must not count toward the failure window (else a self-resolving blip would still open an incident).
+        -- ★ CONFIRMATION EXCLUSION: a confirmation run is a RE-CHECK of a failure ALREADY in this window (the
+        -- scheduled run it confirms) — NOT an independent observation. Counting it double-counts one failure:
+        -- a real outage's [scheduled fail, confirmation fail] would fill a failure_threshold=2 window off ONE
+        -- confirmed scheduled failure, silently ~halving every threshold ≥ 2. The scheduled run stays in the
+        -- window (and, if its confirmation PASSED, is already dropped by the superseded clause above), so the
+        -- window counts exactly "consecutive confirmed SCHEDULED failures" — what failure_threshold has always
+        -- meant. Under-alerting-safe: the confirmation's evaluate() only runs AFTER the scheduled run it
+        -- confirms is durably committed (a prior execution persisted it, then enqueued this confirmation), so
+        -- the window is never short by one.
         WHERE check_id = $1 AND status NOT IN ('running', 'infra_error')
           AND superseded_by_run_id IS NULL
+          AND confirmation_of_run_id IS NULL
      ),
      per_loc AS (
        SELECT location,
@@ -633,11 +643,18 @@ async function countConsecutiveDown(
 ): Promise<number> {
   // Trailing consecutive down runs (optionally scoped to one location), used for
   // the single-location incident wording/count. Look back only as far as needed.
+  // ★ Same window as aggregateVerdict: only SCHEDULED, non-superseded runs. A confirmation run (a re-check of
+  // a failure already here) and a superseded transient (a self-healed blip) are not independent observations,
+  // so counting them made the DISPLAYED consecutive_failures larger than the number that actually triggered
+  // the incident (e.g. a threshold=1 incident showing consecutive_failures=2). Exclude both so the shown
+  // count matches the trigger.
   const { rows } = await pool.query<{
     status: 'pass' | 'warn' | 'fail' | 'error' | 'infra_error' | 'running';
   }>(
     `SELECT status FROM runs
       WHERE check_id = $1 ${location ? 'AND location = $3' : ''}
+        AND superseded_by_run_id IS NULL
+        AND confirmation_of_run_id IS NULL
       ORDER BY started_at DESC
       LIMIT $2`,
     location ? [checkId, threshold, location] : [checkId, threshold],
