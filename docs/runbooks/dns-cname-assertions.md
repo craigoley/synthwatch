@@ -1,5 +1,7 @@
 # Runbook — DNS checks 346–349: CNAME assertions (what resolves, not just *that* something resolves)
 
+> _Verified 2026-07-14 — prose with **no automated check**; if the code disagrees, the code is authoritative. This doc CAN rot._
+
 **Context:** the 2026-07-12 Fleet Assertion Audit. The four apex/`www` DNS checks (346 wegmans, 347 meals2go, 348 amore, 349 nextdoor) were 100% green on 30d — but asserted only *"resolves ≥1 A record"* with **no `expectedValue`**. So a **repoint to a wrong-but-live IP** (hijack, botched CDN cutover, failover to a stale-but-answering origin) would resolve fine and stay **green**. *"DNS answers" ≠ "DNS answers correctly."*
 
 **Owner:** Craig applies the `net_config` change (SQL below). Recon prepared + verified it; no code change (these are DB-only checks, and `net_config` is not a reconcile-authoritative column, so the change survives).

@@ -59,7 +59,10 @@ if (actual === null) {
   fail(`${SRC} is missing the ${BEGIN} … ${END} markers — add them around the shared helpers (the block the runner vendors).`);
 }
 
-// 3) compare.
+// 3) compare. ★ FAIL-CLOSED: a mismatch (or missing markers) EXITs non-zero — a lib/flow change not mirrored
+// into specShim.ts is DEAD AT RUNTIME (the runner executes the VENDORED copy, not monitors' lib/flow.ts), so
+// the fleet must not merge until they match. The ONE non-fail case is source-missing → SKIP exit 0 (a
+// monitors-checkout blip must not red the whole fleet; absence of the file ≠ proven drift).
 if (actual !== expected) {
   fail(
     `specShim.ts is OUT OF SYNC with lib/flow.ts — a lib/flow change is DEAD AT RUNTIME until mirrored here; ` +
