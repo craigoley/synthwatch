@@ -1,0 +1,41 @@
+# Dev environment for BOTH repos. Clone synthwatch + synthwatch-api as SIBLINGS; this mounts their shared
+# parent so `dotnet test` on the api works from the same container. `db` is the real Postgres the runner's
+# integration tests + the schema-replay gate run against.
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # ../.. = the parent dir holding both sibling repos → /workspaces/{synthwatch,synthwatch-api}
+    volumes:
+      - ../..:/workspaces:cached
+      # Testcontainers (api dotnet test) spins sibling containers on the HOST daemon via this socket.
+      - /var/run/docker.sock:/var/run/docker.sock
+    # ★ docker-outside-of-docker: Testcontainers publishes the sibling Postgres to the HOST, so the client
+    #   inside THIS container must reach it via the host gateway, not the compose-network bridge (else every
+    #   integration test fails "connection refused" to 172.17.0.1). host-gateway + HOST_OVERRIDE bridge that.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      # Runner integration tests + the schema gates point here (service name `db`, in-network).
+      DATABASE_URL: postgres://postgres:postgres@db:5432/synthwatch_test
+      TESTCONTAINERS_HOST_OVERRIDE: host.docker.internal
+    working_dir: /workspaces/synthwatch
+    command: sleep infinity
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:16   # ★ matches prod (infra/main.bicep flexibleServers version '16') and CI
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: synthwatch_test
+    ports:
+      - "5432:5432"   # also reachable from the host for ad-hoc psql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
