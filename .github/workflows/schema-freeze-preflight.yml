@@ -51,45 +51,66 @@ jobs:
       - name: Install psql client
         run: sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client
 
-      - name: Pre-flight — reuse the api's parity enumerator against THIS PR's schema
+      # ★ SATISFIABLE guard (the #310 fix): a check that tells you to open a paired fixture PR must be able to
+      # SEE that you did — otherwise it deadlocks the exact pattern it exists to help (runner PR reds → clears
+      # only when the fixture PR merges → the fixture PR is blocked until the runner PR merges). So: parity vs
+      # api MAIN clean → PASS. Drift vs main → search OPEN api PRs; if one's fixture already mirrors this change
+      # → PASS, naming it. No paired PR → RED, naming the object. It reds when you HAVEN'T done the work and
+      # clears when you HAVE — a real gate, not a trap.
+      - name: Pre-flight — satisfiable freeze guard
         env:
           PGHOST: 127.0.0.1
           PGPORT: '5433'
           PGUSER: postgres
           PGPASSWORD: pg
+          GH_TOKEN: ${{ github.token }}
           RUNNER_PARITY: '1'
-          # ★ point the api's own script at THIS PR's schema (not a checked-out runner-repo) + the api fixture.
           RUNNER_SCHEMA: ${{ github.workspace }}/db/schema.sql
           RUNNER_MIGRATIONS: ${{ github.workspace }}/db/migrations
-          FIXTURE: ${{ github.workspace }}/api-repo/tests/SynthWatch.Api.Tests/fixtures/schema.sql
+          API_REPO: craigoley/synthwatch-api
+          FIXTURE_PATH: tests/SynthWatch.Api.Tests/fixtures/schema.sql
+          MAIN_FIXTURE: ${{ github.workspace }}/api-repo/tests/SynthWatch.Api.Tests/fixtures/schema.sql
         run: |
-          set -o pipefail
           set +e
-          bash api-repo/scripts/check-schema-parity.sh 2>&1 | tee preflight.out
-          code=${PIPESTATUS[0]}
-          set -e
-          if [ "$code" -eq 0 ]; then
-            echo "✅ No freeze risk — the synthwatch-api fixture at main already covers this schema change."
+          # run the api's OWN parity script (reused enumerator) with this PR's schema + a given fixture file.
+          parity() { FIXTURE="$1" bash api-repo/scripts/check-schema-parity.sh > "$2" 2>&1; return $?; }
+
+          # 1) clean against api MAIN → no fixture change is needed at all.
+          parity "$MAIN_FIXTURE" /tmp/main.out
+          if [ $? -eq 0 ]; then
+            echo "✅ No api-fixture change needed — parity is clean against synthwatch-api main."
             exit 0
           fi
-          # The parity script prints the missing objects as `col|`, `con|`, `fn|` rows — surface them by name.
-          missing="$(grep -E '^(col|con|fn)\|' preflight.out || true)"
-          {
-            echo "## ⚠️ This schema change will FREEZE synthwatch-api's schema-parity gate on merge"
-            echo ""
-            echo "The api's parity gate reads runner \`main\` live. These objects exist in this PR's schema but"
-            echo "are missing from the api fixture at main, so the gate will red on the NEXT unrelated api PR:"
-            echo ""
-            echo '```'
-            echo "${missing:-<see log above>}"
-            echo '```'
-            echo ""
-            echo "### Do this (do NOT just merge):"
-            echo "1. Open the paired **synthwatch-api** fixture PR adding these objects to"
-            echo "   \`tests/SynthWatch.Api.Tests/fixtures/schema.sql\` (byte-match the runner definition)."
-            echo "2. Get it green + approved."
-            echo "3. Merge THIS runner PR."
-            echo "4. Merge the api fixture PR **immediately** so no unrelated api PR catches the break."
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-          echo "::error title=Will freeze synthwatch-api schema-parity::This PR adds schema objects the api fixture lacks — open the paired api fixture PR first (see the job summary)."
+          missing="$(grep -E '^(col|con|fn)\|' /tmp/main.out || echo '<see the parity log above>')"
+
+          # 2) SATISFIABLE: does an OPEN api PR already carry the matching fixture? (only re-run parity for PRs
+          #    whose fixture actually differs from main — a cheap pre-filter before the ~30s parity run.)
+          echo "::group::Drift vs api main — searching open api PRs for a paired fixture"
+          found=""
+          while read -r n sha; do
+            [ -n "$n" ] || continue
+            gh api "repos/$API_REPO/contents/$FIXTURE_PATH?ref=$sha" -q '.content' 2>/dev/null | base64 -d > /tmp/cand.sql 2>/dev/null
+            [ -s /tmp/cand.sql ] || { echo "  #$n: no fixture at head — skip"; continue; }
+            if cmp -s /tmp/cand.sql "$MAIN_FIXTURE"; then echo "  #$n: fixture == main — skip"; continue; fi
+            parity /tmp/cand.sql /tmp/cand.out
+            if [ $? -eq 0 ]; then echo "  #$n: fixture MIRRORS this change ✓"; found="$n"; break; else echo "  #$n: fixture differs but still doesn't satisfy parity"; fi
+          done < <(gh pr list --repo "$API_REPO" --state open --json number,headRefOid --jq '.[] | "\(.number) \(.headRefOid)"')
+          echo "::endgroup::"
+
+          if [ -n "$found" ]; then
+            { echo "## ✅ Paired api fixture found: ${API_REPO}#${found}"; echo ""
+              echo "This PR changes shared schema, and open api PR **#${found}** already carries the matching fixture."; echo ""
+              echo "**Merge order:** merge THIS runner PR first — #${found}'s parity flips green against runner \`main\` seconds later, then merge it."; } | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "✅ satisfiable: paired fixture ${API_REPO}#${found} present — guard clears."
+            exit 0
+          fi
+
+          # 3) no paired PR → RED (the work isn't done yet — and now it CAN be done to clear this).
+          { echo "## ⚠️ Shared-schema change will FREEZE synthwatch-api — no paired fixture PR exists yet"; echo ""
+            echo "Objects the api fixture at main lacks:"; echo '```'; echo "$missing"; echo '```'; echo ""
+            echo "### Do this — and this check will CLEAR on its next run:"
+            echo "1. Open a **synthwatch-api** PR adding these to \`$FIXTURE_PATH\` (byte-match the runner definition)."
+            echo "2. Push it. This guard searches open api PRs, so once it exists the guard goes green here."
+            echo "3. Merge THIS runner PR first, then the fixture PR (its parity flips green against runner main)."; } | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "::error title=Will freeze synthwatch-api (no paired fixture PR)::Open the paired api fixture PR; this guard clears once it exists."
           exit 1
