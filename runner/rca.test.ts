@@ -208,3 +208,56 @@ test('a NON-sensitive check forwards BOTH screenshot URLs for the visual diff', 
   assert.equal(out.failureUrl, 'https://blob/failure.png', 'non-sensitive: failure screenshot forwarded');
   assert.equal(out.baselineUrl, 'https://blob/baseline.png', 'non-sensitive: baseline screenshot forwarded');
 });
+
+// ── ★ Bucket (b) CORRECTNESS: tighten the survivors the mutation sweep found — validateCites (4), evidenceThin
+//    (17: its OR was never isolated), renderFactPack citeIndex (19: each `if (facts.X)` untested). ────────────
+const mkFacts = (over: Partial<RcaFacts>): RcaFacts => ({
+  checkName: 'x', kind: 'browser', targetUrl: 'https://x.test', sensitive: false, runStatus: 'error',
+  httpStatus: null, durationMs: null, failedStep: null, errorMessage: null, steps: [], recent: [],
+  verdict: { failing: 1, total: 1 }, firstPartyConsole: [], thirdPartyConsoleErrorCount: 0, netFailed: [], ...over,
+});
+
+test('★ validateCites: every branch isolated — no-cite, unresolved, valid, multi-cite-partial, accumulation, empty', () => {
+  const idx = new Set(['failed_step', 'error_message', 'console:www.x.com']);
+  assert.deepEqual(validateCites(['broke'], idx), ['no-cite: broke'], 'an uncited observed item → exactly one no-cite');
+  assert.deepEqual(validateCites(['x [cite: bogus]'], idx), ['unresolved-cite: bogus'], 'a cite not in the index → unresolved');
+  assert.deepEqual(validateCites(['x [cite: failed_step]'], idx), [], 'a resolved cite → no violation');
+  // a cited-but-unresolved item must NOT also be flagged no-cite (the cites.length>0 / continue branch)
+  assert.ok(!validateCites(['x [cite: bogus]'], idx).some((v) => v.startsWith('no-cite')));
+  // two cites, one valid one not → ONLY the invalid one (isolates the per-cite has() loop)
+  assert.deepEqual(validateCites(['x [cite: failed_step][cite: bogus]'], idx), ['unresolved-cite: bogus']);
+  assert.deepEqual(validateCites([], idx), [], 'empty observed → no violations');
+  assert.equal(validateCites(['a', 'b [cite: bogus]', 'c [cite: failed_step]'], idx).length, 2, 'violations accumulate across items');
+});
+
+test('★ evidenceThin: thin ONLY with no corroboration — each artifact ALONE lifts it (isolates the 5-way OR)', () => {
+  assert.equal(evidenceThin(mkFacts({})), true, 'nothing corroborating → thin');
+  assert.equal(evidenceThin(mkFacts({ steps: [{ index: 0, name: 's', status: 'fail', error: null }] })), false, 'a failed step ALONE lifts it');
+  assert.equal(evidenceThin(mkFacts({ firstPartyConsole: [{ origin: 'site', level: 'error', sourceHost: 'x', text: 'e' }] })), false, 'a first-party console error ALONE lifts it');
+  assert.equal(evidenceThin(mkFacts({ netFailed: [{ host: 'x', status: -1 }] })), false, 'a failed network request ALONE lifts it');
+  assert.equal(evidenceThin(mkFacts({ httpStatus: 500 })), false, 'an http status ALONE lifts it');
+  assert.equal(evidenceThin(mkFacts({ httpStatus: 0 })), false, 'httpStatus 0 is != null → lifts it (kills a truthy mutant)');
+  // ★ the bait trap: a BROWSER error_message ALONE does NOT lift thin (it can NAME a false cause)
+  assert.equal(evidenceThin(mkFacts({ errorMessage: 'affordance not found (NET-NEW selector)' })), true, 'a browser error_message ALONE stays thin');
+  assert.equal(evidenceThin(mkFacts({ kind: 'multistep', errorMessage: 'x' })), true, 'multistep is browser-like → message does NOT lift it');
+  assert.equal(evidenceThin(mkFacts({ kind: 'http', errorMessage: 'connect ECONNREFUSED' })), false, 'a NON-browser direct message DOES lift it');
+});
+
+test('★ renderFactPack citeIndex: each token present IFF its fact is (isolates every if + the != null vs truthy)', () => {
+  const e = renderFactPack(mkFacts({})).citeIndex;
+  assert.ok(e.has('locations'), 'locations is always present');
+  for (const t of ['error_message', 'failed_step', 'http_status', 'duration', 'history', 'run_steps']) {
+    assert.ok(!e.has(t), `${t} is ABSENT when its fact is absent (kills an if→true mutant)`);
+  }
+  assert.ok(renderFactPack(mkFacts({ errorMessage: 'x' })).citeIndex.has('error_message'));
+  assert.ok(renderFactPack(mkFacts({ failedStep: 's' })).citeIndex.has('failed_step'));
+  assert.ok(renderFactPack(mkFacts({ httpStatus: 200 })).citeIndex.has('http_status'));
+  assert.ok(renderFactPack(mkFacts({ durationMs: 0 })).citeIndex.has('duration'), 'durationMs 0 is != null → present (kills a > 0 mutant)');
+  assert.ok(renderFactPack(mkFacts({ recent: ['pass'] })).citeIndex.has('history'));
+  const withStep = renderFactPack(mkFacts({ steps: [{ index: 0, name: 'login', status: 'pass', error: null }] })).citeIndex;
+  assert.ok(withStep.has('run_steps') && withStep.has('step:login'), 'run_steps + per-step token');
+  assert.ok(renderFactPack(mkFacts({ firstPartyConsole: [{ origin: 'site', level: 'error', sourceHost: 'api.x.com', text: 'e' }] })).citeIndex.has('console:api.x.com'));
+  assert.ok(renderFactPack(mkFacts({ netFailed: [{ host: 'cdn.x.com', status: -1 }] })).citeIndex.has('network:cdn.x.com'));
+  // a console line with NO sourceHost adds no console token (the `if (c.sourceHost)` guard)
+  assert.ok(!renderFactPack(mkFacts({ firstPartyConsole: [{ origin: 'site', level: 'error', sourceHost: '', text: 'e' }] })).citeIndex.has('console:'));
+});
