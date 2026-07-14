@@ -470,7 +470,7 @@ CREATE TABLE incidents (
     -- 'skipped' (no deliverable channel — a REAL state, must not read as success). The columns hold the
     -- LATEST attempt + a running count; the durable per-failure trail is runner_errors.
     notify_attempted_at  TIMESTAMPTZ,
-    notify_status        TEXT        CHECK (notify_status IS NULL OR notify_status IN ('sent', 'failed', 'skipped')),
+    notify_status        TEXT        CONSTRAINT incidents_notify_status_chk CHECK (notify_status IS NULL OR notify_status IN ('sent', 'failed', 'skipped')),
     notify_error         TEXT,
     notify_attempts      INTEGER     NOT NULL DEFAULT 0
 );
