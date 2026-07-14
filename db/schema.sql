@@ -1169,22 +1169,24 @@ RETURNS TABLE (
     interval_seconds      integer,
     region_count          integer,
     avg_duration_s        double precision,
-    projected             numeric,
-    measured              numeric,
-    divergence            numeric,
-    divergence_flag       boolean,
-    projected_raw         numeric,
+    projected             numeric,   -- rounded 2dp (display)
+    measured              numeric,   -- rounded 2dp (display)
+    divergence            numeric,   -- rounded 3dp; null when projected = 0
+    divergence_flag       boolean,   -- divergence > 1.5
+    projected_raw         numeric,   -- unrounded — sum these for the fleet total, THEN round
     measured_raw          numeric,
-    run_count_7d          integer,
-    confirmation_count_7d integer,
-    sandbox_count_7d      integer,
-    run_count_recent      integer,
-    run_count_prior       integer
+    run_count_7d          integer,   -- runs (duration_ms NOT NULL) in the last 7d = the N in divergence = N/expected
+    confirmation_count_7d integer,   -- of those, confirmation re-runs (confirmation_of_run_id NOT NULL, 0077)
+    sandbox_count_7d      integer,   -- of those, sandbox / on-demand fires (runs.sandbox, 0065)
+    run_count_recent      integer,   -- runs in the RECENT half of the window (last 3.5d)
+    run_count_prior       integer    -- runs in the PRIOR half (3.5–7d ago); recent≠prior ⇒ a cadence change
 )
 LANGUAGE sql
 STABLE
 AS $$
     WITH run_stats AS (
+        -- ONE grouped pass over the measured set (duration_ms NOT NULL, last 7d), byte-identical avg/Σ to
+        -- 0069's two correlated subqueries, plus the run-count columns.
         SELECT r.check_id,
                (avg(r.duration_ms) / 1000.0)::float8 AS avg_duration_s,
                (sum(r.duration_ms) / 1000.0)::float8 AS sum_duration_s_7d,
@@ -1209,7 +1211,8 @@ AS $$
                coalesce(rs.run_count_prior, 0)       AS run_count_prior
           FROM checks c
           LEFT JOIN run_stats rs ON rs.check_id = c.id
-         WHERE c.enabled
+         -- ★ 0086: exclude ARCHIVED checks (matches #254 at the source — the last surface it missed).
+         WHERE c.enabled AND c.archived_at IS NULL
     ),
     scored AS (
         SELECT b.*,
@@ -1222,10 +1225,12 @@ AS $$
           FROM base b
     )
     SELECT s.check_id, s.source_key, s.check_name, s.kind, s.interval_seconds, s.region_count, s.avg_duration_s,
-           round(s.p_raw, 2), round(s.m_raw, 2),
-           CASE WHEN s.p_raw > 0 THEN round(s.m_raw / s.p_raw, 3) ELSE NULL END,
-           CASE WHEN s.p_raw > 0 THEN round(s.m_raw / s.p_raw, 3) > 1.5 ELSE false END,
-           s.p_raw, s.m_raw,
+           round(s.p_raw, 2) AS projected,
+           round(s.m_raw, 2) AS measured,
+           CASE WHEN s.p_raw > 0 THEN round(s.m_raw / s.p_raw, 3) ELSE NULL END AS divergence,
+           CASE WHEN s.p_raw > 0 THEN round(s.m_raw / s.p_raw, 3) > 1.5 ELSE false END AS divergence_flag,
+           s.p_raw AS projected_raw,
+           s.m_raw AS measured_raw,
            s.run_count_7d, s.confirmation_count_7d, s.sandbox_count_7d, s.run_count_recent, s.run_count_prior
       FROM scored s
 $$;
