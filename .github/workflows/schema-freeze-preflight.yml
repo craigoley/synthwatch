@@ -4,12 +4,16 @@ name: Schema-freeze pre-flight
 # main LIVE (correct — liveness gives it teeth), so a runner schema change merges green and freezes the api's
 # gate on someone else's unrelated PR. This has happened THREE times (countable_run, retry_count,
 # audit_check_location_change). This pre-flight runs the API's OWN check-schema-parity.sh (RUNNER_PARITY=1) —
-# the SAME enumerator, reused, never a second definition of "schema object" — against THIS PR's schema and the
-# api fixture at main. If the PR adds/changes an object the fixture lacks, it reds and NAMES the object.
+# the SAME enumerator, reused, never a second definition of "schema object" — against THIS PR's schema.
 #
-# ★ ADVISORY, NOT A HARD STOP: this is a standalone workflow, deliberately NOT in the required ci-gate. It
-# turns red and tells you exactly what to do; it does not forbid the merge (Craig hand-manages merge order by
-# choice). A gate that forbids a legitimate workflow gets disabled; one that tells you the next step gets used.
+# ★ IT IS A REAL GATE, AND IT IS SATISFIABLE. It reds only when THIS PR changes a shared object the api fixture
+# does not yet carry AND no open api PR fixes that — i.e. when the paired-fixture work is not done. A red here
+# is caught by the runner ci-gate's failure-aggregation (this check is not in ci-gate's IGNORE list), so it
+# HOLDS the merge — intended, because it clears the moment you open the paired api fixture PR: the guard
+# searches open api PRs and re-runs parity against each candidate's fixture at its head (see below). A guard
+# that tells you to do a thing must be able to SEE that you did; the earlier "advisory, compares only vs api
+# main" version could not, so it deadlocked #313 ⟷ #255 and cost an --admin bypass. Reds when the work isn't
+# done; clears when it is — not advisory, not a trap.
 
 on:
   pull_request:
@@ -89,7 +93,8 @@ jobs:
           found=""
           while read -r n sha; do
             [ -n "$n" ] || continue
-            gh api "repos/$API_REPO/contents/$FIXTURE_PATH?ref=$sha" -q '.content' 2>/dev/null | base64 -d > /tmp/cand.sql 2>/dev/null
+            # raw media type (not the base64 JSON body): size-safe past the 1 MB contents-API base64 cap.
+            gh api "repos/$API_REPO/contents/$FIXTURE_PATH?ref=$sha" -H "Accept: application/vnd.github.raw" > /tmp/cand.sql 2>/dev/null
             [ -s /tmp/cand.sql ] || { echo "  #$n: no fixture at head — skip"; continue; }
             if cmp -s /tmp/cand.sql "$MAIN_FIXTURE"; then echo "  #$n: fixture == main — skip"; continue; fi
             parity /tmp/cand.sql /tmp/cand.out
