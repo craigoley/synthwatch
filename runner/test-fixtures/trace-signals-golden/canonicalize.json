@@ -1,0 +1,59 @@
+{
+  "_comment": "SHARED golden for the console-text canonicalizer — a SECOND implementation of the same canonical form exists in each repo (runner: canonicalizeConsole in transientClass.ts; api: TraceSignalsDiff.Canonicalize in Infrastructure/TraceSignalsDiff.cs). Both MUST produce byte-identical `expected` for every `input`, or the flake budget (runner) and the error diff (api) would disagree about what counts as 'the same error' — the exact class of bug that made the transient classifier lie (#299). Enforced by canonicalizeGoldenParity.test.ts (runner) + TraceSignalsGoldenParity (api). `expected` was generated from the runner impl and asserted equal on both sides. To prove the gate can fail: change one regex in EITHER impl and this reds.",
+  "cases": [
+    {
+      "name": "hashed_chunk_deploy_stability",
+      "why": "a per-deploy chunk hash (>=12 chars) collapses to '*' so the SAME ChunkLoadError keys identically across deploys",
+      "input": "Failed to load /_next/static/chunks/main.9f8e7d6c5b4a.js",
+      "expected": "failed to load /_next/static/chunks/main.*.js"
+    },
+    {
+      "name": "hashed_chunk_different_deploy",
+      "why": "a DIFFERENT hash for the same chunk must yield the SAME canonical key as above (deploy stability)",
+      "input": "Failed to load /_next/static/chunks/main.0123456789ab.js",
+      "expected": "failed to load /_next/static/chunks/main.*.js"
+    },
+    {
+      "name": "short_hash_below_threshold_not_collapsed",
+      "why": "documents the LONG_TOKEN {12,} threshold — a 6-char id is left intact; both impls agree (no divergence)",
+      "input": "loaded chunk.a1b2c3.js ok",
+      "expected": "loaded chunk.a1b2c3.js ok"
+    },
+    {
+      "name": "iso_timestamp_stripped",
+      "why": "an ISO-8601 timestamp is removed so two errors that differ only by when they logged key the same",
+      "input": "Error at 2026-07-14T02:33:10.123Z: connection reset",
+      "expected": "error at : connection reset"
+    },
+    {
+      "name": "query_string_stripped",
+      "why": "a ?query (cache-buster / token / session id) is removed to the next whitespace/quote/paren",
+      "input": "GET https://www.wegmans.com/api/cart?token=abc&t=123 failed",
+      "expected": "get https://www.wegmans.com/api/cart failed"
+    },
+    {
+      "name": "long_token_collapsed",
+      "why": "a >=12-char id/hash token collapses to '*' (session ids, request ids)",
+      "input": "Uncaught error: sessionId a1b2c3d4e5f6g7h8 invalid",
+      "expected": "uncaught error: sessionid * invalid"
+    },
+    {
+      "name": "mixed_case_lowered",
+      "why": "case is normalised (ToLowerInvariant / toLowerCase) so 'NULL' and 'null' key the same",
+      "input": "TypeError: X is NULL",
+      "expected": "typeerror: x is null"
+    },
+    {
+      "name": "whitespace_collapsed_and_trimmed",
+      "why": "runs of whitespace (incl. tabs/newlines) collapse to one space and both ends are trimmed",
+      "input": "  multiple   spaces\tand\ntabs  ",
+      "expected": "multiple spaces and tabs"
+    },
+    {
+      "name": "combined_all_transforms_in_order",
+      "why": "every transform together, exercising ORDER (lower -> iso -> query -> long-token -> whitespace -> trim)",
+      "input": "ERROR 2026-07-14T02:33:10Z chunk main.9f8e7d6c5b4a.js?v=99 FAILED  twice",
+      "expected": "error chunk main.*.js failed twice"
+    }
+  ]
+}
