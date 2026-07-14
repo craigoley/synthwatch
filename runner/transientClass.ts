@@ -19,9 +19,19 @@ interface NetworkFailed {
   thirdParty?: boolean;
   resourceType?: string;
 }
-/** The slice of trace_signals this classifier reads — network failures only. */
+/** One `console.messages[]` entry. origin/sourceHost are computed at capture via the SAME first-party
+ *  allowlist that sets network `thirdParty` (traceSignals.ts) — so 'site' here is the identical notion. */
+interface ConsoleMsg {
+  level?: string;
+  origin?: string; // 'site' = first-party, 'third-party' = not
+  sourceHost?: string;
+  text?: string;
+}
+/** The slice of trace_signals this classifier reads: network failures AND console messages. Reading console
+ *  too fixes the blind spot that mis-classified run 963205 (five first-party console errors, zero seen). */
 export interface TraceSignalsLike {
   network?: { failed?: NetworkFailed[] | null } | null;
+  console?: { messages?: ConsoleMsg[] | null } | null;
 }
 
 // A FAILED first-party request of one of these types is a real service non-response. image / ping / beacon /
@@ -58,26 +68,73 @@ function firstPartyFailedKeys(sig: TraceSignalsLike | null | undefined): Set<str
   return keys;
 }
 
+// ── Console side (the fix) ──────────────────────────────────────────────────────────────────────────────
+// A NEW first-party ERROR-level console message is a service signal, exactly as a new first-party failed
+// request is. classifyTransient was blind to it — it read network.failed ONLY — so run 963205's five
+// first-party errors (ChunkLoadError, a failed prod-API fetch, cart/cooklist mutation failures,
+// ERR_CONNECTION_CLOSED) all scored ZERO and the run mis-classified as monitor-side (its lifetime-only, 100%
+// false positive). The site was broken; the chip said the monitor was flaky.
+
+// ★ PARITY: canonicalize console TEXT the SAME way the API's C# TraceSignalsDiff.Canonicalize does — lowercase,
+// strip ISO timestamps + query strings, collapse [a-z0-9_-]{12,} id/hash tokens to '*', normalise whitespace;
+// same regexes, same order. This is a SECOND implementation of that canonical form (the recurring runner↔C#
+// parity class) — guard the two with a shared golden fixture (see PR). A drift here silently re-blinds the gate.
+const ISO_TS = /\d{4}-\d{2}-\d{2}t[\d:.]+z?/gi;
+const QUERY = /\?[^\s'")]*/g;
+const LONG_TOKEN = /[a-z0-9_-]{12,}/gi;
+const WS = /\s+/g;
+export function canonicalizeConsole(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(ISO_TS, '')
+    .replace(QUERY, '')
+    .replace(LONG_TOKEN, '*')
+    .replace(WS, ' ')
+    .trim();
+}
+
+// Error-class levels that signal a real failure (not info/log/warning chatter). pageerror = uncaught exception.
+const CONSOLE_ERROR_LEVELS = new Set(['error', 'pageerror']);
+
+/** Canonical keys for FIRST-PARTY, ERROR-level console messages in one run's signals. `console:`-prefixed so
+ *  they join the SAME "new vs baseline" set as network keys without ever colliding with a host+pathname. Reuses
+ *  the existing first-party notion (origin === 'site') — NOT a second predicate. */
+function firstPartyConsoleKeys(sig: TraceSignalsLike | null | undefined): Set<string> {
+  const keys = new Set<string>();
+  for (const m of sig?.console?.messages ?? []) {
+    if (m.origin !== 'site') continue; // first-party only
+    if (m.level == null || !CONSOLE_ERROR_LEVELS.has(m.level)) continue;
+    if (!m.text) continue;
+    keys.add(`console:${m.sourceHost ?? ''}|${canonicalizeConsole(m.text)}`);
+  }
+  return keys;
+}
+
 /**
  * Classify the superseded transient given its OWN signals + the last-N settled baseline runs' signals.
  *   • indeterminate — the failing run captured NO trace_signals (http/dns/ssl, or a strand). We can't see a
  *     first-party service error, so we DON'T guess — and B3-3 burns nothing for it.
- *   • service-side  — the failing run carried a NEW first-party service failure (a first-party fetch/xhr/doc
- *     that failed and is NOT in the baseline union). A real blip the monitor caught (355's Wegmans fetch).
- *   • monitor-side  — trace_signals present, but NO new first-party failure: a monitor-side assertion /
- *     selector race (222's "grid rendered 0 rows"; its _rsc failures are PERSISTENT baseline noise, not new).
+ *   • service-side  — the failing run carried a NEW first-party service failure — a first-party fetch/xhr/doc
+ *     that FAILED, OR a first-party ERROR-level CONSOLE message — that is NOT in the baseline union. A real
+ *     blip the monitor caught (355's ChunkLoadError + failed prod-API fetch).
+ *   • monitor-side  — trace_signals present, but NO new first-party failure (network OR console): a genuine
+ *     monitor-side assertion / selector race (222's "grid rendered 0 rows"; persistent baseline noise, not new).
  *
- * ★ The "NEW vs baseline" clause is the whole discriminator — it is the ONLY thing separating a persistent
- * first-party teardown failure (present every run) from a first-party failure that DEBUTED in this transient.
+ * ★ The "NEW vs baseline" clause is the whole discriminator. It now spans BOTH network.failed AND
+ * console.messages: a first-party service failure often manifests only in the console (a chunk-load error, an
+ * uncaught fetch rejection), never as a captured failed request — reading network alone was blind to it.
  */
 export function classifyTransient(
   original: TraceSignalsLike | null | undefined,
   baseline: (TraceSignalsLike | null | undefined)[],
 ): TransientClass {
   if (original == null) return 'indeterminate';
-  const keys = firstPartyFailedKeys(original);
+  const keys = new Set<string>([...firstPartyFailedKeys(original), ...firstPartyConsoleKeys(original)]);
   const baseKeys = new Set<string>();
-  for (const b of baseline) for (const k of firstPartyFailedKeys(b)) baseKeys.add(k);
+  for (const b of baseline) {
+    for (const k of firstPartyFailedKeys(b)) baseKeys.add(k);
+    for (const k of firstPartyConsoleKeys(b)) baseKeys.add(k);
+  }
   const hasNewFirstParty = [...keys].some((k) => !baseKeys.has(k));
   return hasNewFirstParty ? 'service-side' : 'monitor-side';
 }
