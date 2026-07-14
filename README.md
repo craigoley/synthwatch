@@ -3,6 +3,11 @@
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/craigoley/synthwatch/badge)](https://scorecard.dev/viewer/?uri=github.com/craigoley/synthwatch)
 [![CodeQL](https://github.com/craigoley/synthwatch/actions/workflows/codeql.yml/badge.svg)](https://github.com/craigoley/synthwatch/actions/workflows/codeql.yml)
 
+> ### 🛠️ New here? **[DEVELOPMENT.md](DEVELOPMENT.md)** first.
+> A one-command devcontainer builds **and tests both repos** (runner + `synthwatch-api`) against a real
+> Postgres 16 — so nothing is push-and-pray and the schema gates are provable locally. From a clean clone:
+> `docker compose -f .devcontainer/docker-compose.yml up -d && … exec app bash .devcontainer/verify.sh`.
+
 A self-hosted synthetic monitoring system. SynthWatch runs **HTTP** and
 **real-browser (Playwright)** checks on a timer, records every run (and every
 *step* of a browser flow), and opens/resolves debounced incidents with pluggable
