@@ -340,3 +340,25 @@ nodeTest('★ critical is never debounced: a sub-warning region that spreads to 
     assert.equal(await openIncidentSeverity(check.id), 'critical', '★ CRITICAL directly — the debounce never delayed it');
   } finally { await pool.query(`DELETE FROM checks WHERE id = $1`, [check.id]); }
 });
+
+// ★ RESOLVE AT WARNING (Claude-review gap): a WARNING incident must resolve cleanly when its region recovers,
+// AND route its recovery at its OWN severity (open.severity='warning'), not check.severity (='critical'). The
+// four open/escalate tests didn't cover the resolve-from-warning path.
+nodeTest('★ resolve at WARNING: a WARNING incident resolves as WARNING when its region recovers', { skip: SKIP }, async () => {
+  const check = await makeCheck(1, '__resolve_warning__'); // ft=1 → warning bar = 2
+  try {
+    await seedAt(check.id, 'fail', 'westus2', 30);
+    const w = await seedAt(check.id, 'fail', 'westus2', 25); // westus2 down 2 → past the 2× bar
+    await seedAt(check.id, 'pass', 'centralus', 24);
+    await seedAt(check.id, 'pass', 'eastus2', 23);
+    await evaluate(check, w);
+    assert.equal(await openIncidentSeverity(check.id), 'warning', 'a WARNING incident is open');
+    const rec = await seedAt(check.id, 'pass', 'westus2', 2); // westus2 recovers → failing/failingWarning → 0
+    await evaluate(check, rec);
+    assert.equal(await openIncidentCount(check.id), 0, 'the WARNING incident resolves when the region recovers');
+    const { rows } = await pool.query<{ status: string; severity: string }>(
+      `SELECT status, severity FROM incidents WHERE check_id = $1 ORDER BY id DESC LIMIT 1`, [check.id]);
+    assert.equal(rows[0].status, 'resolved', 'incident is resolved');
+    assert.equal(rows[0].severity, 'warning', '★ resolved AS warning — its recovery routes to the warning channel, not critical');
+  } finally { await pool.query(`DELETE FROM checks WHERE id = $1`, [check.id]); }
+});

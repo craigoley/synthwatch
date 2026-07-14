@@ -257,11 +257,15 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
             `[runner] check ${check.id} "${check.name}" recovered — recovery alert suppressed (maintenance window)`,
           );
         } else {
+          // ★ 0085: route the RECOVERY at the incident's OWN severity (open.severity), NOT check.severity. A
+          // WARNING incident opened + paged the warning-severity channel; its "recovered" must go back to that
+          // SAME channel, or the warning channel never sees closure and the critical channel sees a recovery
+          // for an incident it never saw open (check.severity is 'critical' for every affected check).
           const resolveDispatch = await dispatchAlerts(
             {
               checkId: check.id,
               checkName: check.name,
-              severity: check.severity,
+              severity: open.severity,
               status: 'resolved',
               summary: `Check "${check.name}" recovered.`,
               runId: run.id,
@@ -273,7 +277,7 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
                 rca: resolvedInc.rca ?? null,
               },
             },
-            await resolveChannels(check.id, check.severity),
+            await resolveChannels(check.id, open.severity),
           );
           await recordIncidentDispatch(open.id, check.id, 'resolve', resolveDispatch);
         }
@@ -321,13 +325,13 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
   // a shrinking outage never downgrades a live incident (it resolves via the recovery path). Page on the flip.
   if (open) {
     const escalating = open.severity === 'warning' && desired === 'critical';
-    const { rows: escRows } = await pool.query<{ severity: 'critical' | 'warning' }>(
+    const { rows: escRows } = await pool.query<{ severity: 'critical' | 'warning'; opened_at: Date }>(
       `UPDATE incidents
           SET consecutive_failures = $2,
               severity = CASE WHEN $3 THEN 'critical' ELSE severity END,
               summary  = CASE WHEN $3 THEN $4 ELSE summary END
         WHERE id = $1 AND status = 'open'
-        RETURNING severity`,
+        RETURNING severity, opened_at`,
       [open.id, consecutive, escalating, summary],
     );
     if (escalating && escRows[0]?.severity === 'critical') {
@@ -349,7 +353,7 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
             incident: {
               incidentId: open.id,
               targetUrl: check.target_url,
-              openedAt: new Date().toISOString(),
+              openedAt: escRows[0].opened_at?.toISOString() ?? new Date().toISOString(),
               locations: await failingLocationNames(check),
               consecutiveFailures: consecutive,
               rca: null,
