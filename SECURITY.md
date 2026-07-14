@@ -90,6 +90,47 @@ If you find a way to execute code that did **not** pass the monitors-repo merge 
 `spec_cache` write path, a fetch redirect, an escape from the esbuild `lib/flow` alias —
 that is a vulnerability; please report it via the private channel above.
 
+## Secret & credential model — how a monitor authenticates (and where a credential can leak)
+
+A monitor that logs in or sends a bypass token uses **runner-held secrets**, never credentials
+stored in the DB or the repo. Verified in code (source: `docs/proposals/spec-auth-and-secrets.md`):
+
+- **Secrets are injected as runner env vars, referenced by NAME.** An HTTP/multistep check's
+  `auth` carries only an env-var *name* (`token_env` / `password_env` / `value_env`) →
+  `process.env[name]` at run time (`runner/httpCheck.ts:47-65`, `buildAuthHeader`). Nothing
+  secret is stored in the DB or echoed. Prod injection: a `@secure` bicep param → a job secret →
+  a `secretRef` env on the runner jobs.
+- **Option-C browser specs read `process.env.<NAME>` directly** — the compiled spec runs *in the
+  runner process*, so it sources its credential straight from a runner env var (the sanctioned
+  pattern in `docs/AUTHORING.md`). This is a **global** namespace: every spec in the process can
+  read every secret env var — fine for a shared bypass token or one shared test account, not for
+  many distinct per-monitor logins.
+- **A spec gets the REAL Playwright `page`** (`runner/specfetch/specShim.ts:70`), on a context
+  the harness creates with **no lockdown** (bare `b.newContext()`, `runner/index.ts:991`). So a
+  spec can already `page.setExtraHTTPHeaders(...)` / `page.context().addCookies(...)` (e.g. a
+  Vercel protection-bypass header) with the standard Playwright API.
+- **★ `checks.auth` is NOT applied to browser contexts.** `auth` is consumed ONLY by the HTTP
+  path (`runner/httpCheck.ts:82`) and multistep (`runner/multistep.ts:193`); `executeBrowser`
+  never reads it. Browser specs authenticate via `process.env`, not `checks.auth` — do not assume
+  the two share a path.
+
+### Where a credential can leak (and the mitigations)
+
+- **`trace_signals` (persisted, AI-fed) — low risk.** The extractor keeps only request `url`, the
+  `content-encoding` header, and console `text`/`location` — **no `Authorization`/cookie headers,
+  no request bodies, no `fill` values** — so a header-injected token or a POST-body password never
+  reaches AI. Residual: a credential in a **URL query** or printed to **console** would survive; a
+  value-scrub against the known `process.env` secret values closes it (a proposed ★DECISION).
+- **The raw trace zip — higher risk.** `tracing.start({ screenshots, snapshots })` records the
+  action log (a `page.fill` captures its **value**) and network request **headers**, so the zip
+  *can* contain credentials — and the **success-baseline** zip persists indefinitely. Prefer
+  **header / cookie / storageState** injection over a visible `page.fill`, and treat an
+  authenticated monitor's baseline zip as sensitive. ★DECISION items, for sign-off.
+
+_The forward-looking mitigations (value-scrub, per-monitor creds, baseline-zip handling) are
+proposals awaiting sign-off — `docs/proposals/spec-auth-and-secrets.md`. The OBSERVED capabilities
+and the `checks.auth`-not-on-browser fact are current, verified behaviour._
+
 ## What is in scope
 
 - The runner (`runner/`), the database schema (`db/`), and the container image.

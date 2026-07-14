@@ -407,6 +407,12 @@ export function computeDrift(
 }
 
 // --- Field-split policy (the strict column allow-list), as data so tests can assert on it.
+// ★ OWNERSHIP MODEL (the rule that governs all three lists below): a `checks` column in NEITHER
+//   GIT_AUTHORITATIVE_COLUMNS nor SEED_ONLY_COLUMNS is DASHBOARD-OWNED — it appears in no INSERT column
+//   list and no UPDATE SET (see insertColumns / updateColumns / CHANGED_UPDATE_COLUMNS below), so reconcile
+//   NEVER emits SQL touching it and a dashboard-set value SURVIVES every reconcile. Adding a column to
+//   GIT_AUTHORITATIVE hands the manifest authority over it (it will overwrite the dashboard); leaving it out
+//   keeps it dashboard-owned. This is the field-split contract — do not "helpfully" widen a list.
 /** Git-authoritative: overwritten on every apply (INSERT and UPDATE). B10's sensitive/redact_patterns
  *  are here (NOT seed-only/dashboard-owned) ON PURPOSE: the manifest is the single source of truth for
  *  the redaction policy, so a manifest change re-syncs it and the dashboard can't silently disable it. */

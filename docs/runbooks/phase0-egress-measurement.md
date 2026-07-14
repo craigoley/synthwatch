@@ -1,5 +1,7 @@
 # Runbook — Phase 0: measure the monitors' real egress IP (is it already stable?)
 
+> _Verified 2026-07-14 — prose with **no automated check**; if the code disagrees, the code is authoritative. This doc CAN rot._
+
 **Goal:** find the actual public egress IP each regional monitor leaves from, and whether it's a **single stable IP** (→ allowlist as-is, **zero infra**) or **rotates across a pool** (→ Phase 1: proxy/NAT). See `ANALYSIS-static-egress-ip-2026-06-30.md`.
 
 **Owner:** Craig runs these (they create + start throwaway Azure jobs). Recon/build provisioned nothing.

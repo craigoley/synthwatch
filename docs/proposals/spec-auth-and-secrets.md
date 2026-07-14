@@ -1,5 +1,7 @@
 # Proposal — authenticated monitors: secrets, bypass headers, and trace redaction
 
+> _Verified 2026-07-14 — prose with **no automated check**; if the code disagrees, the code is authoritative. This doc CAN rot._
+
 **Status:** recon + proposal (no prod auth/secrets re-wired here — needs Craig's sign-off on the bits flagged ★DECISION).
 **Scope:** can a spec (a) read injected secrets and (b) set HTTP headers/cookies (e.g. the Vercel bypass)? And does a login leak the password into the persisted trace signals / AI insights? RECON first, then the minimal addition.
 
