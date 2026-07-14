@@ -674,21 +674,24 @@ export async function sendRcaReadyEnrichment(
   incidentId: number,
   rca: { classification: string; confidence: string; summary?: string },
 ): Promise<void> {
-  const claim = await pool.query<{ id: number }>(
+  const claim = await pool.query<{ id: number; severity: 'critical' | 'warning' }>(
     `UPDATE incidents SET rca_notified_at = now()
       WHERE id = $1 AND rca_notified_at IS NULL
-      RETURNING id`,
+      RETURNING id, severity`,
     [incidentId],
   );
   if (!claim.rows[0]) return; // already enriched once — do not re-send
 
-  // SAME channels as the open alert (Craig's decision) — identical resolution.
-  const channels = await resolveChannels(check.id, check.severity);
+  // ★ 0085: route the RCA-ready enrichment at the INCIDENT's severity (a critical-configured check can now
+  // hold a WARNING incident), NOT check.severity — same channel the open alert used, so the enrichment lands
+  // where the operator saw it open.
+  const incidentSeverityForAlert = claim.rows[0].severity;
+  const channels = await resolveChannels(check.id, incidentSeverityForAlert);
   const enrichDispatch = await dispatchAlerts(
     {
       checkId: check.id,
       checkName: check.name,
-      severity: check.severity,
+      severity: incidentSeverityForAlert,
       status: 'open', // still the open incident; rcaReady governs the wording/subject
       rcaReady: true,
       summary: `Root-cause analysis is ready for incident #${incidentId}.`,
