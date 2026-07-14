@@ -47,20 +47,21 @@ async function supersede(origId: number, byId: number): Promise<void> {
 
 const WINDOW: [Date, Date] = [new Date(Date.now() - 3_600_000), new Date(Date.now() + 60_000)];
 
-// ── The canonical view: excludes confirmation / superseded / sandbox / running / infra_error; keeps a real
-//    scheduled run. RED on main (view does not exist → query throws); GREEN on the fix. ──────────────────
-nodeTest('countable_run keeps a scheduled run and excludes confirmation / superseded / sandbox / running', { skip: SKIP }, async () => {
+// ── The canonical view: excludes ALL confirmation runs (symmetric, 0083) / superseded / sandbox / running /
+//    infra_error; keeps a real scheduled run. RED on main (view does not exist → query throws); GREEN on the
+//    fix. Also the symmetric must-go-red: the PASSING confirmation (tc) is excluded, not kept. ─────────────
+nodeTest('countable_run keeps a scheduled run and excludes ALL confirmations / superseded / sandbox / running', { skip: SKIP }, async () => {
   const id = await makeCheck('__cr_view__');
   try {
     const s1 = await seedRun(id, 'fail', 50);              // scheduled real run — COUNTS
-    await seedRun(id, 'fail', 40, { confirmationOf: s1 }); // DOWN confirmation of s1 — excluded (redundant re-check)
+    await seedRun(id, 'fail', 40, { confirmationOf: s1 }); // DOWN confirmation of s1 — excluded (re-check)
     const t = await seedRun(id, 'fail', 35);               // a transient...
     const tc = await seedRun(id, 'pass', 30, { confirmationOf: t }); // ...whose confirmation PASSED
-    await supersede(t, tc);                                // t superseded → excluded; tc is the RECOVERY (pass conf) → KEPT
+    await supersede(t, tc);                                // t superseded → excluded; tc is a confirmation → ALSO excluded (0083: a re-check is neither up nor down)
     await seedRun(id, 'fail', 20, { sandbox: true });      // sandbox — excluded
     await pool.query(`INSERT INTO runs (check_id, status, started_at, location) VALUES ($1,'running',now()- interval '15 min','default'),($1,'infra_error',now()- interval '10 min','default')`, [id]);
     const { rows } = await pool.query<{ n: string }>(`SELECT count(*) AS n FROM countable_run WHERE check_id = $1`, [id]);
-    assert.equal(Number(rows[0].n), 2, 'kept: the scheduled fail + the PASSING confirmation (recovery). excluded: down-confirmation, superseded, sandbox, running, infra_error');
+    assert.equal(Number(rows[0].n), 1, 'kept: ONLY the scheduled fail. excluded: BOTH confirmations (down AND pass — a re-check is not an observation, 0083 symmetric), superseded, sandbox, running, infra_error');
   } finally { await pool.query(`DELETE FROM checks WHERE id = $1`, [id]); }
 });
 
@@ -81,21 +82,22 @@ nodeTest('sla_availability EXCLUDES confirmation runs (33.33% on main → 50% on
 });
 
 // ── ★ A self-healed transient must not CRATER availability: its superseded fail counts ZERO as DOWN, and its
-//    passing confirmation (the recovery) counts as UP — the deliberate confirmationRetry #7/#8 behaviour the
-//    canonical view PRESERVES (excluding the pass would erase it). ──────────────────────────────────────────
-nodeTest('sla_availability: a self-healed transient — fail counts 0 down, recovery counts up (100%)', { skip: SKIP }, async () => {
+//    passing confirmation is EXCLUDED too (0083 symmetric — a re-check is neither up nor down). So the tick
+//    contributes only the surrounding scheduled sample; availability is unmoved (no down counted), NOT
+//    inflated by an extra up. ───────────────────────────────────────────────────────────────────────────────
+nodeTest('sla_availability: a self-healed transient — fail counts 0 down, its confirmation is excluded (100%, not inflated)', { skip: SKIP }, async () => {
   const id = await makeCheck('__cr_sla_super__');
   try {
     await seedRun(id, 'pass', 40);
     const t = await seedRun(id, 'fail', 35);
     const tc = await seedRun(id, 'pass', 30, { confirmationOf: t }); // the confirmation PASSED → transient recovered
-    await supersede(t, tc);                                          // t superseded → excluded; tc (recovery) → KEPT as up
+    await supersede(t, tc);                                          // t superseded → excluded; tc is a confirmation → ALSO excluded (0083)
     const { rows } = await pool.query<{ availability_pct: string; completed_runs: string; down_runs: string }>(
       `SELECT availability_pct, completed_runs, down_runs FROM sla_availability($1, $2) WHERE check_id = $3`,
       [WINDOW[0], WINDOW[1], id]);
     assert.equal(Number(rows[0].down_runs), 0, 'the superseded transient fail never counts as down');
-    assert.equal(Number(rows[0].completed_runs), 2, 'the original pass + the passing confirmation (recovery)');
-    assert.equal(Number(rows[0].availability_pct), 100, 'availability stays 100 — recovery is up, transient fail excluded');
+    assert.equal(Number(rows[0].completed_runs), 1, 'only the surrounding scheduled pass — BOTH the transient fail (superseded) and its passing confirmation (re-check) are excluded');
+    assert.equal(Number(rows[0].availability_pct), 100, 'availability stays 100 from the clean scheduled pass — not inflated by counting the confirmation as an extra up');
   } finally { await pool.query(`DELETE FROM checks WHERE id = $1`, [id]); }
 });
 

@@ -189,7 +189,14 @@ nodeTest('rollup down_count EXCLUDES a superseded transient', { skip: SKIP }, as
     const { rows } = await pool.query<{ down_count: number; up_count: number }>(
       `SELECT down_count, up_count FROM daily_check_rollup WHERE check_id = $1 AND day = $2`, [check.id, day]);
     assert.equal(rows[0].down_count, 0, 'the superseded transient must NOT count as down');
-    assert.equal(rows[0].up_count, 1, 'only the passing confirmation counts as up');
+    // ★ DECISION CHANGE (0083 — the symmetric countable_run predicate). The passing confirmation is a
+    // RE-CHECK of the sample already in this window — neither a new up nor a new down; it is a transient,
+    // which flake_status measures. 0081's "keep it as an up" was asymmetric in the flattering direction
+    // (it took the good re-sample and discarded the bad), inflating availability by one up per transient.
+    // This assertion is edited ON PURPOSE because the DECISION it encodes changed — NOT to dodge a guardrail
+    // (guardrail-2). It is the symmetric must-go-red: a PASSING confirmation must contribute ZERO up —
+    // RED on down-only main (up=1), GREEN on the symmetric fix (up=0). See db/migrations/0083 + PR body.
+    assert.equal(rows[0].up_count, 0, 'a passing confirmation is a re-check, not an up — excluded (0083 symmetric)');
   } finally {
     await pool.query(`DELETE FROM checks WHERE id = $1`, [check.id]);
   }
@@ -210,7 +217,10 @@ nodeTest('rollup down_count EXCLUDES a superseded HTTP transient (read-side is k
     const { rows } = await pool.query<{ down_count: number; up_count: number }>(
       `SELECT down_count, up_count FROM daily_check_rollup WHERE check_id = $1 AND day = $2`, [check.id, day]);
     assert.equal(rows[0].down_count, 0, 'the superseded http transient must NOT count as down');
-    assert.equal(rows[0].up_count, 1, 'only the passing http confirmation counts as up');
+    // ★ DECISION CHANGE (0083 symmetric predicate) — kind-agnostic: a passing http confirmation is a
+    // re-check, not an up. Edited on purpose (the decision changed), not to dodge guardrail-2. RED on
+    // down-only main (up=1), GREEN on the symmetric fix (up=0). See db/migrations/0083 + PR body.
+    assert.equal(rows[0].up_count, 0, 'a passing http confirmation is a re-check, not an up — excluded (0083 symmetric)');
   } finally {
     await pool.query(`DELETE FROM checks WHERE id = $1`, [check.id]);
   }

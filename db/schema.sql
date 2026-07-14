@@ -844,15 +844,36 @@ BEGIN;
 -- incident verdict (runner/evaluate.ts aggregateVerdict + countConsecutiveDown). ★ flake_status
 -- deliberately does NOT use it — a flap IS a superseded run (see its comment below). Maintenance-window
 -- exclusion stays per-consumer (contextual: run.started_at vs each window's range).
+-- ★ EXPLICIT column list, NOT SELECT * (0083). SELECT * pinned EVERY runs column into the view's contract —
+-- including retry_count, which no consumer reads yet whose drop the view then blocked (a view on SELECT * is
+-- a schema contract nobody agreed to; it froze synthwatch-api's fixture-vs-migrations parity gate). List only
+-- what the five consumers read — adding a column later is a deliberate act. Consumers & their columns:
+-- sla_availability/slo_status (check_id, started_at, status); aggregateVerdict + countConsecutiveDown
+-- (check_id, started_at, status, location); computeRollupForDay (id, check_id, started_at, status, duration_ms).
 CREATE OR REPLACE VIEW countable_run AS
-    SELECT *
+    SELECT id, check_id, status, started_at, location, duration_ms
       FROM runs
      WHERE status NOT IN ('running', 'infra_error')
        AND superseded_by_run_id IS NULL
-       -- Exclude only a DOWN confirmation (a redundant re-check of the scheduled failure it confirms → fixes
-       -- the outage double-count). A PASSING confirmation is the transient's RECOVERY — the "up" for that
-       -- tick — and is KEPT (else a self-healed blip contributes zero availability; confirmationRetry #7/#8).
-       AND NOT (confirmation_of_run_id IS NOT NULL AND status IN ('fail', 'error'))
+       -- ★ A confirmation run is a SECOND SAMPLE of a tick we ALREADY sampled — not a new observation.
+       -- The scheduled probe at 10:00 FAILED. That is the observation on the cadence. We then took another
+       -- sample, OFF-CADENCE and TRIGGERED BY THE FAILURE, and it passed.
+       -- ★ Counting that pass as "up" means: when a scheduled probe fails, re-roll, and report the good
+       -- result. We ONLY ever re-roll on a bad result — a passing scheduled run never gets a second sample.
+       -- So the extra samples are drawn EXCLUSIVELY from the failure population and ONLY the good outcomes
+       -- survive. That is not modeling. It is a bias with a mechanism.
+       -- ★★ THE PROOF: a service that fails 50% of scheduled runs, whose confirmations all pass, reports
+       -- 100% AVAILABILITY under the asymmetric rule — every failure is superseded (excluded) AND replaced
+       -- by a passing confirmation (counted). The denominator never sees them.
+       -- ★ The transient is NOT lost information — it is recorded in flake_status, with its own
+       -- classification, budget, and directed task. That is why the flake budget is a SEPARATE AXIS.
+       -- Excluding both says "this tick was a transient, counted over there." Counting the recovery as "up"
+       -- says "it was fine" — which it demonstrably was not.
+       -- ★ ACCEPTED COST: a self-healed blip contributes ZERO to availability, thinning the denominator.
+       -- A thin denominator is VISIBLE (the sample count is right there). An inflated numerator is INVISIBLE,
+       -- and it inflates most on exactly the monitors you trust least. Take the metric that admits it
+       -- doesn't know. (Ruling, not a bug fix — see db/migrations/0083; confirmationRetry #7/#8 updated.)
+       AND confirmation_of_run_id IS NULL
        AND NOT sandbox;
 
 CREATE OR REPLACE FUNCTION sla_availability(p_from timestamptz, p_to timestamptz)
