@@ -16,8 +16,10 @@ import { confirmByRerunEligible, usesDedicatedExecution } from './retry.js';
 import { fireRunnerJobStart } from './jobTrigger.js';
 import { classifyTransient, type TraceSignalsLike } from './transientClass.js';
 
-/** Last-N settled runs used as the anti-flap baseline for transient classification (mirrors the API
- *  ErrorDiff.BaselineRuns=4 — a first-party failure present across recent runs is persistent, not "new"). */
+/** Last-N SUCCESSFUL (pass/warn) runs used as the anti-flap baseline for transient classification. N=4
+ *  matches the API ErrorDiff.BaselineRuns=4 COUNT, but the runner deliberately baselines against SUCCESSFUL
+ *  runs (not settled ones, as the API error-diff does) so a sustained failure never enters its own baseline —
+ *  the sustained-outage inversion fix. See classifyAndPersistTransient. */
 const TRANSIENT_BASELINE_RUNS = 4;
 
 interface OpenIncident {
@@ -955,11 +957,11 @@ export interface RunSideEffectContext {
 }
 
 /**
- * ★ B3-2 stage 2: classify a just-superseded transient (its OWN failing-run signals vs the last-N settled
+ * ★ B3-2 stage 2: classify a just-superseded transient (its OWN failing-run signals vs the last-N SUCCESSFUL
  * baseline) and persist `runs.transient_class`. Same-location baseline keeps it apples-to-apples for a
  * multi-location check. INDETERMINATE when the failing run captured no signals (http/dns/ssl, or a strand).
  */
-async function classifyAndPersistTransient(check: Check, originalRunId: number): Promise<void> {
+export async function classifyAndPersistTransient(check: Check, originalRunId: number): Promise<void> {
   const orig = await pool.query<{ trace_signals: TraceSignalsLike | null; location: string | null; started_at: Date }>(
     `SELECT trace_signals, location, started_at FROM runs WHERE id = $1`,
     [originalRunId],
@@ -967,11 +969,21 @@ async function classifyAndPersistTransient(check: Check, originalRunId: number):
   if (orig.rowCount === 0) return;
   const { trace_signals, location, started_at } = orig.rows[0];
 
-  // Baseline: the last-N SETTLED runs (same location) strictly before the transient, newest first. jsonb →
-  // pg returns trace_signals already parsed.
+  // ★ Baseline: the last-N SUCCESSFUL (pass/warn) runs (same location) strictly before the transient — NOT
+  // the last-N settled runs. Fixes the sustained-outage INVERSION: the classifier's question is "is the SITE
+  // broken?", not the error-diff's "what CHANGED this run?". A first-party error that has failed for four runs
+  // straight is IN the settled baseline (so it read monitor-side — most wrong exactly when the failure is most
+  // real), but it is NOT in the last SUCCESSFUL run, so it counts. The discriminator is already in the data:
+  // benign ambient noise (e.g. /monitoring) fails on PASSING runs too (→ in the success baseline → doesn't
+  // count); a real failure appears ONLY when the check fails (→ absent from the success baseline → counts, no
+  // matter how many in a row). Empty baseline (no recent green) ⇒ every first-party error is new ⇒ service-side
+  // — correct: no green + first-party errors IS an outage (loop handles empty, no divide). Bounded to 30d (the
+  // SLA window): a success older than that is too stale to define "ambient" → ignored → service-side.
+  // ★ Deliberately DIVERGES from the API ErrorDiff's settled baseline — a different question (transientClass.ts).
   const base = await pool.query<{ trace_signals: TraceSignalsLike | null }>(
     `SELECT trace_signals FROM runs
-      WHERE check_id = $1 AND status <> 'running' AND started_at < $2 AND id <> $3
+      WHERE check_id = $1 AND status IN ('pass', 'warn')
+        AND started_at < $2 AND started_at > $2 - interval '30 days' AND id <> $3
         AND (($4::text IS NULL AND location IS NULL) OR location = $4)
       ORDER BY started_at DESC LIMIT $5`,
     [check.id, started_at, originalRunId, location, TRANSIENT_BASELINE_RUNS],
