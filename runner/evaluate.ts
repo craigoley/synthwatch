@@ -955,7 +955,7 @@ export interface RunSideEffectContext {
 }
 
 /**
- * ★ B3-2 stage 2: classify a just-superseded transient (its OWN failing-run signals vs the last-N settled
+ * ★ B3-2 stage 2: classify a just-superseded transient (its OWN failing-run signals vs the last-N SUCCESSFUL
  * baseline) and persist `runs.transient_class`. Same-location baseline keeps it apples-to-apples for a
  * multi-location check. INDETERMINATE when the failing run captured no signals (http/dns/ssl, or a strand).
  */
