@@ -9,7 +9,8 @@
 // partial unique index (one_open_incident_per_check) is a belt-and-braces backstop.
 import { pool, type Check, type RunRecord, type TerminalStatus } from './db.js';
 import type { RunMetrics } from './metrics.js';
-import { dispatchAlerts, resolveChannels } from './alerts.js';
+import { dispatchAlerts, resolveChannels, type DispatchResult } from './alerts.js';
+import { INVOCATION_ID } from './runnerErrors.js';
 import { rcaEnabled, runRca } from './rca.js';
 import { confirmByRerunEligible, usesDedicatedExecution } from './retry.js';
 import { fireRunnerJobStart } from './jobTrigger.js';
@@ -135,6 +136,61 @@ export function perfBudgetVerdict(
 // resolveChannels(checkId, check.severity) in alerts.ts — severity-default with a
 // per-check override. (Replaces the old env-targets + alert_profiles status-routing.)
 
+/**
+ * ★ DELIVERY ACCOUNTING (0082). Persist the outcome of an incident alert dispatch so a FAILED page is
+ * distinguishable from a successful one — before this, both left identical DB state (a send that threw was
+ * caught inside dispatchAlerts, logged to the ephemeral container log, returned as {delivered:0}, and dropped,
+ * which is why it was UNKNOWABLE whether incidents 167/165 paged once the logs rotated). Writes the LATEST
+ * outcome + a running attempt count onto the incident; on a hard failure ALSO writes a runner_errors row (the
+ * durable, greppable trail — the incident columns only hold the latest attempt). Non-fatal by construction:
+ * an accounting failure must NEVER break the run that just paged.
+ *   'sent'    — at least one channel delivered.
+ *   'failed'  — channels were tried and ALL rejected (also → runner_errors, phase alert-dispatch-failed).
+ *   'skipped' — no deliverable channel configured. A REAL state that must NOT read as success.
+ */
+export async function recordIncidentDispatch(
+  incidentId: number,
+  checkId: number,
+  phase: 'open' | 'resolve' | 'enrichment',
+  r: DispatchResult,
+): Promise<void> {
+  const status: 'sent' | 'failed' | 'skipped' =
+    r.active === 0 ? 'skipped' : r.delivered > 0 ? 'sent' : 'failed';
+  const detail =
+    status === 'failed'
+      ? r.results
+          .filter((x) => !x.ok)
+          .map((x) => `${x.name} (${x.type}): ${x.error ?? 'no detail'}`)
+          .join('; ') || 'all channels rejected'
+      : status === 'skipped'
+        ? 'no deliverable channel configured'
+        : null;
+  try {
+    await pool.query(
+      `UPDATE incidents
+          SET notify_attempted_at = now(), notify_status = $2, notify_error = $3,
+              notify_attempts = notify_attempts + 1
+        WHERE id = $1`,
+      [incidentId, status, detail],
+    );
+    if (status === 'failed') {
+      // ★ LOUD: a page that failed to deliver is worse than no page (you believe you were told). Surface it
+      // in runner_errors so it isn't swallowed with the rotating container log.
+      await pool.query(
+        `INSERT INTO runner_errors (invocation_id, phase, check_id, message)
+         VALUES ($1, 'alert-dispatch-failed', $2, $3)`,
+        [
+          INVOCATION_ID,
+          checkId,
+          `incident ${incidentId} ${phase} alert FAILED to deliver on all ${r.active} channel(s): ${detail}`,
+        ],
+      );
+    }
+  } catch (err) {
+    console.warn(`[alerts] incident ${incidentId} ${phase} dispatch-accounting failed (non-fatal):`, err);
+  }
+}
+
 export async function evaluate(check: Check, run: RunRecord): Promise<void> {
   // ★ Option C: 'infra_error' = the runner couldn't FETCH this browser check's own spec. That
   // is an INFRA problem, NOT a monitored-site outage — it must NEVER page. Short-circuit BEFORE
@@ -188,7 +244,7 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
             `[runner] check ${check.id} "${check.name}" recovered — recovery alert suppressed (maintenance window)`,
           );
         } else {
-          await dispatchAlerts(
+          const resolveDispatch = await dispatchAlerts(
             {
               checkId: check.id,
               checkName: check.name,
@@ -206,6 +262,7 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
             },
             await resolveChannels(check.id, check.severity),
           );
+          await recordIncidentDispatch(open.id, check.id, 'resolve', resolveDispatch);
         }
       }
     }
@@ -292,7 +349,7 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
   // model can't delay paging, so the OPEN email never carries RCA. (The RESOLVED email
   // does — by then it's computed. To put RCA in the open email, move runRca above this
   // dispatch at the cost of ~10-30s paging delay — a product call.)
-  await dispatchAlerts(
+  const openDispatch = await dispatchAlerts(
     {
       checkId: check.id,
       checkName: check.name,
@@ -313,6 +370,7 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
     },
     await resolveChannels(check.id, check.severity),
   );
+  await recordIncidentDispatch(incidentId, check.id, 'open', openDispatch);
 
   // AI root-cause analysis (opt-in, non-fatal) — fires ONLY here, on incident-open
   // (not every failed run), so a flapping check isn't RCA-spammed. Runs AFTER the
@@ -519,7 +577,7 @@ export async function sendRcaReadyEnrichment(
 
   // SAME channels as the open alert (Craig's decision) — identical resolution.
   const channels = await resolveChannels(check.id, check.severity);
-  await dispatchAlerts(
+  const enrichDispatch = await dispatchAlerts(
     {
       checkId: check.id,
       checkName: check.name,
@@ -540,6 +598,7 @@ export async function sendRcaReadyEnrichment(
     },
     channels,
   );
+  await recordIncidentDispatch(incidentId, check.id, 'enrichment', enrichDispatch);
 }
 
 /**

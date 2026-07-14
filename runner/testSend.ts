@@ -8,12 +8,36 @@
 // here BEFORE the check loop and marks each delivered/failed. The on-demand start makes it
 // ~seconds; a normal cron tick also drains as a fallback.
 import { pool } from './db.js';
+import { INVOCATION_ID } from './runnerErrors.js';
 import {
   dispatchAlerts,
   getChannelById,
   channelDeliverabilityReason,
   type AlertPayload,
 } from './alerts.js';
+
+// ★ CANARY (0082): re-enqueue a scheduled test-send if the last one is older than this. The notifier is
+// otherwise the only unmonitored component — 27 incidents opened and nothing had ever PROVEN a channel
+// delivers. A canary that reds (writes runner_errors on failure, below) fixes that.
+const CANARY_INTERVAL_MS = 20 * 60 * 60 * 1000; // ~daily, with slack so a missed tick still fires next day
+
+/**
+ * If no channel test-send has been requested within CANARY_INTERVAL_MS, enqueue one per enabled channel.
+ * Delivered on the next drainTestSends through the REAL dispatch path; a failure writes runner_errors (see
+ * finish()). Best-effort + idempotent-enough: a rare duplicate canary across region runners is harmless.
+ */
+export async function maybeEnqueueCanary(): Promise<number> {
+  const { rows } = await pool.query<{ last: Date | null }>(
+    `SELECT max(requested_at) AS last FROM test_send_requests`,
+  );
+  const last = rows[0]?.last;
+  if (last && Date.now() - new Date(last).getTime() < CANARY_INTERVAL_MS) return 0;
+  const { rowCount } = await pool.query(
+    `INSERT INTO test_send_requests (channel_id) SELECT id FROM channels WHERE enabled`,
+  );
+  if (rowCount) console.log(`[canary] enqueued ${rowCount} scheduled channel canary send(s)`);
+  return rowCount ?? 0;
+}
 
 /** A [TEST] alert payload — checkId 0, no incident; only the content is flagged test. */
 function testPayload(channelName: string): AlertPayload {
@@ -35,6 +59,15 @@ async function finish(id: number, status: 'delivered' | 'failed', detail: string
     `UPDATE test_send_requests SET status = $2, detail = $3, completed_at = now() WHERE id = $1`,
     [id, status, detail.slice(0, 500)],
   );
+  // ★ LOUD (0082): a failed test/canary send must red, not vanish — surface it in runner_errors so a broken
+  // notifier is caught by the same "who watches the watcher" path as a failed real alert.
+  if (status === 'failed') {
+    await pool.query(
+      `INSERT INTO runner_errors (invocation_id, phase, check_id, message)
+       VALUES ($1, 'test-send-failed', NULL, $2)`,
+      [INVOCATION_ID, `channel test/canary send ${id} FAILED delivery: ${detail.slice(0, 300)}`],
+    );
+  }
 }
 
 /**

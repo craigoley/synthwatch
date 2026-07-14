@@ -45,7 +45,7 @@ import { loadCompiledSpec } from './specfetch/compileSpec.js';
 import { specToFlow } from './specfetch/specShim.js';
 import { compileHostRewrite, resolveRewrite, hostRewriteFor, type HostRewrite } from './specfetch/hostRewrite.js';
 import { syncFlowManifest } from './flowManifest.js';
-import { drainTestSends } from './testSend.js';
+import { drainTestSends, maybeEnqueueCanary } from './testSend.js';
 import {
   uploadScreenshot,
   uploadTrace,
@@ -193,6 +193,9 @@ async function main(): Promise<void> {
   // processed, this run was (almost certainly) a test-triggered start -> send + exit fast,
   // skipping the check loop. A normal cron tick finds none pending and proceeds. (A cron
   // tick that happens to drain one skips its checks this tick; the next tick recovers.)
+  // ★ CANARY (0082): keep a scheduled channel test-send flowing so the notifier itself is monitored.
+  // Enqueues (if stale) BEFORE the drain below, so the same tick delivers it through the real path.
+  await maybeEnqueueCanary().catch((err) => console.warn('[canary] enqueue failed (non-fatal):', err));
   const tests = await drainTestSends().catch((err) => {
     console.error('[test-send] drain failed (non-fatal):', err);
     return 0;
