@@ -1,0 +1,66 @@
+name: Mutation gate (PR)
+
+# ★ PR-time mutation gate (task #12). The analysis already paid for itself — it found the paging quorum almost
+# entirely unpinned (#307: you could have changed the rule that wakes a human and no test would have died) and
+# the rca redaction seam (#306). This makes it CONTINUOUS: the next PR to touch these modules is protected.
+#
+# Per-module, --incremental: Stryker re-tests only the mutants in changed code, so a PR touching ~30 LOC of
+# evaluate.ts pays ~1-2 min, not the full run. Each module FAILS below its own ratcheting break threshold
+# (scripts/mutation.sh) — a single global floor would let retry.ts (100%, zero survivors) rot to 20%.
+# The incremental cache is warmed by the nightly (mutation-nightly.yml) and restored here.
+
+on:
+  pull_request:
+    paths:
+      - 'runner/**.ts'
+      - 'runner/scripts/mutation.sh'
+
+concurrency:
+  group: mutation-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  mutate:
+    name: mutation ${{ matrix.module }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [retry, transientClass, traceSignals, rca, evaluate, reconcile]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: pg
+          POSTGRES_DB: synthwatch
+        ports:
+          - 5544:5432
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    defaults:
+      run:
+        working-directory: runner
+    env:
+      DATABASE_URL: postgres://postgres:pg@127.0.0.1:5544/synthwatch
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install deps
+        run: npm ci
+      - name: Materialize the schema (for the DB-backed modules)
+        run: |
+          for i in $(seq 1 30); do PGPASSWORD=pg psql -h 127.0.0.1 -p 5544 -U postgres -d synthwatch -c 'select 1' >/dev/null 2>&1 && break; sleep 1; done
+          PGPASSWORD=pg psql -h 127.0.0.1 -p 5544 -U postgres -d synthwatch -c "SET check_function_bodies=false;" -f ../db/schema.sql >/dev/null
+          for f in $(ls ../db/migrations/*.sql | sort); do PGPASSWORD=pg psql -h 127.0.0.1 -p 5544 -U postgres -d synthwatch -c "SET check_function_bodies=false;" -f "$f" >/dev/null; done
+      # Restore the incremental cache the nightly saved so a PR only re-runs its changed mutants.
+      - name: Restore mutation incremental cache
+        uses: actions/cache/restore@v4
+        with:
+          path: runner/.stryker-incremental
+          key: stryker-incremental-${{ matrix.module }}-${{ github.event.pull_request.base.sha }}
+          restore-keys: |
+            stryker-incremental-${{ matrix.module }}-
+      - name: Mutation gate — ${{ matrix.module }} (--incremental, blocking below threshold)
+        run: bash scripts/mutation.sh ${{ matrix.module }} --incremental

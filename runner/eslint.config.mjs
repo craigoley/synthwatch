@@ -7,7 +7,7 @@ import globals from "globals";
 export default tseslint.config(
   {
     // Build output and deps are never linted.
-    ignores: ["dist/**", "node_modules/**"],
+    ignores: ["dist/**", "node_modules/**", ".stryker-tmp/**", "reports/**", ".stryker-incremental/**"],
   },
   js.configs.recommended,
   ...tseslint.configs.recommended,
