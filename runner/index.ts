@@ -72,7 +72,6 @@ import {
   type RunMetrics,
 } from './metrics.js';
 import { isExpectationError } from './errors.js';
-import { runWithRetry, effectiveRetries, confirmByRerunEligible } from './retry.js';
 import { DUE_PREDICATE_SQL } from './duePredicate.js';
 import { withDeadline } from './timeBudget.js';
 import { enforceProdGuard } from './prodGuard.js';
@@ -117,13 +116,6 @@ interface Outcome {
 // lingering as in-flight forever.
 const STALE_RUNNING = "30 minutes";
 
-// Fixed backoff between fast-retry attempts — a short pause so an immediate re-run doesn't just
-// re-hit the same in-flight transient blip. Now that we also retry 'fail' (not just 'error'), a
-// browser flow retried with too short a pause can catch the site still mid-blip — so 5s, in the
-// field-standard 5–15s range, while staying small vs a 60–90s browser run. Fixed (not exponential):
-// retry counts are tiny and the tick is time-bounded by the ACA replicaTimeout. (Per-check backoff
-// config is a possible follow-up; a single sane default keeps this PR one concern.)
-const RETRY_BACKOFF_MS = 5000;
 
 // Whole-flow wall-clock ceiling for a BROWSER run (mirrors multistep's MAX_CHAIN_MS — that family
 // fixed this exact class first). page.setDefaultTimeout bounds each ACTION (check.timeout_ms);
@@ -548,44 +540,11 @@ async function runOneInner(
     baselineScreenshot: null,
   });
 
-  // FAST-RETRY (mechanism 1, within ONE run): runWithRetry re-runs on ANY failure — 'error'
-  // (couldn't COMPLETE — network/timeout/DNS) OR 'fail' (an assertion missed) — up to `retries`
-  // times. NOT retried on pass/warn (a success; warn = available-but-degraded). The LAST attempt
-  // is the verdict; onBeforeRetry discards the prior attempt's partial per-run side effects
-  // (run_steps, run_metrics, the temp trace file) REGARDLESS of its status + backs off, so EXACTLY
-  // ONE verdict persists — the run history / failure_threshold (mechanism 2, AFTER this) never sees
-  // the retried-away attempts (no phantom intermediate-failure metrics pollute the success-baseline
-  // or trace-diff). retries=0 => no retry (pre-0021 behaviour). Retrying 'fail' lets an in-run-
-  // confirmed failure page immediately (with failure_threshold=1) instead of after N scheduled ticks.
-  //
-  // ★ SKIP fast-retry when ALREADY confirmed-down: fast-retry absorbs a TRANSIENT blip on a HEALTHY
-  // monitor — moot once the failure is SUSTAINED. If an incident is already open for this check, a
-  // prior run already confirmed it's failing, so retrying ×2 every tick is wasted browser work
-  // (~2-3 min/tick). effectiveRetries() drops to 0 (1 attempt) then. The FIRST failure of a healthy
-  // monitor still gets full retry (no incident yet); only SUBSEQUENT failures while the incident is
-  // open skip it; on recovery evaluate() resolves the incident, so the next fresh failure retries again.
+  // ★ hasOpenIncident feeds applyRunSideEffects below (confirmation gating — a monitor with an incident
+  // already open does not enqueue another confirmation). The in-run FAST-RETRY that also branched on this
+  // (effectiveRetries + runWithRetry) was retired in 0084: every kind confirms a failure by RE-RUN, never an
+  // in-run loop, so retry_count is structurally 1 for every run. See runner/retry.ts.
   const alreadyFailing = await hasOpenIncident(check.id);
-  // ★ sandbox suppresses fast-retry too: a paused-monitor validation wants the TRUE first-attempt
-  // outcome (evaluate() is skipped, so there's no page to confirm) — see effectiveRetries.
-  // ★ CONFIRM-BY-RERUN (0077, D2): browser/multistep confirm a failure in a FRESH execution, not an in-run
-  // loop — so their in-run fast-retry is OFF (retries → 0). The confirmation IS the retry. This is what
-  // stops the 3 × ~5-min in-ONE-execution strand; http/net/ssl keep the in-run fast-retry.
-  const confirmEligible = confirmByRerunEligible(check.kind);
-  const retries = effectiveRetries(check.retries, alreadyFailing, sandbox, confirmEligible);
-  const maxAttempts = retries + 1;
-  if (sandbox && check.retries > 0) {
-    console.log(
-      `[runner] check ${check.id} "${check.name}" SANDBOX validation — single attempt (fast-retry skipped, true first-attempt state).`,
-    );
-  } else if (confirmEligible && check.retries > 0 && confirmationOfRunId == null) {
-    console.log(
-      `[runner] check ${check.id} "${check.name}" ${check.kind} — in-run fast-retry OFF; a failure confirms by re-run in a fresh execution (0077).`,
-    );
-  } else if (alreadyFailing && check.retries > 0) {
-    console.log(
-      `[runner] check ${check.id} "${check.name}" already has an open incident — skipping fast-retry (1 attempt).`,
-    );
-  }
   // Capture this run's trace as the SUCCESS baseline only if the monitor's existing baseline is
   // missing or older than SUCCESS_TRACE_REFRESH_MS (throttle — see the const). Decided up front from
   // the claimed check row; failures ignore this and are always traced.
@@ -599,41 +558,31 @@ async function runOneInner(
   // redactableCredValues EXCLUDES the non-secret 'username' role (a test-account identifier), so the typed
   // username stays visible for login debugging while the password + every other role stay redacted.
   const credValues = check.sensitive ? redactableCredValues(resolveLoginCredentials(check.login_credentials)) : [];
-  // Wall-clock start of the (final) executor attempt — the OTel root span's start.
-  let execStartMs = Date.now();
-  const { result: outcome, attempts: retryCount } = await runWithRetry<Outcome>(
-    async () => {
-      execStartMs = Date.now();
-      try {
-        if (check.kind === 'http') return await executeHttp(check);
-        if (check.kind === 'ssl') return await executeSsl(check);
-        if (check.kind === 'dns' || check.kind === 'tcp' || check.kind === 'ping')
-          return await executeNet(check);
-        if (check.kind === 'multistep') return await executeMultistep(check, runId);
-        return await executeBrowser(
-          check,
-          runId,
-          captureSuccessTrace,
-          // S2/S3: re-point a pre-prod check's reused prod spec to its own target_url (undefined = no rewrite).
-          hostRewriteFor(check.rewrite_from_origin, check.target_url),
-          credValues, // #232 defect-2: register into the step redactor too
-        );
-      } catch (err) {
-        // Unexpected runner error (e.g. flow loader threw) -> 'error', not 'fail'.
-        return errorOutcome(err instanceof Error ? err.message : String(err));
-      }
-    },
-    retries,
-    async (prev, attempt) => {
-      if (prev.tracePath) await unlink(prev.tracePath).catch(() => {});
-      await pool.query(`DELETE FROM run_steps WHERE run_id = $1`, [runId]);
-      await pool.query(`DELETE FROM run_metrics WHERE run_id = $1`, [runId]);
-      await new Promise((r) => setTimeout(r, RETRY_BACKOFF_MS));
-      console.log(
-        `[runner] check ${check.id} "${check.name}" errored — fast-retry attempt ${attempt}/${maxAttempts}`,
+  // Wall-clock start of the executor — the OTel root span's start. ONE attempt: the in-run fast-retry loop
+  // was retired in 0084 (a failure now confirms by re-run, not in-run). retry_count is a fixed 1 (the api
+  // trust report's retryRate still reads runs.retry_count; it is now structurally 0% — see the PR body).
+  const execStartMs = Date.now();
+  const outcome: Outcome = await (async () => {
+    try {
+      if (check.kind === 'http') return await executeHttp(check);
+      if (check.kind === 'ssl') return await executeSsl(check);
+      if (check.kind === 'dns' || check.kind === 'tcp' || check.kind === 'ping')
+        return await executeNet(check);
+      if (check.kind === 'multistep') return await executeMultistep(check, runId);
+      return await executeBrowser(
+        check,
+        runId,
+        captureSuccessTrace,
+        // S2/S3: re-point a pre-prod check's reused prod spec to its own target_url (undefined = no rewrite).
+        hostRewriteFor(check.rewrite_from_origin, check.target_url),
+        credValues, // #232 defect-2: register into the step redactor too
       );
-    },
-  );
+    } catch (err) {
+      // Unexpected runner error (e.g. flow loader threw) -> 'error', not 'fail'.
+      return errorOutcome(err instanceof Error ? err.message : String(err));
+    }
+  })();
+  const retryCount = 1;
 
   // Perf-budget verdict on an otherwise-PASSED browser run (perfBudgetVerdict is pure + unit-tested):
   //   • a real breach (metric over budget)           → 'warn'  (degraded-but-available; non-inert budgets)

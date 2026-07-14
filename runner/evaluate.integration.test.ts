@@ -204,23 +204,24 @@ async function seedPassRun(checkId: number, minutesAgo: number): Promise<RunReco
   };
 }
 
-// (skip-fast-retry signal) hasOpenIncident drives the fast-retry skip and handles the heal→re-fail
-// cycle: healthy=false (full retry) → first fail opens incident=true (subsequent failures skip retry)
-// → recovery pass RESOLVES the incident=false (full retry returns; a fresh fail is a new transient
-// candidate). Proves effectiveRetries(check.retries, hasOpenIncident) covers all 4 task cases.
-nodeTest('(skip-retry signal) hasOpenIncident: healthy→down→recovered cycle resets correctly (live)', { skip: SKIP }, async () => {
+// (confirmation-gating signal) hasOpenIncident drives confirmation gating (alreadyFailing feeds
+// applyRunSideEffects: a monitor with an incident ALREADY open does not enqueue another confirmation) and
+// handles the heal→re-fail cycle: healthy=false → first fail opens incident=true → recovery pass RESOLVES
+// it=false (a fresh fail is a new transient candidate). The in-run fast-retry this signal used to gate was
+// retired in 0084; the incident-lifecycle behaviour it now gates is unchanged. Covers all 4 states.
+nodeTest('(confirmation-gating signal) hasOpenIncident: healthy→down→recovered cycle resets correctly (live)', { skip: SKIP }, async () => {
   const check = await makeCheck(1, '__eval_skipretry_e2e__');
   try {
-    // 1) healthy monitor: no open incident → signal false → a failure here gets FULL fast-retry.
-    assert.equal(await hasOpenIncident(check.id), false, 'healthy → alreadyFailing=false → full retry');
+    // 1) healthy monitor: no open incident → alreadyFailing false → a fresh failure is a confirmation candidate.
+    assert.equal(await hasOpenIncident(check.id), false, 'healthy → alreadyFailing=false');
 
-    // 2) first confirmed failure opens the incident → signal true → SUBSEQUENT failures skip retry.
+    // 2) first confirmed failure opens the incident → alreadyFailing true → no further confirmation enqueued.
     await evaluate(check, await seedFailRun(check.id, 1));
-    assert.equal(await hasOpenIncident(check.id), true, 'open incident → alreadyFailing=true → 1 attempt');
+    assert.equal(await hasOpenIncident(check.id), true, 'open incident → alreadyFailing=true');
 
-    // 3) recovery: a passing run → evaluate() resolves the incident → 4) signal false → full retry again.
+    // 3) recovery: a passing run → evaluate() resolves the incident → 4) alreadyFailing false again.
     await evaluate(check, await seedPassRun(check.id, 0));
-    assert.equal(await hasOpenIncident(check.id), false, 'recovery pass resolves incident → full retry returns');
+    assert.equal(await hasOpenIncident(check.id), false, 'recovery pass resolves incident → confirmation candidacy returns');
   } finally {
     await pool.query(`DELETE FROM checks WHERE id = $1`, [check.id]);
   }
