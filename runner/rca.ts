@@ -365,6 +365,22 @@ export function deterministicResult(facts: RcaFacts, signature: string, abstain:
   };
 }
 
+/**
+ * ★ B10 SAFETY (privacy control). A SENSITIVE monitor's RCA is TEXT-ONLY — never fetch or forward a
+ * screenshot to the (3rd-party) AI: a rendered cart/auth page shows cart contents / a logged-in
+ * name·email·address. Returns the screenshot URLs this RCA may download — BOTH null for a sensitive check.
+ * Pure + exported ON PURPOSE: this is the privacy gate, so it must be unit-testable AND mutation-visible
+ * (a mutant that flips the `sensitive` guard is killed by a must-go-red test), not buried inside an async
+ * DB/blob/model function where mutation testing gives no signal. See rca.test.ts.
+ */
+export function rcaScreenshotUrls(
+  check: Check,
+  failureUrl: string | null,
+): { failureUrl: string | null; baselineUrl: string | null } {
+  if (check.sensitive) return { failureUrl: null, baselineUrl: null };
+  return { failureUrl, baselineUrl: check.baseline_screenshot_url };
+}
+
 /** Gather facts + screenshots + render the prompt. Screenshots stay separate (multimodal user content). */
 async function gatherContext(
   check: Check,
@@ -378,11 +394,13 @@ async function gatherContext(
   baselineB64: string | null;
 }> {
   const { facts, screenshotUrl } = await gatherFacts(check, run, verdict);
-  // ★ B10: a SENSITIVE monitor's RCA is TEXT-ONLY — never send screenshots to the (3rd-party) AI: a
-  // rendered cart/auth page shows cart contents / logged-in name·email·address. The runner already stores no
-  // screenshots for sensitive monitors, so these are normally null anyway; this is the explicit guard.
-  const failureB64 = check.sensitive ? null : await downloadBlobBase64(screenshotUrl);
-  const baselineB64 = check.sensitive ? null : await downloadBlobBase64(check.baseline_screenshot_url);
+  // ★ B10 SAFETY: which screenshot URLs this RCA may fetch — BOTH null for a sensitive check (see the pure,
+  // unit-tested + mutation-visible rcaScreenshotUrls). downloadBlobBase64(null) returns null, so a suppressed
+  // URL simply yields no image. This is the explicit privacy guard (the runner also stores no screenshots for
+  // sensitive monitors, so these are normally null anyway — defence in depth).
+  const shots = rcaScreenshotUrls(check, screenshotUrl);
+  const failureB64 = await downloadBlobBase64(shots.failureUrl);
+  const baselineB64 = await downloadBlobBase64(shots.baselineUrl);
   const { text, citeIndex } = renderFactPack(facts);
   const withShots = [
     text,

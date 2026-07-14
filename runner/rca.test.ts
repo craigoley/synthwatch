@@ -11,8 +11,10 @@ import {
   evidenceThin,
   deterministicResult,
   extractTraceFacts,
+  rcaScreenshotUrls,
   type RcaFacts,
 } from './rca.js';
+import type { Check } from './db.js';
 
 // ── The REAL run 955866 as an RcaFacts (from the 2026-07-13 recon; console verbatim from runs.trace_signals) ──
 const ERR_955866 =
@@ -173,7 +175,36 @@ test('★ token budget: extractTraceFacts ranks first-party first, caps them, an
   assert.equal(out.thirdPartyConsoleErrorCount, 60, 'third-party counted, not dumped');
   assert.equal(out.netFailed.length, 8, 'network.failed capped');
 
-  // sensitive → host+level only, no text forwarded.
+  // ★ B10 SAFETY must-go-red (console text). NON-sensitive: the real console text is forwarded (bidirectional —
+  // kills an "always blank" mutant). SENSITIVE: every forwarded text is '' (kills a "forward the text anyway"
+  // mutant — the privacy leak). If the redaction guard at rca.ts:174 is disabled, ONE of these two fails.
+  assert.ok(out.firstPartyConsole.some((c) => c.text.length > 0), 'non-sensitive: real console text IS forwarded');
   const sens = extractTraceFacts(ts, true);
-  assert.ok(sens.firstPartyConsole.every((c) => c.text === ''), 'sensitive: console text withheld');
+  assert.ok(sens.firstPartyConsole.every((c) => c.text === ''), 'sensitive: console text withheld (privacy)');
+  assert.equal(sens.firstPartyConsole.length, out.firstPartyConsole.length, 'same messages, just text-stripped');
+});
+
+// ── ★★ B10 SAFETY (privacy control): a SENSITIVE monitor's RCA must never fetch/forward a SCREENSHOT to the
+//    3rd-party AI (a rendered cart/auth page shows cart contents / a logged-in name·email·address). These are
+//    the must-go-red for rcaScreenshotUrls — the pure seam that gates it. Flipping the `check.sensitive` guard
+//    at rca.ts reds the first test. ────────────────────────────────────────────────────────────────────────
+const asCheck = (over: Partial<Check>): Check =>
+  ({ sensitive: false, baseline_screenshot_url: null, ...over }) as unknown as Check;
+
+test('★ B10 SAFETY: a SENSITIVE check suppresses BOTH screenshot URLs (never fetched → never sent to the AI)', () => {
+  const out = rcaScreenshotUrls(
+    asCheck({ sensitive: true, baseline_screenshot_url: 'https://blob/baseline.png' }),
+    'https://blob/failure.png',
+  );
+  assert.equal(out.failureUrl, null, 'sensitive: failure screenshot URL withheld — nothing to download or send');
+  assert.equal(out.baselineUrl, null, 'sensitive: baseline screenshot URL withheld');
+});
+
+test('a NON-sensitive check forwards BOTH screenshot URLs for the visual diff', () => {
+  const out = rcaScreenshotUrls(
+    asCheck({ sensitive: false, baseline_screenshot_url: 'https://blob/baseline.png' }),
+    'https://blob/failure.png',
+  );
+  assert.equal(out.failureUrl, 'https://blob/failure.png', 'non-sensitive: failure screenshot forwarded');
+  assert.equal(out.baselineUrl, 'https://blob/baseline.png', 'non-sensitive: baseline screenshot forwarded');
 });
