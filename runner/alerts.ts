@@ -15,7 +15,7 @@
 // Fires on incident OPEN / RESOLVE and the warn path.
 import { EmailClient } from '@azure/communication-email';
 import { pool } from './db.js';
-import { buildAlertEmail } from './alertEmail.js';
+import { buildAlertEmail, viewLink } from './alertEmail.js';
 
 // Hard ceiling on any single outbound send. dispatchAlerts is awaited in the run
 // tick, and Promise.allSettled isolates REJECTIONS but not HANGS — a webhook (or
@@ -114,13 +114,6 @@ function subjectLine(p: AlertPayload): string {
   return `[SynthWatch][${p.severity}] ${verb}: ${p.checkName}`;
 }
 
-/** Deep link to the check in the dashboard, or null if DASHBOARD_URL is unset. */
-function dashboardLink(p: AlertPayload): string | null {
-  const base = process.env.DASHBOARD_URL;
-  if (!base) return null;
-  return `${base.replace(/\/+$/, '')}/checks/${p.checkId}`;
-}
-
 // --- Delivery: Azure Communication Services email --------------------------
 // Transport SECRET (ACS connection string) AND sender (ALERT_EMAIL_FROM) from env;
 // recipients (to[]) from the channel's DB config. Body is a rich HTML email + plaintext
@@ -157,6 +150,39 @@ async function sendEmail(c: Channel, p: AlertPayload): Promise<void> {
 // URL (+ optional full Authorization header) from the channel's DB config. The URL may
 // embed a token (acceptable for v1). Payload (application/json):
 //   { event, severity, checkId, checkName, summary, runId|null, failedStep, screenshotUrl, dashboardUrl }
+// The JSON body delivered to a webhook receiver. Exported so a test can assert the
+// contract (esp. that dashboardUrl deep-links the incident) without touching the network.
+export function buildWebhookPayload(p: AlertPayload) {
+  return {
+    // 'rca_ready' = the follow-up enrichment on an already-open incident (not a new open).
+    event: p.rcaReady ? 'rca_ready' : p.status,
+    severity: p.severity,
+    checkId: Number(p.checkId),
+    checkName: p.checkName,
+    summary: p.summary,
+    runId: p.runId == null ? null : Number(p.runId),
+    failedStep: p.failedStep ?? null,
+    screenshotUrl: p.screenshotUrl ?? null,
+    // Deep link the operator to the ANSWER: the incident detail page (OBSERVED/INFERRED
+    // panel) when there's an incident id, else the check page. Shares viewLink() with the
+    // email so the two links can never drift (was a /checks-only builder that ignored the
+    // incident even though the payload carries incidentId below).
+    dashboardUrl: viewLink(p),
+    // incident id for correlation (so a webhook receiver can thread the enrichment onto
+    // the open event), + the RCA verdict when present (the rca_ready payload).
+    incidentId: p.incident?.incidentId ?? null,
+    rca: p.incident?.rca
+      ? {
+          classification: p.incident.rca.classification,
+          confidence: p.incident.rca.confidence,
+          summary: p.incident.rca.summary ?? null,
+        }
+      : null,
+    // true for a channel test-send (lets the receiver distinguish a drill from a real alert).
+    test: Boolean(p.test),
+  };
+}
+
 async function sendWebhook(c: Channel, p: AlertPayload): Promise<void> {
   const url = c.config.url;
   if (!url) return;
@@ -168,30 +194,7 @@ async function sendWebhook(c: Channel, p: AlertPayload): Promise<void> {
     // Bound the request — a webhook that accepts TCP but never responds would
     // otherwise hang the tick (allSettled isolates rejections, not hangs).
     signal: AbortSignal.timeout(ALERT_TIMEOUT_MS),
-    body: JSON.stringify({
-      // 'rca_ready' = the follow-up enrichment on an already-open incident (not a new open).
-      event: p.rcaReady ? 'rca_ready' : p.status,
-      severity: p.severity,
-      checkId: Number(p.checkId),
-      checkName: p.checkName,
-      summary: p.summary,
-      runId: p.runId == null ? null : Number(p.runId),
-      failedStep: p.failedStep ?? null,
-      screenshotUrl: p.screenshotUrl ?? null,
-      dashboardUrl: dashboardLink(p),
-      // incident id for correlation (so a webhook receiver can thread the enrichment onto
-      // the open event), + the RCA verdict when present (the rca_ready payload).
-      incidentId: p.incident?.incidentId ?? null,
-      rca: p.incident?.rca
-        ? {
-            classification: p.incident.rca.classification,
-            confidence: p.incident.rca.confidence,
-            summary: p.incident.rca.summary ?? null,
-          }
-        : null,
-      // true for a channel test-send (lets the receiver distinguish a drill from a real alert).
-      test: Boolean(p.test),
-    }),
+    body: JSON.stringify(buildWebhookPayload(p)),
   });
   if (!res.ok) throw new Error(`webhook returned ${res.status}`);
 }
