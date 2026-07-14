@@ -1,5 +1,17 @@
 # Authoring browser flows
 
+> _Verified 2026-07-14 — prose with **no automated check**; if the code disagrees, the code wins._
+>
+> ### ★ Adding a monitor via the **monitors repo**? Read this first — it is the #1 day-one mistake.
+> Most monitors today are authored as **single-file Playwright specs** in
+> `craigoley/synthwatch-monitors`, **not** as the in-repo flows this document describes. A
+> monitors-repo spec is esbuild-compiled with exactly **one** allowed import — `lib/flow` —
+> so **it cannot import a shared module or a sibling file. If it tries, it will not compile
+> and the monitor never runs.** (That single-file constraint is also a security control —
+> see [SECURITY.md](../SECURITY.md).) The rest of this doc covers the *in-repo*
+> `runner/checks/` flow model, which *can* share modules; the single-file rule is specific
+> to monitors-repo specs.
+
 A **browser flow** is a Playwright script that SynthWatch runs on a schedule as a
 `kind='browser'` check. Flows live in `runner/checks/<name>.ts`. If you know
 Playwright, you already know how to write one — there's near-zero SynthWatch

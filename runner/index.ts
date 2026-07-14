@@ -944,6 +944,10 @@ async function executeBrowser(
   // spec_path) runs the baked-in flow_name. Resolving first means an infra-error short-circuits
   // to a non-paging infra_error WITHOUT wasting a browser context.
   let compiledJs: string | null = null;
+  // ★ SECURITY BOUNDARY: a spec_path check fetches, compiles, and `await import()`s code from the
+  //   synthwatch-monitors repo AT RUNNER PRIVILEGE (the import() is in compileSpec.ts:loadCompiledSpec).
+  //   The trust boundary is the monitors-repo MERGE GATE; spec_cache is write-locked to the runner (0041).
+  //   See SECURITY.md "Trust model — the execution boundary".
   if (check.spec_path) {
     const resolution = await getCompiledSpecFromPool(check.spec_path);
     if (resolution.kind === 'infra-error') {

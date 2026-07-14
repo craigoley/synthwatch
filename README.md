@@ -24,9 +24,12 @@ the split exists.
 > **privately** — never via a public issue.
 
 This repository currently contains the **data-plane runner**, the **database
-schema**, and the **container image**. No dashboard and no infrastructure-as-code
-yet — those land in later PRs. This document is an **architecture decision
-record**: it explains *why* the runner is shaped the way it is.
+schema**, the **container image**, and its **infrastructure-as-code**
+(`infra/main.bicep`). The **dashboard** is a separate Next.js app in its own repo.
+This document is an **architecture decision record**: it explains *why* the runner
+is shaped the way it is.
+
+> _Verified 2026-07-14 — this README is prose with **no automated check**. Where it names a status, path, or behaviour, `db/schema.sql` and the code are authoritative; distrust anything here they contradict._
 
 ---
 
@@ -205,9 +208,10 @@ review and the schema/migration convergence check.
 ## Data model
 
 - **checks** — the catalogue (target, kind, cadence, thresholds, severity).
-- **runs** — one row per execution. Inserted pessimistically as `fail` *before*
-  execution so a crashed/OOM-killed runner leaves an honest record, then flipped
-  to `pass` on success. Indexed by `(check_id, started_at DESC)`.
+- **runs** — one row per execution. Inserted as `running` *before* execution (a
+  crashed/OOM-killed runner's stale `running` is reaped to `error`), then updated on
+  finish to a terminal status — one of `pass | warn | fail | error | infra_error`
+  (source: `db/schema.sql`; not just pass/fail). Indexed by `(check_id, started_at DESC)`.
 - **run_steps** — one row per `StepRecorder.step()` (browser flows).
 - **incidents** — open/resolved lifecycle with severity, linked to the runs that
   opened and resolved them.
