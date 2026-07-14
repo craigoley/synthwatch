@@ -1389,4 +1389,78 @@ CREATE TABLE error_mutes (
     CONSTRAINT error_mutes_check_fingerprint_key UNIQUE (check_id, fingerprint)
 );
 
+-- ★ Audit + alarm a check_locations add/REMOVE, without preventing it (0085). Removing a location is an
+-- unlogged, unalarmed way to make a monitor stop being red (westus2 off 341/342 Jul 5; centralus off 355
+-- Jul 13 — audit_log had ZERO record of either). Best-effort, NEVER-BLOCKING trigger: it records who
+-- (best-effort app.actor_email) / when / which check+location / THE LOCATION'S 24H FAILURE RATE to audit_log,
+-- and on a removal of a location failing >= 10% ALSO writes a runner_errors row (loud, not illegal). Defined
+-- last (needs check_locations + audit_log + runner_errors + runs). See db/migrations/0085.
+CREATE OR REPLACE FUNCTION audit_check_location_change() RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_check_id bigint;
+  v_location text;
+  v_runs     int;
+  v_fail_pct numeric;
+BEGIN
+  BEGIN
+    IF TG_OP = 'DELETE' THEN
+      v_check_id := OLD.check_id;
+      v_location := OLD.location;
+      IF NOT EXISTS (SELECT 1 FROM checks WHERE id = v_check_id) THEN
+        RETURN OLD; -- CASCADE delete of the whole check, not a coverage change
+      END IF;
+    ELSE
+      v_check_id := NEW.check_id;
+      v_location := NEW.location;
+    END IF;
+
+    SELECT count(*),
+           round(100.0 * count(*) FILTER (WHERE status IN ('fail','error')) / nullif(count(*), 0), 1)
+      INTO v_runs, v_fail_pct
+      FROM runs
+     WHERE check_id = v_check_id AND location = v_location
+       AND started_at >= now() - interval '24 hours';
+
+    INSERT INTO audit_log (actor_email, action, target_type, target_id, before_json, after_json, note)
+    VALUES (
+      current_setting('app.actor_email', true),
+      CASE WHEN TG_OP = 'DELETE' THEN 'check_location.remove' ELSE 'check_location.add' END,
+      'check', v_check_id::text,
+      CASE WHEN TG_OP = 'DELETE'
+           THEN jsonb_build_object('location', v_location, 'runs_24h', coalesce(v_runs, 0), 'fail_pct_24h', coalesce(v_fail_pct, 0))
+           END,
+      CASE WHEN TG_OP = 'INSERT' THEN jsonb_build_object('location', v_location) END,
+      format('location %s %s check %s (last 24h: %s runs, %s%% failing)',
+             v_location,
+             CASE WHEN TG_OP = 'DELETE' THEN 'REMOVED from' ELSE 'added to' END,
+             v_check_id, coalesce(v_runs, 0), coalesce(v_fail_pct, 0))
+    );
+
+    IF TG_OP = 'DELETE' AND coalesce(v_fail_pct, 0) >= 10 THEN
+      INSERT INTO runner_errors (invocation_id, phase, check_id, message)
+      VALUES (
+        'db-trigger', 'check_location.remove', v_check_id,
+        format('Location %s removed from check %s while FAILING %s%% over the last 24h (%s runs). Coverage shrank '
+               || 'silently and the removal is unpaged by design — verify this was intentional (e.g. a bad egress IP) '
+               || 'and not a way to clear a red. See audit_log.', v_location, v_check_id, v_fail_pct, v_runs)
+      );
+    END IF;
+  EXCEPTION WHEN OTHERS THEN
+    RAISE WARNING 'audit_check_location_change failed for check % location % (%): %',
+      coalesce(v_check_id, -1), coalesce(v_location, '?'), TG_OP, SQLERRM;
+  END;
+
+  RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_audit_check_location ON check_locations;
+CREATE TRIGGER trg_audit_check_location
+  AFTER INSERT OR DELETE ON check_locations
+  FOR EACH ROW EXECUTE FUNCTION audit_check_location_change();
+
 COMMIT;
