@@ -1252,6 +1252,12 @@ LANGUAGE sql
 STABLE
 AS $$
 WITH cfg AS (
+    -- ★ ::text::float8, NOT ::float8 — DO NOT "simplify" this. node-pg parses the float4 slo_target from its
+    -- TEXT form ("0.99" → float64 0.99); a direct ::float8 widens the float4 BINARY (0.990000009…), giving a
+    -- different (1 - target), so the burn diverges at the threshold boundary. Casting through text reproduces
+    -- node-pg byte-for-byte (the slo_burn_status differential red-test proves it). ★ The schema-parity gate
+    -- NORMALIZES COMMENTS AWAY, so NOTHING will catch this comment's re-deletion — it is a comment whose
+    -- ABSENCE causes a bug. Keep it in sync with 0055_slo_burn_status.sql.
     SELECT c.slo_target::text::float8 AS target,
            c.failure_threshold         AS floor,
            c.min_fail_locations        AS minfail

@@ -6,6 +6,8 @@ flow, and — most importantly — **how to write a browser flow safely**.
 
 By participating you agree to abide by our [Code of Conduct](CODE_OF_CONDUCT.md).
 
+> _Verified 2026-07-14 — prose with **no automated check**. If the code disagrees with a rule here, the code is authoritative; fix the doc._
+
 ## Development setup
 
 All TypeScript lives under `runner/` (Node ≥ 22, NodeNext ESM, strict).
@@ -59,13 +61,16 @@ common failures early.
 > Browser flows execute a **real Chromium** holding live credentials. This
 > section is mandatory reading before you add or change a flow.
 
-- **Flows are CODE, added via PR and reviewed — never uploaded or executed at
-  runtime.** A check row only *names* an existing flow module under
-  `runner/checks/` (validated against `/^[a-z0-9-]+$/`). SynthWatch never accepts
-  user-uploaded code.
-- **No dynamic code execution.** No `eval`, no `new Function`, no `require`/
-  `import()` of attacker-influenced paths, no Node `vm`. Flows are static
-  TypeScript reviewed like any other code.
+- **Monitor logic is reviewed code — never user-uploaded.** An in-repo `flow_name`
+  check names a flow module under `runner/checks/` (validated against `/^[a-z0-9-]+$/`).
+  An Option-C `spec_path` check runs a Playwright spec from a **separate reviewed repo**,
+  `craigoley/synthwatch-monitors`, whose merge gate is the admission control. Neither
+  accepts arbitrary user upload.
+- **Dynamic code execution is CONFINED to the Option-C spec path — do NOT add another.**
+  The runner `await import()`s esbuild-compiled monitor specs (single-file, `lib/flow`-only
+  alias, `spec_cache` write-locked to the runner). That one surface is deliberate and
+  bounded — see **[SECURITY.md](SECURITY.md)** for the trust boundary + controls. Introduce
+  no other `eval` / `new Function` / dynamic `import()` / Node `vm`.
 - **No secrets in flow files.** URLs, cadence, thresholds and other config live
   in the **dashboard / `checks` table**, not in source. Never hardcode
   credentials, tokens, or tenant-specific endpoints.

@@ -72,6 +72,11 @@ export async function loadCompiledSpec(compiledJs: string): Promise<CapturedTest
   const file = join(dir, 'spec.mjs');
   try {
     await writeFile(file, resolved, 'utf8');
+    // ★ SECURITY BOUNDARY — this import() EXECUTES esbuild-compiled spec JS AT RUNNER PRIVILEGE, so a
+    //   spec_cache write == RCE as the runner. What defends it: spec_cache is write-locked to the runner
+    //   (0041 revokes the API role's write); the source is a pinned, traversal-guarded fetch from
+    //   synthwatch-monitors; and that repo's MERGE GATE is the admission control (a spec compiles only
+    //   through the single lib/flow alias — no arbitrary import). See SECURITY.md. Do NOT widen this.
     await import(pathToFileURL(file).href); // triggers test() capture in the shared shim
     return drainCapturedTests();
   } finally {
