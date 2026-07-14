@@ -174,29 +174,38 @@ test('crossLocationDown: one failing region of three does NOT meet the majority 
   assert.equal(crossLocationDown(3, 3, null), true, 'all three failing → down');
 });
 
-// ── ★ incidentSeverity (0085): the single-region WARNING ruling. A sustained single/minority region down
-//    pages at WARNING; a majority pages at the check's severity (CRITICAL); nothing sustainedly down → no
-//    incident. Reuses the SAME majority quorum (effectiveN) — it does not change it. ──────────────────────
-test('★ incidentSeverity: a single sustained region of three → WARNING (the westus2 fix — not silence)', () => {
-  assert.equal(incidentSeverity(1, 3, null, 'critical'), 'warning', '★ one of three sustainedly down → WARNING');
-  assert.equal(incidentSeverity(2, 3, null, 'critical'), 'critical', 'two of three (majority) → CRITICAL — unchanged');
-  assert.equal(incidentSeverity(3, 3, null, 'critical'), 'critical', 'all three → CRITICAL');
+// ── ★ incidentSeverity (0085): two bars. `failing` = regions at the failure_threshold bar (CRITICAL/majority,
+//    checked FIRST + immediate); `failingWarning` = regions past the 2× WARNING debounce. Args:
+//    (failing, failingWarning, total, minFailLocations, checkSeverity). ─────────────────────────────────────
+test('★ incidentSeverity: a single region PAST the warning bar → WARNING (the westus2 fix — not silence)', () => {
+  assert.equal(incidentSeverity(1, 1, 3, null, 'critical'), 'warning', '★ one region sustained past the 2× debounce → WARNING');
+  assert.equal(incidentSeverity(2, 1, 3, null, 'critical'), 'critical', 'two of three (majority) → CRITICAL — uses the LOW bar, unchanged');
+  assert.equal(incidentSeverity(3, 2, 3, null, 'critical'), 'critical', 'all three → CRITICAL');
 });
-test('incidentSeverity: nothing sustainedly down → null (no incident)', () => {
-  assert.equal(incidentSeverity(0, 3, null, 'critical'), null);
-  assert.equal(incidentSeverity(0, 0, null, 'critical'), null, 'a fully silent check opens nothing');
+test('★ incidentSeverity: the WARNING DEBOUNCE — a region at the critical bar but NOT the 2× warning bar → null', () => {
+  // ★ the churn fix: failing=1 (down failure_threshold runs) but failingWarning=0 (not yet 2×) → NO incident.
+  assert.equal(incidentSeverity(1, 0, 3, null, 'critical'), null, 'below the 2× warning bar → silent (debounced — kills a flapping-region daily warning)');
 });
-test('incidentSeverity: a single-location check (total=1) pages at its configured severity directly (unchanged)', () => {
-  assert.equal(incidentSeverity(1, 1, null, 'critical'), 'critical', 'total=1 → effectiveN=1 → 1 failing is a majority → critical');
-  assert.equal(incidentSeverity(1, 1, null, 'warning'), 'warning');
+test('★ incidentSeverity: CRITICAL is NEVER delayed by the debounce — a majority pages even with failingWarning=0', () => {
+  // ★ the one way this could be worse than today: a spread to majority MUST page critical immediately, not
+  // wait out the warning bar. failing=2 (majority at the LOW bar), failingWarning=0 → still CRITICAL.
+  assert.equal(incidentSeverity(2, 0, 3, null, 'critical'), 'critical', 'majority at the low bar → CRITICAL now, not waiting any debounce');
 });
-test('incidentSeverity: a WARNING-configured check never yields critical (a majority is still just warning)', () => {
-  assert.equal(incidentSeverity(1, 3, null, 'warning'), 'warning');
-  assert.equal(incidentSeverity(3, 3, null, 'warning'), 'warning', 'majority of a warning check stays warning — no escalation to critical');
+test('incidentSeverity: nothing down at either bar → null', () => {
+  assert.equal(incidentSeverity(0, 0, 3, null, 'critical'), null);
+  assert.equal(incidentSeverity(0, 0, 0, null, 'critical'), null, 'a fully silent check opens nothing');
 });
-test('incidentSeverity: explicit minFailLocations overrides the quorum (min(minFail, total))', () => {
-  assert.equal(incidentSeverity(1, 3, 1, 'critical'), 'critical', 'minFail=1 → one failing region IS a majority → CRITICAL directly');
-  assert.equal(incidentSeverity(1, 3, 3, 'critical'), 'warning', 'minFail=3 → one of three is below quorum → WARNING');
+test('incidentSeverity: a single-location check (total=1) pages at its severity directly (unchanged)', () => {
+  assert.equal(incidentSeverity(1, 0, 1, null, 'critical'), 'critical', 'total=1 → effectiveN=1 → 1 failing is a majority → CRITICAL (low bar, even below the warning bar)');
+  assert.equal(incidentSeverity(1, 1, 1, null, 'warning'), 'warning');
+});
+test('incidentSeverity: a WARNING-configured check never yields critical', () => {
+  assert.equal(incidentSeverity(1, 1, 3, null, 'warning'), 'warning');
+  assert.equal(incidentSeverity(3, 2, 3, null, 'warning'), 'warning', 'majority of a warning check stays warning');
+});
+test('incidentSeverity: explicit minFailLocations overrides the quorum', () => {
+  assert.equal(incidentSeverity(1, 0, 3, 1, 'critical'), 'critical', 'minFail=1 → one region IS a majority → CRITICAL (low bar, even below warning bar)');
+  assert.equal(incidentSeverity(1, 1, 3, 3, 'critical'), 'warning', 'minFail=3 → one region below quorum but past the warning bar → WARNING');
 });
 
 test('crossLocationDown: the `failing >= 1` floor keeps a 0-failing check UP even with minFailLocations=0', () => {

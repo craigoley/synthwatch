@@ -221,6 +221,7 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
   //   · check.severity (CRITICAL) = majority quorum met (unchanged). See incidentSeverity.
   const desired = incidentSeverity(
     verdict.failing,
+    verdict.failingWarning,
     verdict.total,
     check.min_fail_locations,
     check.severity as 'critical' | 'warning',
@@ -474,11 +475,24 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
 // verdict) so a decommissioned region can't pin a check down or up forever.
 const STALE_LOCATION = '1 hour';
 
+// ★ 0085 WARNING debounce. A single-region WARNING requires that region to be consecutively down for
+// MULTIPLIER × failure_threshold runs — a HIGHER evidence bar than the failure_threshold that gates CRITICAL.
+// DERIVED from the 30-day replay, not invented: at the flat failure_threshold bar the flagship flapper (342,
+// westus2, failure_threshold=3) produced 30 warnings/month (~1/day about a known state — noise is silence
+// wearing different clothes). The curve of warnings/30d vs multiplier: flat=59 → 2×=34 → 3×=22 → 4×=20; #342
+// alone: 30 → 4 → 2 → 2. The knee is 2×: it collapses #342's daily churn (30→4) while STILL catching its real
+// 16-consecutive outage (16 ≥ 2×3=6), and it is the most sensitive multiplier that does so (3×/4× only shave a
+// further ~12 fleet-wide while raising the bar past genuine 6–8-run regional outages). CRITICAL is UNAFFECTED —
+// it uses `failing` at the failure_threshold bar, so a spread to majority pages immediately, never debounced.
+const WARNING_DEBOUNCE_MULTIPLIER = 2;
+
 interface Verdict {
   /** down = failing from >= effective-N distinct active locations. */
   down: boolean;
-  /** active locations whose latest `failure_threshold` runs are all down. */
+  /** active locations whose latest `failure_threshold` runs are all down (the CRITICAL / majority bar). */
   failing: number;
+  /** active locations whose latest `MULTIPLIER × failure_threshold` runs are all down (the WARNING bar). */
+  failingWarning: number;
   /** active locations (a completed run within STALE_LOCATION). */
   total: number;
 }
@@ -524,27 +538,31 @@ export function crossLocationDown(
 }
 
 /**
- * ★ Incident severity from the cross-location scope (0085 — the single-region WARNING ruling). Reuses the
- * SAME majority quorum as crossLocationDown (effectiveN); it does NOT change that quorum:
- *   • failing === 0            → null  (no incident — no region is sustainedly down)
- *   • 0 < failing < effectiveN → 'warning'  (a SINGLE / minority region sustainedly down: a real outage of one
- *                                vantage — already debounced by the per-location failure_threshold baked into
- *                                `failing` — but NOT a majority, so not CRITICAL)
- *   • failing >= effectiveN    → the check's configured severity (CRITICAL) — the majority path, UNCHANGED.
- * Why WARNING and not silence: the old "minority ⇒ no incident" gave a sustained single-region outage (check
- * 342: 16 consecutive westus2 failures, 219 failed runs over 3 days) ZERO acknowledgeable signal, so the
- * operator DELETED westus2 from the check to make it stop — manufacturing a green light by removing the
- * observation, inside the platform built to refuse exactly that. A WARNING is acknowledgeable; silence is not.
+ * ★ Incident severity from the cross-location scope (0085 — the single-region WARNING ruling). Reuses the SAME
+ * majority quorum as crossLocationDown (effectiveN); it does NOT change that quorum. Takes TWO failing counts:
+ *   • `failing`        — regions down for failure_threshold runs (the CRITICAL / majority bar).
+ *   • `failingWarning` — regions down for MULTIPLIER × failure_threshold runs (the higher WARNING bar).
+ * Decision (CRITICAL is checked FIRST and uses the LOW bar, so it is NEVER delayed by the warning debounce):
+ *   • failing >= effectiveN   → check's configured severity (CRITICAL) — the majority path, UNCHANGED.
+ *   • failingWarning >= 1      → 'warning'  (a single / minority region sustained PAST the debounce).
+ *   • otherwise               → null (no incident).
+ * Why a WARNING at all (not silence): the old "minority ⇒ no incident" gave a sustained single-region outage
+ * (342: 16 consecutive westus2 failures, 219 failed runs over 3 days) ZERO acknowledgeable signal, so the
+ * operator DELETED westus2 to make it stop — manufacturing green by removing the observation. Why a HIGHER bar
+ * for the warning (the debounce): the flat bar turned 342's flapping westus2 into ~1 warning/day about a known
+ * state — noise, which ends the same way as silence (ignored). The 2× bar (see WARNING_DEBOUNCE_MULTIPLIER)
+ * raises the EVIDENCE required for a regional outage; it does not lower the listening rate.
  */
 export function incidentSeverity(
   failing: number,
+  failingWarning: number,
   total: number,
   minFailLocations: number | null,
   checkSeverity: 'critical' | 'warning',
 ): 'critical' | 'warning' | null {
-  if (failing < 1) return null;
-  if (failing >= effectiveN(total, minFailLocations)) return checkSeverity; // majority → configured (CRITICAL)
-  return 'warning'; // a single / minority region sustainedly down → WARNING (never CRITICAL)
+  if (failing >= 1 && failing >= effectiveN(total, minFailLocations)) return checkSeverity; // majority → CRITICAL (low bar, immediate)
+  if (failingWarning >= 1) return 'warning'; // a single / minority region sustained past the WARNING debounce
+  return null;
 }
 
 /**
@@ -556,7 +574,8 @@ export function incidentSeverity(
  * paging. Single reporting location => N=1 => exactly the old behaviour.
  */
 async function aggregateVerdict(check: Check): Promise<Verdict> {
-  const { rows } = await pool.query<{ total: string; failing: string }>(
+  const warningThreshold = WARNING_DEBOUNCE_MULTIPLIER * check.failure_threshold;
+  const { rows } = await pool.query<{ total: string; failing: string; failing_warning: string }>(
     `WITH recent AS (
        SELECT location, status,
               row_number() OVER (PARTITION BY location ORDER BY started_at DESC) AS rn,
@@ -576,8 +595,14 @@ async function aggregateVerdict(check: Check): Promise<Verdict> {
      ),
      per_loc AS (
        SELECT location,
+              -- CRITICAL / majority bar: the latest failure_threshold ($2) runs all down.
               bool_and(status IN ('fail','error')) FILTER (WHERE rn <= $2) AS all_down,
               count(*) FILTER (WHERE rn <= $2) AS recent_count,
+              -- WARNING bar (0085): the latest MULTIPLIER x failure_threshold ($4) runs all down — a higher
+              -- evidence bar so a flapping region cannot churn a daily warning. recent_count_warn >= $4 also
+              -- requires the region to HAVE that many recent runs (a young region cannot warn early).
+              bool_and(status IN ('fail','error')) FILTER (WHERE rn <= $4) AS all_down_warn,
+              count(*) FILTER (WHERE rn <= $4) AS recent_count_warn,
               max(loc_last) AS loc_last
          FROM recent
         GROUP BY location
@@ -586,15 +611,19 @@ async function aggregateVerdict(check: Check): Promise<Verdict> {
        count(*) FILTER (WHERE loc_last > now() - $3::interval) AS total,
        count(*) FILTER (
          WHERE all_down AND recent_count >= $2 AND loc_last > now() - $3::interval
-       ) AS failing
+       ) AS failing,
+       count(*) FILTER (
+         WHERE all_down_warn AND recent_count_warn >= $4 AND loc_last > now() - $3::interval
+       ) AS failing_warning
        FROM per_loc`,
-    [check.id, check.failure_threshold, STALE_LOCATION],
+    [check.id, check.failure_threshold, STALE_LOCATION, warningThreshold],
   );
   // N is over REPORTING locations (`total`), NOT assigned — a stale region must not
   // veto paging (the silent-suppression bug). failing <= total always.
   const total = Number(rows[0]?.total ?? 0);
   const failing = Number(rows[0]?.failing ?? 0);
-  return { down: crossLocationDown(failing, total, check.min_fail_locations), failing, total };
+  const failingWarning = Number(rows[0]?.failing_warning ?? 0);
+  return { down: crossLocationDown(failing, total, check.min_fail_locations), failing, failingWarning, total };
 }
 
 /**

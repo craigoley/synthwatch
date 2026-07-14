@@ -288,10 +288,11 @@ nodeTest('★ escalation: a WARNING incident escalates to CRITICAL when the outa
   try {
     await seedAt(check.id, 'pass', 'centralus', 20);
     await seedAt(check.id, 'pass', 'eastus2', 20);
+    await seedAt(check.id, 'fail', 'westus2', 16); // 2× failure_threshold (ft=1) → past the WARNING debounce
     const w1 = await seedAt(check.id, 'fail', 'westus2', 15);
     await evaluate(check, w1);
-    assert.equal(await openIncidentSeverity(check.id), 'warning', 'tick 1: one region down → WARNING opens');
-    const c2 = await seedAt(check.id, 'fail', 'centralus', 3); // now 2 of 3 → majority
+    assert.equal(await openIncidentSeverity(check.id), 'warning', 'tick 1: one region sustained (2×) → WARNING opens');
+    const c2 = await seedAt(check.id, 'fail', 'centralus', 3); // now 2 of 3 at the CRITICAL bar → majority
     await evaluate(check, c2);
     assert.equal(await openIncidentCount(check.id), 1, 'still ONE incident — escalated in place, not a second');
     assert.equal(await openIncidentSeverity(check.id), 'critical', '★ escalated WARNING → CRITICAL (not dropped by ON CONFLICT)');
@@ -308,5 +309,34 @@ nodeTest('the majority path is unchanged: 2 of 3 regions down opens a CRITICAL i
     await evaluate(check, c);
     assert.equal(await openIncidentCount(check.id), 1, 'majority down → incident opens');
     assert.equal(await openIncidentSeverity(check.id), 'critical', 'directly at CRITICAL — the majority path, unchanged');
+  } finally { await pool.query(`DELETE FROM checks WHERE id = $1`, [check.id]); }
+});
+
+// ★ THE DEBOUNCE (the churn fix): a single region down AT the critical bar (failure_threshold) but BELOW the
+// 2× warning bar opens NO incident. This is what kills check 342's daily westus2 warning.
+nodeTest('★ debounce: a single region down at the critical bar but below 2× → NO warning (kills the daily churn)', { skip: SKIP }, async () => {
+  const check = await makeCheck(2, '__warning_debounce__'); // failure_threshold=2 → warning bar = 4
+  try {
+    await seedAt(check.id, 'fail', 'westus2', 20);
+    const w = await seedAt(check.id, 'fail', 'westus2', 10); // westus2 down 2 = meets ft=2, but < 2×2=4
+    await seedAt(check.id, 'pass', 'centralus', 12);
+    await seedAt(check.id, 'pass', 'eastus2', 11);
+    await evaluate(check, w);
+    assert.equal(await openIncidentCount(check.id), 0, 'sustained at the CRITICAL bar but below the 2× WARNING bar → still silent (debounced)');
+  } finally { await pool.query(`DELETE FROM checks WHERE id = $1`, [check.id]); }
+});
+
+// ★★ CRITICAL IS NEVER DELAYED BY THE DEBOUNCE (the one way this could be worse than today): a region below
+// the warning bar that SPREADS to a majority pages CRITICAL immediately — no warning was ever open, no wait.
+nodeTest('★ critical is never debounced: a sub-warning region that spreads to a majority pages CRITICAL immediately', { skip: SKIP }, async () => {
+  const check = await makeCheck(1, '__critical_no_delay__'); // ft=1 → warning bar = 2
+  try {
+    await seedAt(check.id, 'pass', 'eastus2', 20);
+    await seedAt(check.id, 'fail', 'westus2', 8); // westus2 down 1 = below the 2× warning bar → NO warning yet
+    // (no evaluate here — the warning bar isn't met, nothing would open)
+    const c = await seedAt(check.id, 'fail', 'centralus', 3); // now 2 of 3 at the critical bar → majority
+    await evaluate(check, c);
+    assert.equal(await openIncidentCount(check.id), 1, 'majority reached → incident opens immediately');
+    assert.equal(await openIncidentSeverity(check.id), 'critical', '★ CRITICAL directly — the debounce never delayed it');
   } finally { await pool.query(`DELETE FROM checks WHERE id = $1`, [check.id]); }
 });
