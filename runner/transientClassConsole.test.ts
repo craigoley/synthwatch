@@ -76,3 +76,33 @@ test('canonicalizeConsole mirrors the C# canonicalizer (lowercase, strip ts/quer
   assert.equal(canonicalizeConsole('Error at 2026-07-08T02:19:31.000Z boom'), 'error at boom');
   assert.equal(canonicalizeConsole('load /_next/static/chunks/0123456789abcdef.js'), 'load /_next/static/chunks/*.js');
 });
+
+// ── ★ Tighten the console-feed survivors the mutation sweep found (#299's firstPartyConsoleKeys). ────────────
+
+// :97 — 'pageerror' (an uncaught exception) is an error-class level too, not just 'error'. Kills 'pageerror'→"".
+test('a NEW first-party PAGEERROR (uncaught exception) ⇒ SERVICE-SIDE', () => {
+  const orig: TraceSignalsLike = { console: { messages: [{ level: 'pageerror', origin: 'site', sourceHost: 'www.wegmans.com', text: 'Uncaught TypeError: x is not a function' }] } };
+  assert.equal(classifyTransient(orig, [{ console: { messages: [] } }]), 'service-side', 'pageerror is error-class — a new one is a service signal');
+});
+
+// :107 — an error-level message with EMPTY text carries no signal (no key). Kills the `!m.text` guard → false.
+test('a first-party error with EMPTY text ⇒ no key ⇒ monitor-side (the !m.text guard)', () => {
+  const orig: TraceSignalsLike = { console: { messages: [err('')] } };
+  assert.equal(classifyTransient(orig, [{ console: { messages: [] } }]), 'monitor-side', 'an empty-text console line is not a first-party service error');
+});
+
+// :108 — the console key must be the REAL canonical text, not a constant. A NEW error vs a DIFFERENT baseline
+// error must read service-side; a mutant that emits a constant key (``) would collapse both → monitor-side.
+test('a NEW first-party error, DIFFERENT from a baseline error ⇒ service-side (kills a constant-key mutant)', () => {
+  const orig: TraceSignalsLike = { console: { messages: [err('brand new prod API 500 on checkout')] } };
+  const base = [{ console: { messages: [err('a totally different chronic cooklist error')] } }];
+  assert.equal(classifyTransient(orig, base), 'service-side', 'the new error differs from the baseline error → NEW → service-side');
+});
+
+// :108 — the sourceHost is PART of the key. The SAME text from a NEW host is a new key; a mutant that drops the
+// host (sourceHost && '') would collapse the two hosts → falsely monitor-side.
+test('same text from a NEW host ⇒ new key ⇒ service-side (the sourceHost belongs in the key)', () => {
+  const orig: TraceSignalsLike = { console: { messages: [err('Failed to fetch', 'site', 'api-new.wegmans.cloud')] } };
+  const base = [{ console: { messages: [err('Failed to fetch', 'site', 'api-old.wegmans.cloud')] } }];
+  assert.equal(classifyTransient(orig, base), 'service-side', 'a first-party error from a host not in the baseline is NEW');
+});
