@@ -21,7 +21,8 @@ async function makeCheck(name: string, archived: boolean): Promise<number> {
   return rows[0].id;
 }
 
-const has = (rows: { id: string }[], id: number): boolean => rows.some((r) => Number(r.id) === id);
+// node-pg returns BIGINT ids as strings, so compare numerically on both sides (=== on mixed types is false).
+const has = (rows: { id: string }[], id: number | string): boolean => rows.some((r) => Number(r.id) === Number(id));
 
 test('narratableCheckIds: an ARCHIVED check is excluded from the narrative loop; un-archiving restores it', async () => {
   // Two ENABLED checks — the only difference is archived_at. The live one must always narrate; the archived

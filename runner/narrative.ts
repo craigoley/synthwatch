@@ -594,7 +594,7 @@ async function upsert(fp: FactPack, n: Narrative, model: string): Promise<void> 
  * The monitors that get a per-monitor AI narrative each cycle: LIVE checks only.
  *
  * ★ TWO DIFFERENT "active check" predicates live in this codebase and the divergence on `enabled` is
- * DELIBERATE — do NOT unify them (that erases a real distinction: the countable_run/flake_status lesson):
+ * DELIBERATE — do NOT unify them (that erases a real distinction: the countable_run / flake-budget lesson):
  *   live_check       = enabled AND archived_at IS NULL   — "does this produce LIVE health RIGHT NOW?"
  *                      THIS loop. A paused check produces no live signal to narrate, and an ARCHIVED/retired
  *                      check must NEVER get an urgent AI action-item written about it (rca-demo: 0% avail,
