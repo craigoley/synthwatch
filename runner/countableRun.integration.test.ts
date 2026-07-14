@@ -53,14 +53,14 @@ nodeTest('countable_run keeps a scheduled run and excludes confirmation / supers
   const id = await makeCheck('__cr_view__');
   try {
     const s1 = await seedRun(id, 'fail', 50);              // scheduled real run — COUNTS
-    await seedRun(id, 'fail', 40, { confirmationOf: s1 }); // confirmation of s1 — excluded
+    await seedRun(id, 'fail', 40, { confirmationOf: s1 }); // DOWN confirmation of s1 — excluded (redundant re-check)
     const t = await seedRun(id, 'fail', 35);               // a transient...
-    const tc = await seedRun(id, 'pass', 30, { confirmationOf: t }); // ...whose confirmation passed
-    await supersede(t, tc);                                // → t superseded (excluded); tc is a confirmation (excluded)
+    const tc = await seedRun(id, 'pass', 30, { confirmationOf: t }); // ...whose confirmation PASSED
+    await supersede(t, tc);                                // t superseded → excluded; tc is the RECOVERY (pass conf) → KEPT
     await seedRun(id, 'fail', 20, { sandbox: true });      // sandbox — excluded
     await pool.query(`INSERT INTO runs (check_id, status, started_at, location) VALUES ($1,'running',now()- interval '15 min','default'),($1,'infra_error',now()- interval '10 min','default')`, [id]);
     const { rows } = await pool.query<{ n: string }>(`SELECT count(*) AS n FROM countable_run WHERE check_id = $1`, [id]);
-    assert.equal(Number(rows[0].n), 1, 'exactly one countable run (the scheduled fail); all others excluded');
+    assert.equal(Number(rows[0].n), 2, 'kept: the scheduled fail + the PASSING confirmation (recovery). excluded: down-confirmation, superseded, sandbox, running, infra_error');
   } finally { await pool.query(`DELETE FROM checks WHERE id = $1`, [id]); }
 });
 
@@ -80,20 +80,22 @@ nodeTest('sla_availability EXCLUDES confirmation runs (33.33% on main → 50% on
   } finally { await pool.query(`DELETE FROM checks WHERE id = $1`, [id]); }
 });
 
-// ── ★ A superseded transient contributes ZERO to availability. (Invariant guard — green on both main and
-//    fix; pins that the view keeps 0077 behaviour while adding the confirmation fix.) ────────────────────
-nodeTest('sla_availability: a superseded transient contributes ZERO', { skip: SKIP }, async () => {
+// ── ★ A self-healed transient must not CRATER availability: its superseded fail counts ZERO as DOWN, and its
+//    passing confirmation (the recovery) counts as UP — the deliberate confirmationRetry #7/#8 behaviour the
+//    canonical view PRESERVES (excluding the pass would erase it). ──────────────────────────────────────────
+nodeTest('sla_availability: a self-healed transient — fail counts 0 down, recovery counts up (100%)', { skip: SKIP }, async () => {
   const id = await makeCheck('__cr_sla_super__');
   try {
     await seedRun(id, 'pass', 40);
     const t = await seedRun(id, 'fail', 35);
-    const tc = await seedRun(id, 'pass', 30, { confirmationOf: t }); // confirmation passed → transient
-    await supersede(t, tc);                                          // t superseded (excluded); tc confirmation (excluded)
-    const { rows } = await pool.query<{ availability_pct: string; completed_runs: string }>(
-      `SELECT availability_pct, completed_runs FROM sla_availability($1, $2) WHERE check_id = $3`,
+    const tc = await seedRun(id, 'pass', 30, { confirmationOf: t }); // the confirmation PASSED → transient recovered
+    await supersede(t, tc);                                          // t superseded → excluded; tc (recovery) → KEPT as up
+    const { rows } = await pool.query<{ availability_pct: string; completed_runs: string; down_runs: string }>(
+      `SELECT availability_pct, completed_runs, down_runs FROM sla_availability($1, $2) WHERE check_id = $3`,
       [WINDOW[0], WINDOW[1], id]);
-    assert.equal(Number(rows[0].completed_runs), 1, 'only the pass counts');
-    assert.equal(Number(rows[0].availability_pct), 100, 'the superseded transient never moved availability');
+    assert.equal(Number(rows[0].down_runs), 0, 'the superseded transient fail never counts as down');
+    assert.equal(Number(rows[0].completed_runs), 2, 'the original pass + the passing confirmation (recovery)');
+    assert.equal(Number(rows[0].availability_pct), 100, 'availability stays 100 — recovery is up, transient fail excluded');
   } finally { await pool.query(`DELETE FROM checks WHERE id = $1`, [id]); }
 });
 

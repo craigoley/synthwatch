@@ -829,18 +829,21 @@ COMMIT;
 BEGIN;
 
 -- ★ countable_run (0081): the ONE canonical "countable scheduled observation" — a real-result,
--- non-superseded, non-confirmation, non-sandbox run. Defined before the functions below because SQL-
--- language function bodies are validated against catalog objects at CREATE time. Consumed by
--- sla_availability, slo_status (below), daily_check_rollup (runner/rollup.ts), and the incident verdict
--- (runner/evaluate.ts aggregateVerdict + countConsecutiveDown). ★ flake_status deliberately does NOT
--- use it — a flap IS a superseded run (see its comment below). Maintenance-window exclusion stays
--- per-consumer (contextual: run.started_at vs each window's range).
+-- non-superseded, non-sandbox run, MINUS redundant DOWN confirmation re-checks. Defined before the
+-- functions below because SQL-language function bodies are validated against catalog objects at CREATE
+-- time. Consumed by sla_availability, slo_status (below), daily_check_rollup (runner/rollup.ts), and the
+-- incident verdict (runner/evaluate.ts aggregateVerdict + countConsecutiveDown). ★ flake_status
+-- deliberately does NOT use it — a flap IS a superseded run (see its comment below). Maintenance-window
+-- exclusion stays per-consumer (contextual: run.started_at vs each window's range).
 CREATE OR REPLACE VIEW countable_run AS
     SELECT *
       FROM runs
      WHERE status NOT IN ('running', 'infra_error')
        AND superseded_by_run_id IS NULL
-       AND confirmation_of_run_id IS NULL
+       -- Exclude only a DOWN confirmation (a redundant re-check of the scheduled failure it confirms → fixes
+       -- the outage double-count). A PASSING confirmation is the transient's RECOVERY — the "up" for that
+       -- tick — and is KEPT (else a self-healed blip contributes zero availability; confirmationRetry #7/#8).
+       AND NOT (confirmation_of_run_id IS NOT NULL AND status IN ('fail', 'error'))
        AND NOT sandbox;
 
 CREATE OR REPLACE FUNCTION sla_availability(p_from timestamptz, p_to timestamptz)

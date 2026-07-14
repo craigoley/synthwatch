@@ -29,7 +29,14 @@ CREATE OR REPLACE VIEW countable_run AS
       FROM runs
      WHERE status NOT IN ('running', 'infra_error')
        AND superseded_by_run_id IS NULL
-       AND confirmation_of_run_id IS NULL
+       -- ★ Exclude only a DOWN confirmation run. A fail/error confirmation is a redundant RE-CHECK of the
+       -- scheduled failure it confirms (already in the window) → dropping it fixes the outage double-count
+       -- (the bug). But a PASSING confirmation is the transient's RECOVERY — the "up" for that tick — and
+       -- must be KEPT, else a self-healed blip contributes zero availability, silently reversing the
+       -- deliberate rollup behaviour proven by confirmationRetry #7/#8 ("only the passing confirmation counts
+       -- as up"). Excluding ALL confirmations erased that distinction — the exact "unification worse than the
+       -- duplication" this canonical view was warned against.
+       AND NOT (confirmation_of_run_id IS NOT NULL AND status IN ('fail', 'error'))
        AND NOT sandbox;
 
 COMMENT ON VIEW countable_run IS
