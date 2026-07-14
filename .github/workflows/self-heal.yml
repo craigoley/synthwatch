@@ -58,6 +58,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 35
     permissions:
+      id-token: write       # ★ claude-code-action authenticates via OIDC — WITHOUT this the agent dies at
+                            #   startup ("Could not fetch an OIDC token. Did you remember to add id-token:
+                            #   write?") on every run, so self-heal has been silently non-functional: it never
+                            #   even attempts a fix, and the job reports FAILURE (not "nothing to heal"). (#313)
       contents: write       # Claude pushes ONE candidate fix to the (trusted, same-repo) PR branch
       pull-requests: write  # PR comments / ops
       issues: write         # `gh pr comment` posts an issue comment
