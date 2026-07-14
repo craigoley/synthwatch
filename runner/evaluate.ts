@@ -959,7 +959,7 @@ export interface RunSideEffectContext {
  * baseline) and persist `runs.transient_class`. Same-location baseline keeps it apples-to-apples for a
  * multi-location check. INDETERMINATE when the failing run captured no signals (http/dns/ssl, or a strand).
  */
-async function classifyAndPersistTransient(check: Check, originalRunId: number): Promise<void> {
+export async function classifyAndPersistTransient(check: Check, originalRunId: number): Promise<void> {
   const orig = await pool.query<{ trace_signals: TraceSignalsLike | null; location: string | null; started_at: Date }>(
     `SELECT trace_signals, location, started_at FROM runs WHERE id = $1`,
     [originalRunId],
@@ -967,11 +967,21 @@ async function classifyAndPersistTransient(check: Check, originalRunId: number):
   if (orig.rowCount === 0) return;
   const { trace_signals, location, started_at } = orig.rows[0];
 
-  // Baseline: the last-N SETTLED runs (same location) strictly before the transient, newest first. jsonb →
-  // pg returns trace_signals already parsed.
+  // ★ Baseline: the last-N SUCCESSFUL (pass/warn) runs (same location) strictly before the transient — NOT
+  // the last-N settled runs. Fixes the sustained-outage INVERSION: the classifier's question is "is the SITE
+  // broken?", not the error-diff's "what CHANGED this run?". A first-party error that has failed for four runs
+  // straight is IN the settled baseline (so it read monitor-side — most wrong exactly when the failure is most
+  // real), but it is NOT in the last SUCCESSFUL run, so it counts. The discriminator is already in the data:
+  // benign ambient noise (e.g. /monitoring) fails on PASSING runs too (→ in the success baseline → doesn't
+  // count); a real failure appears ONLY when the check fails (→ absent from the success baseline → counts, no
+  // matter how many in a row). Empty baseline (no recent green) ⇒ every first-party error is new ⇒ service-side
+  // — correct: no green + first-party errors IS an outage (loop handles empty, no divide). Bounded to 30d (the
+  // SLA window): a success older than that is too stale to define "ambient" → ignored → service-side.
+  // ★ Deliberately DIVERGES from the API ErrorDiff's settled baseline — a different question (transientClass.ts).
   const base = await pool.query<{ trace_signals: TraceSignalsLike | null }>(
     `SELECT trace_signals FROM runs
-      WHERE check_id = $1 AND status <> 'running' AND started_at < $2 AND id <> $3
+      WHERE check_id = $1 AND status IN ('pass', 'warn')
+        AND started_at < $2 AND started_at > $2 - interval '30 days' AND id <> $3
         AND (($4::text IS NULL AND location IS NULL) OR location = $4)
       ORDER BY started_at DESC LIMIT $5`,
     [check.id, started_at, originalRunId, location, TRANSIENT_BASELINE_RUNS],
