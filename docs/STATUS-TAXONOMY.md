@@ -1,6 +1,6 @@
 # Status taxonomy — recon findings
 
-> _Verified 2026-07-14 — prose with **no automated check**; `db/schema.sql` + the code are authoritative._
+> _Verified 2026-07-14 — the STATUS ENUM below is **tripwire-enforced** (`runner/statusTaxonomyDoc.test.ts`); the surrounding **prose** (when each status is emitted, what it means) has **no automated check** — if it disagrees with the code, the code wins._
 >
 > ### ★ CURRENT TRUTH (read this — the body below is a superseded 2026-06-21 recon)
 > `runs.status` has **SIX** values today: `pass | warn | fail | error | infra_error |
@@ -11,6 +11,14 @@
 > **The statements below that "the runner only ever emits pass/fail" and that the row is
 > inserted as `fail` are NO LONGER TRUE** — they describe the pre-widening state and are
 > kept only as the original recon record. For the live taxonomy, trust `db/schema.sql`.
+
+<!-- ★ STATUS ENUM — tripwire-enforced by runner/statusTaxonomyDoc.test.ts: the list between the markers below
+     MUST equal RunStatus in runner/db.ts AND runs_status_check in db/schema.sql, exactly. The test reds BY NAME
+     in either direction (a status here but not in code = the doc invents one; a status in code but not here =
+     the doc under-describes). Add a status only by changing the code enum + this list together. -->
+<!-- STATUS-ENUM:START -->
+`pass` · `warn` · `fail` · `error` · `infra_error` · `running`
+<!-- STATUS-ENUM:END -->
 
 ## TL;DR (⚠️ HISTORICAL — 2026-06-21, superseded; see "CURRENT TRUTH" above)
 
