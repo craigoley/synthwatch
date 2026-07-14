@@ -6,7 +6,7 @@
 // breach / successful capture) is unchanged — no false positives.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { perfBudgetVerdict, hasPerfBudget, perfBudgetBreach, budgetedMetricCaptureFailed, shouldConfirmByRerun } from './evaluate.js';
+import { perfBudgetVerdict, hasPerfBudget, perfBudgetBreach, budgetedMetricCaptureFailed, shouldConfirmByRerun, effectiveN, crossLocationDown } from './evaluate.js';
 import { EMPTY_METRICS, type RunMetrics } from './metrics.js';
 import type { Check } from './db.js';
 
@@ -143,4 +143,36 @@ test('shouldConfirmByRerun: NOT for pass/warn/infra_error, NOT when already-fail
   assert.equal(shouldConfirmByRerun(check({ kind: 'http' }), 'infra_error', false), false); // not a site outage
   assert.equal(shouldConfirmByRerun(check({ kind: 'http' }), 'fail', true), false); // ★ D5: already-failing http → immediate, no confirm
   assert.equal(shouldConfirmByRerun(check({ kind: 'browser' }), 'fail', true), false); // D5 browser unchanged
+});
+
+// ── ★ effectiveN + crossLocationDown: the cross-location quorum that gates paging. The mutation sweep found
+//    it almost entirely unpinned — the quorum VALUE (floor(n/2)+1), the min/max clamp, the null-vs-explicit
+//    branch, and the `failing >= 1 &&` floor coupling ALL survived. These are the must-go-red for each. This
+//    is also the documented gap: a COMPLETE single-region outage (1 of 3 failing) is deliberately NOT paged
+//    under majority quorum — that decision is now a TEST, so a regression in either direction is caught. ────
+test('effectiveN: null minFailLocations → MAJORITY quorum floor(n/2)+1 (1→1, 2→2, 3→2, 4→3, 5→3)', () => {
+  assert.equal(effectiveN(1, null), 1);
+  assert.equal(effectiveN(2, null), 2);
+  assert.equal(effectiveN(3, null), 2, '★ 2-of-3 majority — kills the +1 → -1 quorum-arithmetic mutant');
+  assert.equal(effectiveN(4, null), 3);
+  assert.equal(effectiveN(5, null), 3);
+});
+
+test('effectiveN: explicit minFailLocations → min(minFail, reporting) — a CLAMP, not max', () => {
+  assert.equal(effectiveN(5, 2), 2, 'ask 2 of 5 reporting → 2');
+  assert.equal(effectiveN(2, 5), 2, '★ ask 5 but only 2 reporting → clamp to 2 (min), NOT 5 (max) — kills min→max');
+  assert.equal(effectiveN(3, 1), 1, '★ explicit 1 overrides the majority (would be 2) — kills the null-branch flip');
+});
+
+test('★ crossLocationDown: one failing region of three is NOT down under majority quorum (the #4 gap, now pinned)', () => {
+  // failing>=1 is TRUE but failing>=effectiveN(3,null)=2 is FALSE → && ⇒ false. `&& → ||` would page here.
+  assert.equal(crossLocationDown(1, 3, null), false, '★ one of three failing → NOT paged (majority) — kills && → ||');
+  assert.equal(crossLocationDown(2, 3, null), true, 'two of three failing → down');
+  assert.equal(crossLocationDown(3, 3, null), true, 'all three failing → down');
+});
+
+test('crossLocationDown: the `failing >= 1` floor keeps a 0-failing check UP even with minFailLocations=0', () => {
+  assert.equal(crossLocationDown(0, 3, 0), false, '★ nothing failing → UP even when minFail=0 (the floor) — kills a `>= 1 → true` mutant');
+  assert.equal(crossLocationDown(0, 0, null), false, 'a fully silent check (reporting=0) is not down');
+  assert.equal(crossLocationDown(1, 3, 1), true, 'explicit minFail=1 → a single failing region DOES page (overrides majority)');
 });
