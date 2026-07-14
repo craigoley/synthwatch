@@ -1,0 +1,95 @@
+name: Schema-freeze pre-flight
+
+# ★ Warn the PERSON WHO BREAKS IT, not the person who finds out. The api's schema-parity gate reads runner
+# main LIVE (correct — liveness gives it teeth), so a runner schema change merges green and freezes the api's
+# gate on someone else's unrelated PR. This has happened THREE times (countable_run, retry_count,
+# audit_check_location_change). This pre-flight runs the API's OWN check-schema-parity.sh (RUNNER_PARITY=1) —
+# the SAME enumerator, reused, never a second definition of "schema object" — against THIS PR's schema and the
+# api fixture at main. If the PR adds/changes an object the fixture lacks, it reds and NAMES the object.
+#
+# ★ ADVISORY, NOT A HARD STOP: this is a standalone workflow, deliberately NOT in the required ci-gate. It
+# turns red and tells you exactly what to do; it does not forbid the merge (Craig hand-manages merge order by
+# choice). A gate that forbids a legitimate workflow gets disabled; one that tells you the next step gets used.
+
+on:
+  pull_request:
+    paths:
+      - 'db/migrations/**'
+      - 'db/schema.sql'
+
+concurrency:
+  group: schema-freeze-preflight-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  preflight:
+    name: Will this freeze synthwatch-api?
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: pg
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - name: Checkout runner PR (this repo)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # The api OWNS the parity script + the fixture (the source of truth for "what the API mirrors"). Both
+      # repos are public; default token reads it. Tracks api MAIN — the same ref the api's gate compares against.
+      - name: Checkout synthwatch-api at main (its parity script + fixture)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: craigoley/synthwatch-api
+          ref: main
+          path: api-repo
+          persist-credentials: false
+
+      - name: Install psql client
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client
+
+      - name: Pre-flight — reuse the api's parity enumerator against THIS PR's schema
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: '5433'
+          PGUSER: postgres
+          PGPASSWORD: pg
+          RUNNER_PARITY: '1'
+          # ★ point the api's own script at THIS PR's schema (not a checked-out runner-repo) + the api fixture.
+          RUNNER_SCHEMA: ${{ github.workspace }}/db/schema.sql
+          RUNNER_MIGRATIONS: ${{ github.workspace }}/db/migrations
+          FIXTURE: ${{ github.workspace }}/api-repo/tests/SynthWatch.Api.Tests/fixtures/schema.sql
+        run: |
+          set -o pipefail
+          set +e
+          bash api-repo/scripts/check-schema-parity.sh 2>&1 | tee preflight.out
+          code=${PIPESTATUS[0]}
+          set -e
+          if [ "$code" -eq 0 ]; then
+            echo "✅ No freeze risk — the synthwatch-api fixture at main already covers this schema change."
+            exit 0
+          fi
+          # The parity script prints the missing objects as `col|`, `con|`, `fn|` rows — surface them by name.
+          missing="$(grep -E '^(col|con|fn)\|' preflight.out || true)"
+          {
+            echo "## ⚠️ This schema change will FREEZE synthwatch-api's schema-parity gate on merge"
+            echo ""
+            echo "The api's parity gate reads runner \`main\` live. These objects exist in this PR's schema but"
+            echo "are missing from the api fixture at main, so the gate will red on the NEXT unrelated api PR:"
+            echo ""
+            echo '```'
+            echo "${missing:-<see log above>}"
+            echo '```'
+            echo ""
+            echo "### Do this (do NOT just merge):"
+            echo "1. Open the paired **synthwatch-api** fixture PR adding these objects to"
+            echo "   \`tests/SynthWatch.Api.Tests/fixtures/schema.sql\` (byte-match the runner definition)."
+            echo "2. Get it green + approved."
+            echo "3. Merge THIS runner PR."
+            echo "4. Merge the api fixture PR **immediately** so no unrelated api PR catches the break."
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "::error title=Will freeze synthwatch-api schema-parity::This PR adds schema objects the api fixture lacks — open the paired api fixture PR first (see the job summary)."
+          exit 1
