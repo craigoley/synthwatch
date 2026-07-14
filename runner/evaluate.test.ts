@@ -6,7 +6,7 @@
 // breach / successful capture) is unchanged — no false positives.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { perfBudgetVerdict, hasPerfBudget, perfBudgetBreach, budgetedMetricCaptureFailed, shouldConfirmByRerun, effectiveN, crossLocationDown } from './evaluate.js';
+import { perfBudgetVerdict, hasPerfBudget, perfBudgetBreach, budgetedMetricCaptureFailed, shouldConfirmByRerun, effectiveN, crossLocationDown, incidentSeverity } from './evaluate.js';
 import { EMPTY_METRICS, type RunMetrics } from './metrics.js';
 import type { Check } from './db.js';
 
@@ -164,11 +164,39 @@ test('effectiveN: explicit minFailLocations → min(minFail, reporting) — a CL
   assert.equal(effectiveN(3, 1), 1, '★ explicit 1 overrides the majority (would be 2) — kills the null-branch flip');
 });
 
-test('★ crossLocationDown: one failing region of three is NOT down under majority quorum (the #4 gap, now pinned)', () => {
-  // failing>=1 is TRUE but failing>=effectiveN(3,null)=2 is FALSE → && ⇒ false. `&& → ||` would page here.
-  assert.equal(crossLocationDown(1, 3, null), false, '★ one of three failing → NOT paged (majority) — kills && → ||');
-  assert.equal(crossLocationDown(2, 3, null), true, 'two of three failing → down');
+test('crossLocationDown: one failing region of three does NOT meet the majority (CRITICAL) quorum', () => {
+  // ★ DECISION UPDATED (0085): crossLocationDown is the CRITICAL/majority gate and its RETURN is unchanged
+  // (1 of 3 is not a majority → false). But it no longer means "not paged" — a single sustained region now
+  // pages at WARNING via incidentSeverity (see the incidentSeverity tests below + the westus2 integration
+  // replay). This still kills the && → || mutant on the quorum.
+  assert.equal(crossLocationDown(1, 3, null), false, 'one of three → below majority (no CRITICAL) — kills && → ||');
+  assert.equal(crossLocationDown(2, 3, null), true, 'two of three (majority) → CRITICAL-down');
   assert.equal(crossLocationDown(3, 3, null), true, 'all three failing → down');
+});
+
+// ── ★ incidentSeverity (0085): the single-region WARNING ruling. A sustained single/minority region down
+//    pages at WARNING; a majority pages at the check's severity (CRITICAL); nothing sustainedly down → no
+//    incident. Reuses the SAME majority quorum (effectiveN) — it does not change it. ──────────────────────
+test('★ incidentSeverity: a single sustained region of three → WARNING (the westus2 fix — not silence)', () => {
+  assert.equal(incidentSeverity(1, 3, null, 'critical'), 'warning', '★ one of three sustainedly down → WARNING');
+  assert.equal(incidentSeverity(2, 3, null, 'critical'), 'critical', 'two of three (majority) → CRITICAL — unchanged');
+  assert.equal(incidentSeverity(3, 3, null, 'critical'), 'critical', 'all three → CRITICAL');
+});
+test('incidentSeverity: nothing sustainedly down → null (no incident)', () => {
+  assert.equal(incidentSeverity(0, 3, null, 'critical'), null);
+  assert.equal(incidentSeverity(0, 0, null, 'critical'), null, 'a fully silent check opens nothing');
+});
+test('incidentSeverity: a single-location check (total=1) pages at its configured severity directly (unchanged)', () => {
+  assert.equal(incidentSeverity(1, 1, null, 'critical'), 'critical', 'total=1 → effectiveN=1 → 1 failing is a majority → critical');
+  assert.equal(incidentSeverity(1, 1, null, 'warning'), 'warning');
+});
+test('incidentSeverity: a WARNING-configured check never yields critical (a majority is still just warning)', () => {
+  assert.equal(incidentSeverity(1, 3, null, 'warning'), 'warning');
+  assert.equal(incidentSeverity(3, 3, null, 'warning'), 'warning', 'majority of a warning check stays warning — no escalation to critical');
+});
+test('incidentSeverity: explicit minFailLocations overrides the quorum (min(minFail, total))', () => {
+  assert.equal(incidentSeverity(1, 3, 1, 'critical'), 'critical', 'minFail=1 → one failing region IS a majority → CRITICAL directly');
+  assert.equal(incidentSeverity(1, 3, 3, 'critical'), 'warning', 'minFail=3 → one of three is below quorum → WARNING');
 });
 
 test('crossLocationDown: the `failing >= 1` floor keeps a 0-failing check UP even with minFailLocations=0', () => {

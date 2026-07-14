@@ -24,6 +24,7 @@ const TRANSIENT_BASELINE_RUNS = 4;
 
 interface OpenIncident {
   id: number;
+  severity: 'critical' | 'warning';
 }
 
 /**
@@ -215,9 +216,18 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
   // is recorded + visible but does NOT page). With one location this is exactly
   // the old consecutive-failure behaviour.
   const verdict = await aggregateVerdict(check);
+  // ★ 0085 (single-region WARNING). Incident severity from the cross-location scope:
+  //   null = no region sustainedly down (recover/up) · 'warning' = a single/minority region sustainedly down
+  //   · check.severity (CRITICAL) = majority quorum met (unchanged). See incidentSeverity.
+  const desired = incidentSeverity(
+    verdict.failing,
+    verdict.total,
+    check.min_fail_locations,
+    check.severity as 'critical' | 'warning',
+  );
 
-  // UP across locations (fewer than N locations failing) -> clear any incident.
-  if (!verdict.down) {
+  // No region sustainedly down -> clear any open incident (recovery) + handle this run's pass/warn/sub-threshold.
+  if (desired === null) {
     if (open) {
       // Resolve the incident row regardless (the check IS up now). But gate the
       // recovery ALERT on the maintenance window, symmetric with the open path: a
@@ -290,33 +300,13 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
     return;
   }
 
-  // DOWN across locations (>= N locations failing). The single-location count
-  // (for the unchanged wording) is the current location's consecutive downs.
+  // ===== DOWN: >= 1 region is sustainedly down. `desired` is 'warning' (a single/minority region) or the
+  // check's severity (CRITICAL, majority quorum met). The single-location count (for the wording) is this
+  // location's consecutive downs. =====
   const consecutive =
     verdict.total > 1
       ? verdict.failing
       : await countConsecutiveDown(check.id, check.failure_threshold, run.location);
-
-  if (open) {
-    // Already paged; keep the count fresh.
-    await pool.query(
-      `UPDATE incidents SET consecutive_failures = $2 WHERE id = $1`,
-      [open.id, consecutive],
-    );
-    return;
-  }
-
-  // About to OPEN (and page). Suppress inside an active maintenance window —
-  // planned downtime should not page. The run + status are already recorded;
-  // suppression skips only the incident open + alert, never the data.
-  if (await inMaintenanceWindow(check.id)) {
-    console.log(
-      `[runner] check ${check.id} "${check.name}" down (${run.status}) but ` +
-        `incident suppressed — active maintenance window`,
-    );
-    return;
-  }
-
   const where =
     verdict.total > 1
       ? `from ${verdict.failing} of ${verdict.total} locations`
@@ -325,39 +315,102 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
     `Check "${check.name}" down (${run.status}) ${where}` +
     (run.failed_step ? ` (died at step: ${run.failed_step})` : '') + '.';
 
-  // ON CONFLICT: with per-location cadence, two regions can evaluate the same check
-  // concurrently, both see no open incident, and both reach this INSERT. The partial
-  // unique index one_open_incident_per_check would make the loser THROW (-> the run's
-  // catch -> process.exit(1)) — so swallow the race: the loser gets zero rows and
-  // silently no-ops (the winner opens the incident + pages exactly once).
-  const { rows: incidentRows } = await pool.query<{ id: number }>(
-    `INSERT INTO incidents (check_id, status, severity, opened_run_id,
-                            consecutive_failures, summary)
+  // (1) An incident is already OPEN. Keep the count fresh and — ★ ESCALATE warning → critical if the outage
+  // has now spread to a majority (the per-tick path: getOpenIncident saw the open warning). Escalate-only-UP:
+  // a shrinking outage never downgrades a live incident (it resolves via the recovery path). Page on the flip.
+  if (open) {
+    const escalating = open.severity === 'warning' && desired === 'critical';
+    const { rows: escRows } = await pool.query<{ severity: 'critical' | 'warning' }>(
+      `UPDATE incidents
+          SET consecutive_failures = $2,
+              severity = CASE WHEN $3 THEN 'critical' ELSE severity END,
+              summary  = CASE WHEN $3 THEN $4 ELSE summary END
+        WHERE id = $1 AND status = 'open'
+        RETURNING severity`,
+      [open.id, consecutive, escalating, summary],
+    );
+    if (escalating && escRows[0]?.severity === 'critical') {
+      if (await inMaintenanceWindow(check.id)) {
+        console.log(
+          `[runner] check ${check.id} "${check.name}" escalated warning→critical — page suppressed (maintenance window)`,
+        );
+      } else {
+        const escDispatch = await dispatchAlerts(
+          {
+            checkId: check.id,
+            checkName: check.name,
+            severity: 'critical',
+            status: 'open',
+            summary: `[ESCALATED → CRITICAL] ${summary}`,
+            runId: run.id,
+            failedStep: run.failed_step,
+            screenshotUrl: run.screenshot_url,
+            incident: {
+              incidentId: open.id,
+              targetUrl: check.target_url,
+              openedAt: new Date().toISOString(),
+              locations: await failingLocationNames(check),
+              consecutiveFailures: consecutive,
+              rca: null,
+            },
+          },
+          await resolveChannels(check.id, 'critical'),
+        );
+        await recordIncidentDispatch(open.id, check.id, 'open', escDispatch);
+      }
+    }
+    return;
+  }
+
+  // (2) No open incident → OPEN at `desired`. Suppress the open + page inside a maintenance window (the run +
+  // status are already recorded; suppression skips only the incident open + alert, never the data).
+  if (await inMaintenanceWindow(check.id)) {
+    console.log(
+      `[runner] check ${check.id} "${check.name}" down (${run.status}) but ` +
+        `incident suppressed — active maintenance window`,
+    );
+    return;
+  }
+
+  // ON CONFLICT: with per-location cadence two regions can evaluate concurrently, both see no open incident,
+  // and both reach this INSERT (the partial unique index one_open_incident_per_check would otherwise make the
+  // loser THROW → the run's catch → process.exit(1)). ★ DO UPDATE, not DO NOTHING: if the row already exists as
+  // a WARNING and THIS tick computed CRITICAL (the outage spread within the race), ESCALATE it — a regional
+  // outage that spreads must never be silently dropped. The WHERE fires ONLY on that escalation; a
+  // same-or-higher-severity conflict updates nothing (no row returned) and no-ops. inserted (xmax=0)
+  // distinguishes a fresh open (page `desired`) from a race-escalation (page CRITICAL).
+  const { rows: incidentRows } = await pool.query<{ id: number; inserted: boolean }>(
+    `INSERT INTO incidents (check_id, status, severity, opened_run_id, consecutive_failures, summary)
      VALUES ($1, 'open', $2, $3, $4, $5)
-     ON CONFLICT (check_id) WHERE status = 'open' DO NOTHING
-     RETURNING id`,
-    [check.id, check.severity, run.id, consecutive, summary],
+     ON CONFLICT (check_id) WHERE status = 'open'
+     DO UPDATE SET severity = 'critical', summary = EXCLUDED.summary,
+                   consecutive_failures = EXCLUDED.consecutive_failures
+           WHERE incidents.severity = 'warning' AND EXCLUDED.severity = 'critical'
+     RETURNING id, (xmax = 0) AS inserted`,
+    [check.id, desired, run.id, consecutive, summary],
   );
   if (!incidentRows[0]) {
-    // Another location won the open race — it pages; we don't double-page.
+    // Conflict with no escalation — another location already opened it at >= this severity this tick. It pages.
     console.log(
-      `[runner] check ${check.id} "${check.name}" down — incident already opened by another location this tick`,
+      `[runner] check ${check.id} "${check.name}" down — incident already open (>= this severity) this tick`,
     );
     return;
   }
   const incidentId = incidentRows[0].id;
+  const inserted = incidentRows[0].inserted;
+  // inserted → a NEW incident at `desired`; else → we escalated an existing WARNING to CRITICAL in the race.
+  const pageSeverity: 'critical' | 'warning' = inserted ? desired : 'critical';
+  const pageSummary = inserted ? summary : `[ESCALATED → CRITICAL] ${summary}`;
 
-  // Rich-email context. RCA is null here — it runs AFTER this dispatch (below) so a slow
-  // model can't delay paging, so the OPEN email never carries RCA. (The RESOLVED email
-  // does — by then it's computed. To put RCA in the open email, move runRca above this
-  // dispatch at the cost of ~10-30s paging delay — a product call.)
+  // Rich-email context. RCA is null here — it runs AFTER this dispatch (below) so a slow model can't delay
+  // paging, so the OPEN email never carries RCA. (The RESOLVED email does.)
   const openDispatch = await dispatchAlerts(
     {
       checkId: check.id,
       checkName: check.name,
-      severity: check.severity,
+      severity: pageSeverity,
       status: 'open',
-      summary,
+      summary: pageSummary,
       runId: run.id,
       failedStep: run.failed_step,
       screenshotUrl: run.screenshot_url,
@@ -370,15 +423,15 @@ export async function evaluate(check: Check, run: RunRecord): Promise<void> {
         rca: null,
       },
     },
-    await resolveChannels(check.id, check.severity),
+    await resolveChannels(check.id, pageSeverity),
   );
   await recordIncidentDispatch(incidentId, check.id, 'open', openDispatch);
 
-  // AI root-cause analysis (opt-in, non-fatal) — fires ONLY here, on incident-open
-  // (not every failed run), so a flapping check isn't RCA-spammed. Runs AFTER the
-  // alert so a slow model never delays paging; writes structured JSON into the
+  // AI root-cause analysis (opt-in, non-fatal) — fires ONLY on a NEW incident-open (inserted; not a
+  // race-escalation of an existing one, which already ran RCA when it opened), so a flapping check isn't
+  // RCA-spammed. Runs AFTER the alert so a slow model never delays paging; writes structured JSON into the
   // incident. Any failure is swallowed: the incident keeps its record without rca.
-  if (rcaEnabled()) {
+  if (inserted && rcaEnabled()) {
     try {
       const rca = await runRca(check, run, { failing: verdict.failing, total: verdict.total });
       if (rca) {
@@ -468,6 +521,30 @@ export function crossLocationDown(
   minFailLocations: number | null,
 ): boolean {
   return failing >= 1 && failing >= effectiveN(reporting, minFailLocations);
+}
+
+/**
+ * ★ Incident severity from the cross-location scope (0085 — the single-region WARNING ruling). Reuses the
+ * SAME majority quorum as crossLocationDown (effectiveN); it does NOT change that quorum:
+ *   • failing === 0            → null  (no incident — no region is sustainedly down)
+ *   • 0 < failing < effectiveN → 'warning'  (a SINGLE / minority region sustainedly down: a real outage of one
+ *                                vantage — already debounced by the per-location failure_threshold baked into
+ *                                `failing` — but NOT a majority, so not CRITICAL)
+ *   • failing >= effectiveN    → the check's configured severity (CRITICAL) — the majority path, UNCHANGED.
+ * Why WARNING and not silence: the old "minority ⇒ no incident" gave a sustained single-region outage (check
+ * 342: 16 consecutive westus2 failures, 219 failed runs over 3 days) ZERO acknowledgeable signal, so the
+ * operator DELETED westus2 from the check to make it stop — manufacturing a green light by removing the
+ * observation, inside the platform built to refuse exactly that. A WARNING is acknowledgeable; silence is not.
+ */
+export function incidentSeverity(
+  failing: number,
+  total: number,
+  minFailLocations: number | null,
+  checkSeverity: 'critical' | 'warning',
+): 'critical' | 'warning' | null {
+  if (failing < 1) return null;
+  if (failing >= effectiveN(total, minFailLocations)) return checkSeverity; // majority → configured (CRITICAL)
+  return 'warning'; // a single / minority region sustainedly down → WARNING (never CRITICAL)
 }
 
 /**
@@ -675,7 +752,7 @@ async function inMaintenanceWindow(checkId: number): Promise<boolean> {
 
 async function getOpenIncident(checkId: number): Promise<OpenIncident | null> {
   const { rows } = await pool.query<OpenIncident>(
-    `SELECT id FROM incidents WHERE check_id = $1 AND status = 'open' LIMIT 1`,
+    `SELECT id, severity FROM incidents WHERE check_id = $1 AND status = 'open' LIMIT 1`,
     [checkId],
   );
   return rows[0] ?? null;
