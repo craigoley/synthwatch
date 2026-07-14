@@ -18,6 +18,7 @@ import { createRequire } from 'node:module';
 // memory-bound test below can spy on the whole-file read and prove the streaming extractor never performs it.
 const fsCjs = createRequire(import.meta.url)('node:fs') as typeof import('node:fs');
 import { extractNetwork, extractConsole, extractTraceSignals } from './traceSignals.js';
+import { canonicalizeConsole } from './transientClass.js';
 import { makeRedactor, IDENTITY_REDACTOR } from './redact.js';
 
 const TARGET = 'www.wegmans.com';
@@ -407,6 +408,23 @@ test('★ golden parity: extractTraceSignals(golden input) === expected.json (th
     assert.deepEqual(actual, expected);
   } finally {
     rmSync(tdir, { recursive: true, force: true });
+  }
+});
+
+// ── ★ CONSOLE-TEXT CANONICALIZER golden (the SECOND cross-repo parity contract, #299) ────────────────────────
+// canonicalizeConsole (runner) and TraceSignalsDiff.Canonicalize (api) are a hand-ported pair that MUST produce
+// byte-identical output, or the flake budget (runner) and the error diff (api) disagree about what counts as
+// "the same error" — the class of bug that made the classifier lie. Same shared golden as above: this asserts
+// the runner impl; TraceSignalsGoldenParity (api) asserts the C# impl against the SAME canonicalize.json.
+// Prove the gate can fail: change one regex in either impl → the corresponding side reds on a case below.
+test('★ golden parity: canonicalizeConsole(input) === canonicalize.json expected (cross-repo contract with C# Canonicalize)', () => {
+  const dir = goldenDir();
+  const golden = JSON.parse(readFileSync(join(dir, 'canonicalize.json'), 'utf8')) as {
+    cases: { name: string; input: string; expected: string }[];
+  };
+  assert.ok(golden.cases.length >= 6, 'the canonicalizer golden must cover the cases that matter (>= 6)');
+  for (const c of golden.cases) {
+    assert.equal(canonicalizeConsole(c.input), c.expected, `canonicalize case "${c.name}"`);
   }
 });
 
