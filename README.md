@@ -5,222 +5,58 @@
 
 > ### 🛠️ New here? **[DEVELOPMENT.md](DEVELOPMENT.md)** first.
 > A one-command devcontainer builds **and tests both repos** (runner + `synthwatch-api`) against a real
-> Postgres 16 — so nothing is push-and-pray and the schema gates are provable locally. From a clean clone:
-> `docker compose -f .devcontainer/docker-compose.yml up -d && … exec app bash .devcontainer/verify.sh`.
+> Postgres 16 — so nothing is push-and-pray and the schema gates are provable locally.
 
 A self-hosted synthetic monitoring system. SynthWatch runs **HTTP** and
 **real-browser (Playwright)** checks on a timer, records every run (and every
 *step* of a browser flow), and opens/resolves debounced incidents with pluggable
-alerting.
+alerting. The **data plane** (this repo's `runner/`) executes checks on **Azure
+Container Apps Jobs**; the **dashboard** is a separate Next.js app on **Vercel**.
 
-The **data plane** (this repo's `runner/`) executes checks on **Azure Container
-Apps Jobs**; the **dashboard** is a separate Next.js app on **Vercel**. See
-[Decision 8](#decision-8--two-repo-split-runner-here-dashboard-on-vercel) for why
-the split exists.
+> ## ★★ Adding a migration? Read this FIRST — it is the day-one landmine
+> Three unchecked couplings a newcomer trips, none of which a test will catch for you:
+>
+> 1. **Migrations apply BEFORE the new image rolls** (CD runs the migrate job, then rolls the runner —
+>    `.github/workflows/deploy.yml`). So the **old image — and any ROLLBACK — meets the NEWER schema.**
+>    Migrations are **forward-only**; *nothing checks backward-compatibility.* Make every migration
+>    compatible with the **currently-deployed** code, not just the new code.
+> 2. **It must be idempotent, in its own transaction** — `IF NOT EXISTS` / `CREATE OR REPLACE`, wrapped in
+>    its own `BEGIN/COMMIT`. (A `CONCURRENTLY` index migration carries **no** transaction — different rule;
+>    see `db/migrations/README.md`.)
+> 3. **Hand-fold its end state into `db/schema.sql`, or Gate A reds.** `schema.sql` is the load-bearing base
+>    a restore replays; a migration not mirrored there drifts it (that is exactly how the old `docs/SCHEMA.md`
+>    rotted 52 migrations). The authoring contract lives in **`db/migrations/README.md`** — the good pattern.
 
 > **Contributing & security:** see [CONTRIBUTING.md](CONTRIBUTING.md) (including
 > the mandatory *“Writing a flow safely”* section), [SECURITY.md](SECURITY.md),
 > and the [Code of Conduct](CODE_OF_CONDUCT.md). Report vulnerabilities
 > **privately** — never via a public issue.
 
-This repository currently contains the **data-plane runner**, the **database
-schema**, the **container image**, and its **infrastructure-as-code**
-(`infra/main.bicep`). The **dashboard** is a separate Next.js app in its own repo.
-This document is an **architecture decision record**: it explains *why* the runner
-is shaped the way it is.
+This repository contains the **data-plane runner**, the **database schema**, the
+**container image**, and its **infrastructure-as-code** (`infra/main.bicep`). The
+**dashboard** is a separate Next.js app in its own repo. The *why* behind the
+runner's shape — ACA Jobs, cadence-in-DB, the two-repo split, and six other calls
+— is the architecture decision record in **[docs/DECISIONS.md](docs/DECISIONS.md)**.
 
-> _Verified 2026-07-14 — this README is prose with **no automated check**. Where it names a status, path, or behaviour, `db/schema.sql` and the code are authoritative; distrust anything here they contradict._
-
----
-
-## What's in this PR
-
-```
-db/
-  schema.sql              Postgres 16 schema (checks, runs, run_steps, incidents)
-  seed.sql                One HTTP check + one browser check
-runner/
-  index.ts                due-filter -> claim -> execute -> evaluate
-  db.ts                   Postgres pool + row types
-  httpCheck.ts            Cheap HTTP tier (plain fetch, no browser)
-  stepRecorder.ts         Mandatory funnel instrumentation
-  evaluate.ts             Debounced incident open/resolve
-  alerts.ts               Email (ACS) / generic webhook — env-driven
-  artifacts.ts            Failure screenshot -> Azure Blob (no-op if unconfigured)
-  checks/
-    index.ts              Dynamic flow loader (validates flow name)
-    homepage-load.ts      Real flow — asserts a rich page actually rendered
-    wegmans-homepage.ts   Real flow (verified selectors)
-    wegmans-search.ts     Real flow (verified selectors)
-  Dockerfile              Built on the official Playwright image
-  package.json            Pinned dependencies
-  tsconfig.json           NodeNext / ES2022, strict
-  .env.example            Every env var, documented
-```
-
----
-
-## Decision 1 — Azure Container Apps Jobs, not Vercel (or any serverless function)
-
-A browser check needs a **real Chromium** — around 150–300 MB of binary plus all
-its OS dependencies (fonts, `libnss`, `libatk`, …). Vercel (and comparable
-function platforms) cap a deployment bundle at roughly **50 MB**. Chromium does
-not fit, full stop. You cannot ship a real browser into that box.
-
-ACA **Jobs** give us:
-
-- A container we fully control, so we use
-  `mcr.microsoft.com/playwright:v1.61.0-noble` as the base — Chromium and every
-  OS dependency are already baked in and known-good.
-- A **scheduled** execution model (cron) that matches "run checks on a timer".
-- **Parallel replicas** for throughput, which we lean on (and guard against — see
-  Decision 3).
-
-The HTTP tier could run almost anywhere; the browser tier is what forces a real
-container. Running both in one runner keeps the system simple.
-
-> Runtime note: ACA (and local `docker run`) should pass **`--ipc=host`**.
-> Chromium uses a lot of shared memory; the default 64 MB `/dev/shm` triggers
-> renderer crashes under load.
-
-## Decision 2 — Cadence lives in the database, not in cron
-
-Each check carries its own `interval_seconds` and `last_run_at` **columns**. The
-Job is scheduled on the **finest tier only** (`*/5` UTC). On each tick the runner
-self-filters to checks that are actually due:
-
-```
-now() - last_run_at >= interval_seconds
-```
-
-Why not encode cadence in cron? Because you'd need one cron entry — and one
-deployment concern — per distinct interval (5 m, 30 m, 1 h, …), and changing a
-single check's cadence would mean editing infrastructure. With cadence in data,
-adding a check or retuning its interval is a single `UPDATE`; the schedule never
-changes. The cron tier just needs to be **at least as fine** as the smallest
-interval you want to support.
-
-## Decision 3 — Claim each check with a conditional UPDATE (parallel-safe)
-
-ACA runs Job replicas **in parallel by default**. If two replicas both saw the
-same due check, it would run twice per tick. We prevent that without locks or a
-queue: each replica *claims* a check with a conditional `UPDATE` that advances
-`last_run_at` **only if the check is still due**, and `RETURNING` the row:
-
-```sql
-UPDATE checks
-   SET last_run_at = now()
- WHERE id = $1
-   AND enabled
-   AND (last_run_at IS NULL
-        OR now() - last_run_at >= make_interval(secs => interval_seconds))
-RETURNING *;
-```
-
-The single-statement `UPDATE` is atomic, so exactly one replica's claim returns a
-row — that replica owns the check. Every other replica's `UPDATE` matches zero
-rows (the row is no longer due) and it moves on. No double execution, no extra
-infrastructure.
-
-## Decision 4 — Funnel telemetry is structural, not optional
-
-Every browser flow runs through a **`StepRecorder`**. Each logical action is
-wrapped in `rec.step('<name>', async (page) => { … })`, which:
-
-1. times the step,
-2. writes a `run_steps` row (pass **or** fail) before returning, and
-3. on failure, records the row, remembers the step name, and **rethrows** so the
-   flow stops exactly where it broke.
-
-The result: a failed run shows **which step it died at**, with timings for every
-step before it — without re-running anything.
-
-This is enforced by *design*, not by convention. The `StepRecorder` holds the
-Playwright `Page` **privately** and only hands it to the callback *inside*
-`step()`. A flow receives the recorder and nothing else, so there is no way to
-drive the browser without being timed and recorded. You cannot write a flow that
-skips instrumentation.
-
-## Decision 5 — Pin the Playwright npm package to the base image version
-
-The Dockerfile's base image is `mcr.microsoft.com/playwright:v1.61.0-noble` and
-the `playwright` npm dependency is pinned to the **same** `1.61.0`. Playwright
-resolves browser binaries by a version-specific path; if the library and the
-image drift, the npm package looks for a Chromium build that isn't in the image
-and launches fail. **Bump both together, never one alone.**
-
-## Decision 6 — Alerting is 100% env-config driven (this repo is public OSS)
-
-Two vendor-neutral channels ship in `alerts.ts`:
-
-| Channel | Env vars | Disabled when… |
-| --- | --- | --- |
-| Email (Azure Communication Services) | `ACS_EMAIL_CONNECTION_STRING`, `ALERT_EMAIL_FROM`, `ALERT_EMAIL_TO` | any unset |
-| Generic webhook (PagerDuty / Slack / any HTTP endpoint) | `ALERT_WEBHOOK_URL` (+ optional `ALERT_WEBHOOK_AUTH_HEADER`) | unset |
-
-Vendor-specific channels are intentionally kept out of this open-source engine.
-Wire one either (1) via the generic webhook — point `ALERT_WEBHOOK_URL` at the
-vendor's inbound endpoint — or (2) in a fork, by implementing the `AlertChannel`
-interface in `runner/alerts.ts` and adding it to `CHANNELS`.
-
-An absent env var means that channel is **disabled** — no errors, it simply
-doesn't fire. There is **nothing tenant-specific in source**: no addresses, URLs,
-or secrets. Channels dispatch concurrently and failures are isolated, so one dead
-webhook never blocks the others. Failure **screenshots** follow the same rule
-(`artifacts.ts`): if `AZURE_STORAGE_CONNECTION_STRING` is unset, the upload
-silently no-ops.
-
-## Decision 7 — Debounce incidents to suppress flapping
-
-`evaluate.ts` opens an incident only after **`failure_threshold` consecutive
-failures** (default 3) and resolves it on the **first** subsequent pass. A single
-transient blip never pages anyone. A partial unique index
-(`one_open_incident_per_check WHERE status = 'open'`) keeps incident state
-coherent in the database; because each check is claimed by exactly one replica
-per tick, that index is a backstop rather than the primary guard.
-
-## Decision 8 — Two-repo split: runner here, dashboard on Vercel
-
-The runner needs a **full container with Chromium** and runs on ACA Jobs
-(Decision 1). The dashboard is a Next.js app that deploys best on Vercel. These
-have different runtimes, deploy cadences, and scaling models, so they live in
-**separate repositories** rather than a monorepo:
-
-- The runner can be rebuilt/redeployed (and its Playwright/base-image pair bumped
-  together — Decision 5) without touching the dashboard, and vice versa.
-- Each repo gets a focused CI/security surface (this repo's scanners target a
-  Node/TS **backend**, not a React/Next frontend).
-- The shared contract between them is the **database schema** (`db/schema.sql`),
-  not shared application code.
-
-## Decision 9 — Generated DB types are committed, not built on demand
-
-Types that mirror the schema are **generated at commit time and checked in**,
-rather than regenerated during every build or at runtime. Committing them means
-`tsc` type-checks against a concrete, reviewed artifact; schema changes show up as
-a **visible diff** in the PR (easy to review and to catch drift); and neither CI
-nor the dashboard needs a live database connection just to type-check. The
-trade-off — remembering to regenerate after a schema change — is enforced by
-review and the schema/migration convergence check.
+> _Verified 2026-07-14 — this README is prose with **no automated check**. Where it names a status, path, default, or behaviour, `db/schema.sql`, `scripts/deploy.sh`, `infra/main.bicep`, and the code are authoritative; distrust anything here they contradict._
 
 ---
 
 ## Data model
 
-- **checks** — the catalogue (target, kind, cadence, thresholds, severity).
-- **runs** — one row per execution. Inserted as `running` *before* execution (a
-  crashed/OOM-killed runner's stale `running` is reaped to `error`), then updated on
-  finish to a terminal status — one of `pass | warn | fail | error | infra_error`
-  (source: `db/schema.sql`; not just pass/fail). Indexed by `(check_id, started_at DESC)`.
-- **run_steps** — one row per `StepRecorder.step()` (browser flows).
-- **incidents** — open/resolved lifecycle with severity, linked to the runs that
-  opened and resolved them.
-
-Primary keys use `BIGINT GENERATED ALWAYS AS IDENTITY`.
+**Not documented here — `db/schema.sql` is canonical AND schema-parity-gated** (a hand-copy is precisely
+how the old `docs/SCHEMA.md` drifted 52 migrations). In outline: `checks` (the catalogue), `runs` (one row
+per execution, inserted `running` before it starts), `run_steps` (one per `StepRecorder.step()`), `incidents`
+(open/resolved, linked to the runs that opened + resolved them). For the **run-status enum**
+(`pass | warn | fail | error | infra_error | running`) see **[docs/STATUS-TAXONOMY.md](docs/STATUS-TAXONOMY.md)**
+— tripwire-enforced against the code. Read `db/schema.sql` for the truth; do not trust a summary.
 
 ---
 
 ## Local development
+
+See **[DEVELOPMENT.md](DEVELOPMENT.md)** for the one-command devcontainer (builds + tests both repos against
+a real Postgres). A bare local runner tick:
 
 ```bash
 # 1. Apply the schema and seed (Postgres 16)
@@ -229,164 +65,90 @@ psql "$DATABASE_URL" -f db/seed.sql
 
 # 2. Runner
 cd runner
-cp .env.example .env          # fill in DATABASE_URL (+ optional alert channels)
+cp .env.example .env          # fill in DATABASE_URL (+ optional alert channels — see .env.example)
 npm install
 npm run typecheck             # tsc --noEmit, must be clean
 npm run build                 # -> dist/
 node dist/index.js            # one tick: due-filter -> claim -> execute -> evaluate
 ```
 
-To exercise the browser tier locally, run the container so Chromium and its OS
-deps are present:
+To exercise the browser tier locally, run the container so Chromium and its OS deps are present:
 
 ```bash
 docker build -t synthwatch-runner ./runner
 docker run --rm --ipc=host -e DATABASE_URL="$DATABASE_URL" synthwatch-runner
 ```
 
+> _Verified 2026-07-14 — prose, no automated check; if the code disagrees, the code wins._
+
 ## Deploy (Azure — runner only)
 
-`infra/main.bicep` provisions the **runner's** Azure footprint into the
-**existing** resource group `synthwatch-rg` (eastus), referencing the
-**existing** registry `synthwatcholey0620.azurecr.io`. It does **not** create the
-resource group or the registry, and it does **not** provision the dashboard
-(that's a separate Vercel app). The ACA Job pulls its image via a user-assigned
-managed identity granted **AcrPull** — no registry password is stored.
+> ### ★ NEVER hand-run `az` to deploy. Use **`scripts/deploy.sh`**.
+> `deploy.sh` is the guardrail against two live hazards a raw `az deployment` walks straight into:
+> - **The `:0.1.0` silent REVERT.** `infra/main.bicep`'s `runnerImage`/`migrateImage` params default to
+>   `…:0.1.0` (`infra/main.bicep:51,54`) — *bootstrap* tags. A hand-run `az deployment group create` without
+>   the current image reverts the live ACA jobs to the **ancient 0.1.0** image. `deploy.sh` always passes the
+>   real image.
+> - **The DB-ahead-of-code half-state.** `deploy.sh` deploys a fully-built runner **+** migrate pair for one
+>   SHA, verifying that SHA exists in **both** ACR repos before applying (a one-sided deploy half-applies).
 
 ```bash
-# 0. Build and push the runner image to the existing ACR.
-az acr login --name synthwatcholey0620
-docker build -t synthwatcholey0620.azurecr.io/synthwatch-runner:0.1.0 ./runner
-docker push synthwatcholey0620.azurecr.io/synthwatch-runner:0.1.0
-
-# 1. Provision the runner footprint (PostgreSQL, Storage, Log Analytics, ACA
-#    environment + scheduled Jobs). The Bicep param defaults match the LIVE stack
-#    (-e2 naming, eastus2), so this is additive — it reuses existing resources
-#    rather than building a duplicate stack.
-az deployment group create \
-  --resource-group synthwatch-rg \
-  --name synthwatch-infra \
-  --template-file infra/main.bicep \
-  --parameters \
-      postgresAdminPassword='<strong-password>' \
-      acsEmailConnectionString='<acs-email-connection-string>' \
-      runnerImage='synthwatcholey0620.azurecr.io/synthwatch-runner:0.1.0'
-
-# 2. Grab the Postgres FQDN from the deployment outputs.
-FQDN=$(az deployment group show -g synthwatch-rg -n synthwatch-infra \
-        --query properties.outputs.postgresFqdn.value -o tsv)
-export DATABASE_URL="postgresql://synthadmin:<strong-password>@${FQDN}:5432/synthwatch?sslmode=require"
-
-# 3. Apply the schema and seed to the fresh database.
-#    schema.sql is the full, converged schema for a NEW database — it already
-#    includes the end state of every migration AND the schema_migrations tracker.
-#    Migrations are idempotent (IF NOT EXISTS / CREATE OR REPLACE), so running the
-#    migration runner afterwards is safe: each migration re-applies as a no-op and
-#    registers its version. (On merge this is automatic — see "Database migrations
-#    on merge" below.)
-psql "$DATABASE_URL" -f db/schema.sql
-psql "$DATABASE_URL" -f db/seed.sql
-
-# 4. Smoke-test: fire one Job execution now instead of waiting for the cron tick.
-az containerapp job start -g synthwatch-rg -n synthwatch-runner-job
+scripts/deploy.sh                 # pick the newest fully-built SHA, what-if, deploy, verify
+scripts/deploy.sh --sha <sha>     # deploy a specific SHA pair (verified present in BOTH repos)
 ```
 
-> **Re-running against the live stack (additive).** The Bicep param defaults are
-> pinned to the live deployment's values (`-e2` names, `eastus2`), so re-running
-> the command above only re-asserts the existing resources — it does **not** build
-> a duplicate stack. Two caveats:
-> 1. CD rolls the runner/migrate jobs to `:<git-sha>` images, so re-running with the
->    default `runnerImage` (`:0.1.0`) would revert the runner image — pass the **current** image.
-> 2. **Secrets are REQUIRED params** (`@secure`, no default): `postgresAdminPassword`
->    **and** `acsEmailConnectionString` (the ACS email connection string). Both are owned
->    by the template (Postgres auth + the `ACS_EMAIL_CONNECTION_STRING` env on both runner
->    jobs), so passing them on every deploy keeps them intact — and the deploy can no longer
->    **wipe** ACS (the recurring email-alerting defect). Omit `acsEmailConnectionString` and
->    the secret deploys empty → email alerting goes dark.
->
-> ```bash
-> RUNNER_IMG=$(az containerapp job show -n synthwatch-runner-job -g synthwatch-rg \
->               --query "properties.template.containers[0].image" -o tsv)
-> az deployment group create -g synthwatch-rg --name synthwatch-infra \
->   --template-file infra/main.bicep \
->   --parameters postgresAdminPassword='<password>' \
->                acsEmailConnectionString='<acs-email-connection-string>' \
->                runnerImage="$RUNNER_IMG"
-> ```
->
-> A `what-if` on this then shows **0 to create, 0 to delete** (the only deltas are
-> cosmetic `reference()` re-evaluations that resolve to identical values). If you
-> ever see resources being *created*, the defaults have drifted from the live
-> stack again — stop and reconcile before applying.
+`infra/main.bicep` provisions the runner's Azure footprint into the **existing** `synthwatch-rg` /
+`synthwatcholey0620.azurecr.io` — additive (it reuses the live stack, doesn't build a duplicate), pulling
+its image via a managed identity with **AcrPull** (no registry password stored). Its `@secure` params
+(`postgresAdminPassword`, `acsEmailConnectionString`) have **no defaults**, and `deploy.sh` passes them on
+every deploy so a deploy can never **wipe** ACS email alerting (the recurring dark-email defect). First-time
+DB init for a *fresh* database: `psql "$DATABASE_URL" -f db/schema.sql && psql "$DATABASE_URL" -f db/seed.sql`
+from a host allowed through the Postgres firewall (Azure Cloud Shell, or your IP added under *Networking*).
 
-> To run `psql` from your workstation you must also allow your client IP on the
-> Postgres server (Portal → the server → *Networking*), or run these steps from
-> **Azure Cloud Shell**. The Bicep opens the firewall to *Azure services* (so the
-> Job can connect) but not to arbitrary public IPs.
+> _Verified 2026-07-14 — prose, no automated check; `scripts/deploy.sh` + `infra/main.bicep` are authoritative._
 
-> Alert channels (`ACS_EMAIL_*` / `ALERT_EMAIL_*`, `ALERT_WEBHOOK_*`) are added
-> as Job env vars per deployment; an absent channel is simply disabled. The Bicep
-> intentionally hardcodes none.
+## Rollback
+
+> ### ★★ DRAFT · UNREHEARSED · NEVER EXECUTED
+> Scaffolded from what the code *supports* — **not a verified procedure. No line here has been run.** Only
+> Craig can rehearse it against the live stack; until then treat it as fiction with a delay fuse.
+
+- **Roll the image (code path):** `scripts/deploy.sh --sha <old-sha>` points the runner **and** migrate jobs
+  back to a prior image pair. It verifies `<old-sha>` exists in **both** ACR repos before applying (line ~351:
+  *"even an explicit SHA must exist in BOTH repos, or the deploy half-applies"*).
+- **★ The DATABASE does NOT roll back.** Migrations are **forward-only** — there are **no down-migrations**,
+  and **nothing checks backward-compatibility.** Rolling the image back leaves the old code facing the
+  **newer** schema. That is safe **only if** every intervening migration was backward-compatible with the old
+  code. If one was breaking, an image rollback does **not** repair it — you are in the DB-ahead-of-code
+  half-state, deliberately.
+- **★ NEVER hand-run `az` to roll back** — the `:0.1.0` bicep default would revert to the ancient image
+  instead of your target (same trap as a hand-run deploy, above).
+- **Untested:** the SHA-pair roll has not been rehearsed against the live stack. Rehearse in a scratch
+  environment before you rely on it during an incident.
 
 ## Database migrations on merge (CD)
 
-DB migrations apply **automatically** as part of CD, **before** the new runner
-image rolls — so a runner that expects a new column never runs against a DB that
-lacks it. On merge to `main` (touching `runner/**`, `db/**`, a Dockerfile, or the
-workflow), `.github/workflows/deploy.yml` runs, in order:
+DB migrations apply **automatically** in CD, **before** the new runner image rolls — so a runner expecting a
+new column never meets a DB lacking it. The mechanism lives in the code, not here:
 
-1. **Build** the runner image (`az acr build`, context `runner/`).
-2. **Build** the migration image (`az acr build`, context `db/`, from
-   `db/Dockerfile.migrate` — a tiny `psql`-only image bundling `db/migrate.sh` +
-   `db/migrations/`).
-3. **Migrate** — point `synthwatch-migrate-job` at the new migration image, start
-   a one-off execution, and **poll until it succeeds**. If it fails (or times
-   out) the step exits non-zero and **the deploy stops here — the new runner
-   image is NOT rolled.**
-4. **Roll** the runner job to the new image.
+- **`.github/workflows/deploy.yml`** — builds the runner + migrate images, runs `synthwatch-migrate-job`,
+  **polls until it succeeds, and STOPS the deploy (image NOT rolled) if it fails**, then rolls the runner.
+- **`db/migrate.sh`** — the idempotent applier; tracks applied versions in `schema_migrations` and skips
+  already-applied ones. It runs *inside* Azure (the ACA migrate job) so the DB password never leaves Azure.
+- **`db/migrations/README.md`** — the migration-authoring contract (idempotency, own transaction, the
+  `schema.sql` fold, `CONCURRENTLY` caveats). The source of truth; deliberately **not copied here**.
 
-### How migrations are tracked & kept safe
+Manual fallback if CD is down (from a PG-firewall-allowed host):
+`MIGRATIONS_DIR=db/migrations ./db/migrate.sh` — idempotent, safe to re-run.
 
-- **Tracking:** `schema_migrations(version, applied_at)` records which
-  `db/migrations/*.sql` have run (`version` = filename without `.sql`). The runner
-  applies, in lexical order, only versions not already recorded.
-- **Idempotency is mandatory.** Every migration uses `IF NOT EXISTS` /
-  `CREATE OR REPLACE`. That makes the record-after-apply gap safe (a re-run is a
-  no-op) and lets an already-migrated DB **auto-baseline** under tracking with no
-  manual step.
-- **Convergence:** `db/schema.sql` contains the converged end state (incl. the
-  `schema_migrations` table). Fresh install = `schema.sql` then the runner, where
-  migrations no-op and self-register. No version list is duplicated.
-- **Adding a migration:** drop `db/migrations/000N_name.sql` (idempotent, with its
-  own `BEGIN/COMMIT`) **and** fold its end state into `db/schema.sql`. CD applies
-  it on the next merge.
-
-### Why migrations run *inside* Azure (DB-access path)
-
-The Postgres firewall allows **Azure-internal** traffic (`AllowAllAzureServices`)
-but **not** arbitrary GitHub-hosted runner IPs. Rather than open a firewall hole
-for CI, the migration runs as the ACA **`synthwatch-migrate-job`** — inside Azure,
-already permitted by that rule. It reuses the **same `database-url` ACA secret** as
-the runner job, so **the DB password never leaves Azure** (it is never a GitHub
-secret and never touches the workflow). CD only *triggers* the job via OIDC.
-
-### Manual fallback (if CD is down)
-
-Run the same runner yourself from a host allowed through the PG firewall (Azure
-Cloud Shell, or your workstation IP added under the server's *Networking*):
-
-```bash
-export DATABASE_URL="postgresql://synthadmin:<password>@<pg-fqdn>:5432/synthwatch?sslmode=require"
-MIGRATIONS_DIR=db/migrations ./db/migrate.sh
-```
-
-It is idempotent — safe to re-run; already-applied migrations are skipped.
+> _Verified 2026-07-14 — prose, no automated check; `deploy.yml` + `db/migrate.sh` + `db/migrations/README.md` are authoritative._
 
 ## Writing a browser flow
 
-Add `runner/checks/<name>.ts` exporting a `flow`, then point a check's
-`flow_name` at `<name>` (must match `/^[a-z0-9-]+$/`). Keep every action inside a
-`rec.step(...)`:
+See **[CONTRIBUTING.md](CONTRIBUTING.md)** (*"Writing a flow safely"*) and **[docs/AUTHORING.md](docs/AUTHORING.md)**,
+which leads with the single-file monitors-repo spec constraint (the #1 day-one violation). In short: add
+`runner/checks/<name>.ts` exporting a `flow` (name must match `/^[a-z0-9-]+$/`), keep every action inside a
+`rec.step(...)` so it is timed and recorded, and use **verified selectors** — inspect the live DOM, never guess.
 
 ```ts
 import type { Flow } from './index.js';
@@ -399,11 +161,7 @@ export const flow: Flow = async (rec) => {
 };
 ```
 
-`checks/homepage-load.ts` is a minimal **real** flow (assertions that hold for
-any real HTML page); `checks/wegmans-homepage.ts` and `checks/wegmans-search.ts`
-are fuller real flows with **verified selectors**. When writing your own flow,
-inspect the live DOM and use real selectors — never guess.
+---
 
-<!-- claude-review end-to-end validation: trivial docs touch, safe to merge. -->
-
-
+**Architecture decisions** (why ACA Jobs, cadence-in-DB, claim-by-conditional-`UPDATE`, the two-repo split,
+and five more): **[docs/DECISIONS.md](docs/DECISIONS.md)**.
