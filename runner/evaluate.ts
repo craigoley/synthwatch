@@ -16,8 +16,10 @@ import { confirmByRerunEligible, usesDedicatedExecution } from './retry.js';
 import { fireRunnerJobStart } from './jobTrigger.js';
 import { classifyTransient, type TraceSignalsLike } from './transientClass.js';
 
-/** Last-N settled runs used as the anti-flap baseline for transient classification (mirrors the API
- *  ErrorDiff.BaselineRuns=4 — a first-party failure present across recent runs is persistent, not "new"). */
+/** Last-N SUCCESSFUL (pass/warn) runs used as the anti-flap baseline for transient classification. N=4
+ *  matches the API ErrorDiff.BaselineRuns=4 COUNT, but the runner deliberately baselines against SUCCESSFUL
+ *  runs (not settled ones, as the API error-diff does) so a sustained failure never enters its own baseline —
+ *  the sustained-outage inversion fix. See classifyAndPersistTransient. */
 const TRANSIENT_BASELINE_RUNS = 4;
 
 interface OpenIncident {
