@@ -24,6 +24,16 @@
 
 BEGIN;
 
+-- ★ Replay-idempotency (added alongside 0083, EFFECT-PRESERVING). schema.sql now defines countable_run with an
+-- EXPLICIT 6-column list; this migration's SELECT * (21 cols) can therefore no longer CREATE OR REPLACE on top
+-- of it on a schema.sql-then-replay-all-migrations rebuild (Postgres errors "cannot change name of view
+-- column …"). DROP first so the rebuild converges. This changes NOTHING for any DB that already applied 0081
+-- (prod recorded it in schema_migrations and never re-runs it) — the resulting object is byte-identical (a
+-- SELECT * view). 0083 (numerically last) then re-drops and installs the explicit + symmetric definition,
+-- which wins. The string-body sla_availability/slo_status functions carry no pg_depend on the view, so the
+-- DROP is not blocked. See db/migrations/0083.
+DROP VIEW IF EXISTS countable_run;
+
 CREATE OR REPLACE VIEW countable_run AS
     SELECT *
       FROM runs
