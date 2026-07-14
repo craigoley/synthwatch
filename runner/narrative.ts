@@ -591,8 +591,29 @@ async function upsert(fp: FactPack, n: Narrative, model: string): Promise<void> 
 }
 
 /**
- * Generate + store narratives for the fleet and each enabled monitor. No-ops (returns 0)
- * when AOAI is not configured (Layer 3 dark, zero cost). Returns the number of narratives
+ * The monitors that get a per-monitor AI narrative each cycle: LIVE checks only.
+ *
+ * ★ TWO DIFFERENT "active check" predicates live in this codebase and the divergence on `enabled` is
+ * DELIBERATE — do NOT unify them (that erases a real distinction: the countable_run / flake-budget lesson):
+ *   live_check       = enabled AND archived_at IS NULL   — "does this produce LIVE health RIGHT NOW?"
+ *                      THIS loop. A paused check produces no live signal to narrate, and an ARCHIVED/retired
+ *                      check must NEVER get an urgent AI action-item written about it (rca-demo: 0% avail,
+ *                      2,264 dead runs, narrated + billed at AOAI prices every cycle until this).
+ *   reportable_check = archived_at IS NULL               — "is this a real HISTORICAL record?" A PAUSED
+ *                      check's incidents + SLO history are real and stay reportable.
+ * `archived_at IS NULL` is the shared floor both need; `enabled` is the extra liveness filter only the live
+ * predicate adds. (Mirrors #313's cost_projection fix exactly — exclude archived, keep paused visible.)
+ */
+export async function narratableCheckIds(): Promise<{ id: string; name: string }[]> {
+  const { rows } = await pool.query<{ id: string; name: string }>(
+    `SELECT id, name FROM checks WHERE enabled AND archived_at IS NULL ORDER BY id`,
+  );
+  return rows;
+}
+
+/**
+ * Generate + store narratives for the fleet and each LIVE monitor (enabled AND not archived). No-ops
+ * (returns 0) when AOAI is not configured (Layer 3 dark, zero cost). Returns the number of narratives
  * written.
  */
 export async function runNarratives(): Promise<number> {
@@ -608,9 +629,7 @@ export async function runNarratives(): Promise<number> {
   written++;
   console.log(`[narrative] fleet: "${fleetN.narrative.headline}" (${fleetN.model})`);
 
-  const { rows } = await pool.query<{ id: string; name: string }>(
-    `SELECT id, name FROM checks WHERE enabled ORDER BY id`,
-  );
+  const rows = await narratableCheckIds();
   for (const c of rows) {
     const fp = await computeFactPack({ type: 'monitor', checkId: Number(c.id), key: String(c.id), name: c.name });
     const res = await narrate(fp);
