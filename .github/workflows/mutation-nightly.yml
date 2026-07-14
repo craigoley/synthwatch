@@ -1,0 +1,83 @@
+name: Mutation nightly (full)
+
+# ★ Nightly FULL mutation over all 6 modules (~50-60 min). Two jobs it does that the PR gate can't:
+#   1. Refreshes the --incremental cache the PR gate restores (so PRs stay at ~1-2 min).
+#   2. Catches a regression the incremental gate might miss (a change that lowers a mutant far from the diff),
+#      and OPENS AN ISSUE — non-blocking, because nightly failures shouldn't wedge the merge queue.
+
+on:
+  schedule:
+    - cron: '0 8 * * *'   # 08:00 UTC daily
+  workflow_dispatch: {}
+
+jobs:
+  mutate:
+    name: nightly mutation ${{ matrix.module }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [retry, transientClass, traceSignals, rca, evaluate, reconcile]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: pg
+          POSTGRES_DB: synthwatch
+        ports:
+          - 5544:5432
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    defaults:
+      run:
+        working-directory: runner
+    env:
+      DATABASE_URL: postgres://postgres:pg@127.0.0.1:5544/synthwatch
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install deps
+        run: npm ci
+      - name: Materialize the schema
+        run: |
+          for i in $(seq 1 30); do PGPASSWORD=pg psql -h 127.0.0.1 -p 5544 -U postgres -d synthwatch -c 'select 1' >/dev/null 2>&1 && break; sleep 1; done
+          PGPASSWORD=pg psql -h 127.0.0.1 -p 5544 -U postgres -d synthwatch -c "SET check_function_bodies=false;" -f ../db/schema.sql >/dev/null
+          for f in $(ls ../db/migrations/*.sql | sort); do PGPASSWORD=pg psql -h 127.0.0.1 -p 5544 -U postgres -d synthwatch -c "SET check_function_bodies=false;" -f "$f" >/dev/null; done
+      - name: Full mutation — ${{ matrix.module }}
+        id: mut
+        run: bash scripts/mutation.sh ${{ matrix.module }}
+      # Persist the refreshed incremental cache for tomorrow's PRs.
+      - name: Save mutation incremental cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: runner/.stryker-incremental
+          key: stryker-incremental-${{ matrix.module }}-${{ github.sha }}
+      # ★ Non-blocking: a regression OPENS AN ISSUE rather than wedging anything.
+      - name: Open an issue on regression
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const module = '${{ matrix.module }}';
+            const title = `Mutation regression: ${module} fell below its threshold`;
+            const body = [
+              `The nightly full mutation run for **${module}** dropped below its ratcheting break threshold`,
+              `(see \`runner/scripts/mutation.sh\`). A test that could have failed no longer does — a mutant survived.`,
+              ``,
+              `Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              ``,
+              `Fix the surviving mutant (tighten the test), or — if the drop is a deliberate, reviewed scope`,
+              `change — lower the module's threshold in \`mutation.sh\` in the same PR.`,
+            ].join('\n');
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo, state: 'open', labels: 'mutation-regression',
+            });
+            const dup = existing.data.find((i) => i.title === title);
+            if (dup) {
+              await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: dup.number, body });
+            } else {
+              await github.rest.issues.create({ owner: context.repo.owner, repo: context.repo.repo, title, body, labels: ['mutation-regression'] });
+            }

@@ -1,0 +1,4 @@
+stryker.conf.json
+.stryker-tmp/
+reports/
+.stryker-incremental/
