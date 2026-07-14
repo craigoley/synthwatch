@@ -85,13 +85,6 @@ CREATE TABLE checks (
     -- ticks. >1 stays available as an OPTIONAL debounce for intentionally-noisy monitors.
     failure_threshold  INTEGER     NOT NULL DEFAULT 1 CHECK (failure_threshold > 0),
 
-    -- Fast-retry (mirrors 0021 + 0045): within ONE run, re-run up to `retries` times on ANY failure
-    -- — 'error' (couldn't complete) OR 'fail' (assertion missed); only the FINAL attempt counts
-    -- (intermediate attempts discarded). Sits IN FRONT of failure_threshold: it confirms a failure
-    -- in-run (seconds) so the incident can open immediately. DEFAULT 2 (3 attempts total — Datadog's
-    -- recommended default); 0 = no retry. Distinct from failure_threshold.
-    retries            INTEGER     NOT NULL DEFAULT 2 CHECK (retries >= 0),
-
     -- B10 trace redaction (mirrors 0046). `sensitive` = a cart/auth monitor whose trace can carry
     -- session tokens / cart contents / account PII: the runner skips the success-trace baseline +
     -- failure trace zips, omits screenshots from RCA (and doesn't store them), scrubs trace_signals

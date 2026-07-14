@@ -113,9 +113,6 @@ export interface Check {
   last_run_at: Date | null;
   timeout_ms: number;
   failure_threshold: number;
-  // Fast-retry: within-run re-attempts on a transient 'error' (not 'fail'). The final
-  // attempt is the run's verdict; intermediate attempts don't persist. 0 = no retry.
-  retries: number;
   // B10 (0046): a cart/auth monitor whose trace can carry session tokens / PII. When true the runner
   // stores no RAW artifacts: a FAILED run persists a REDACTED/REDUCED trace zip (traceRedact.ts),
   // the permanent success-baseline zip + all screenshots are skipped, trace_signals is scrubbed
