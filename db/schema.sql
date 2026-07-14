@@ -463,7 +463,16 @@ CREATE TABLE incidents (
     -- 0027_rca_notified.sql). Set when the enrichment sends; the conditional UPDATE
     -- (... WHERE rca_notified_at IS NULL) makes the follow-up fire AT MOST ONCE per
     -- incident, race-safe across runner executions. See runner/evaluate.ts.
-    rca_notified_at      TIMESTAMPTZ
+    rca_notified_at      TIMESTAMPTZ,
+    -- ★ DELIVERY ACCOUNTING (0082): a failed page and a successful page must NOT leave identical DB state.
+    -- Set by recordIncidentDispatch (runner/evaluate.ts) after every incident dispatch (open/resolve/enrich):
+    -- 'sent' (>=1 channel delivered) / 'failed' (all channels rejected — ALSO writes a runner_errors row) /
+    -- 'skipped' (no deliverable channel — a REAL state, must not read as success). The columns hold the
+    -- LATEST attempt + a running count; the durable per-failure trail is runner_errors.
+    notify_attempted_at  TIMESTAMPTZ,
+    notify_status        TEXT        CHECK (notify_status IS NULL OR notify_status IN ('sent', 'failed', 'skipped')),
+    notify_error         TEXT,
+    notify_attempts      INTEGER     NOT NULL DEFAULT 0
 );
 
 -- At most one OPEN incident per check. Lets evaluate.ts rely on the DB to keep
