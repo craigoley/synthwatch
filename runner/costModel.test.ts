@@ -13,6 +13,10 @@ import {
   costRatePerActiveSecond,
   FALLBACK_RUNNER_CPU,
   FALLBACK_RUNNER_MEMORY_GIB,
+  FREE_GRANT_VCPU_SECONDS,
+  FREE_GRANT_GIB_SECONDS,
+  freeGrantDollars,
+  reconcileTargetMonthly,
 } from './costModel.js';
 
 const approx = (a: number, b: number) => assert.ok(Math.abs(a - b) < 1e-12, `${a} ≈ ${b}`);
@@ -52,4 +56,20 @@ test('unstamped env → the documented current-shape fallback, flagged stamped:f
   // a valid stamp is honored and marked stamped:true
   const s = runnerAllocation({ SYNTHWATCH_RUNNER_CPU: '2.0', SYNTHWATCH_RUNNER_MEMORY_GIB: '4' } as NodeJS.ProcessEnv);
   assert.equal(s.stamped, true);
+});
+
+test('the per-subscription free grant is the two meters at 180k/360k seconds (~$5.40 at any shape)', () => {
+  assert.equal(FREE_GRANT_VCPU_SECONDS, 180_000);
+  assert.equal(FREE_GRANT_GIB_SECONDS, 360_000);
+  // $ value = seconds × meter rates — independent of the container SHAPE (grant is in seconds).
+  approx(freeGrantDollars(), 180_000 * 0.000024 + 360_000 * 0.000003); // 4.32 + 1.08 = 5.40
+  approx(freeGrantDollars(), 5.4);
+});
+
+test('reconcileTargetMonthly: null (derived) by default; a positive env pins Σ; junk → null', () => {
+  assert.equal(reconcileTargetMonthly({} as NodeJS.ProcessEnv), null); // unset → derived grant-corrected total
+  assert.equal(reconcileTargetMonthly({ COST_RECONCILE_TARGET_MONTHLY: '76' } as NodeJS.ProcessEnv), 76); // pin to forecast
+  assert.equal(reconcileTargetMonthly({ COST_RECONCILE_TARGET_MONTHLY: '47' } as NodeJS.ProcessEnv), 47); // pin to MTD
+  assert.equal(reconcileTargetMonthly({ COST_RECONCILE_TARGET_MONTHLY: 'nope' } as NodeJS.ProcessEnv), null);
+  assert.equal(reconcileTargetMonthly({ COST_RECONCILE_TARGET_MONTHLY: '0' } as NodeJS.ProcessEnv), null); // non-positive → null
 });

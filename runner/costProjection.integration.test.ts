@@ -137,3 +137,51 @@ test('cost_projection: active_seconds_7d = Σduration, share ratio = active-seco
     await pool.query(`DELETE FROM checks WHERE id = ANY($1)`, [[a, b]]);
   }
 });
+
+// ★ 0091 — the free-grant-aware per-monitor DOLLAR (restored, primary). Proves: (1) Σ estimated = the anchor
+// (grant-corrected fleet, or the target when passed); (2) every ACTIVE monitor WITH runs gets a dollar,
+// including a cheap one (spread proportionally, never zeroed); (3) a no-runs monitor → NULL, not $0.
+test('cost_projection(3-param): per-monitor $ sums to the anchor; cheap check non-zero; no-runs → NULL (0091)', async () => {
+  const mk = async (name: string, interval: number, enabled = true, archived = false) => {
+    const { rows } = await pool.query<{ id: number }>(
+      `INSERT INTO checks (name, kind, target_url, flow_name, spec_path, failure_threshold, severity, interval_seconds, enabled, archived_at)
+       VALUES ($1, 'browser', 'https://example.test', 'noop', 'monitors/__test__/x.spec.ts', 1, 'critical', $2, $3, ${archived ? 'now()' : 'NULL'})
+       RETURNING id`, [name, interval, enabled]);
+    await pool.query(`INSERT INTO check_locations (check_id, location) VALUES ($1, 'default')`, [rows[0].id]);
+    return Number(rows[0].id); // node-pg returns bigint as a string — coerce so it matches Number(check_id) keys
+  };
+  const big = await mk('__d_big__', 300);
+  const cheap = await mk('__d_cheap__', 300);
+  const norun = await mk('__d_norun__', 300);  // enabled, but no runs → NULL $
+  const arch = await mk('__d_arch__', 300, true, true); // archived → excluded
+  try {
+    const run = (id: number, dur: number) => pool.query(
+      `INSERT INTO runs (check_id, status, started_at, finished_at, location, duration_ms)
+       VALUES ($1,'pass', now()-interval '1 hour', now(), 'default', $2)`, [id, dur]);
+    for (let i = 0; i < 3; i++) { await run(big, 40000); await run(cheap, 200); await run(arch, 99000); }
+
+    // ALL active monitors (the integration DB may hold others — the Σ invariant is fleet-wide, so sum ALL).
+    const q = async (target: number | null) => (await pool.query<{ check_id: string; estimated_monthly: string | null; fleet_billable_monthly: string }>(
+      `SELECT check_id, estimated_monthly, fleet_billable_monthly FROM cost_projection(0.00006::numeric, 2.00::numeric, $1::numeric)`,
+      [target])).rows;
+    const derived = await q(null);
+    const byId = new Map(derived.map((r) => [Number(r.check_id), r]));
+
+    assert.ok(!byId.has(arch), 'archived monitor is EXCLUDED');
+    assert.equal(byId.get(norun)!.estimated_monthly, null, 'no-runs monitor → NULL $, never a fake $0');
+    assert.ok(Number(byId.get(big)!.estimated_monthly) > 0, 'big monitor gets a dollar');
+    assert.ok(Number(byId.get(cheap)!.estimated_monthly) > 0, 'cheap monitor gets a NON-ZERO dollar (grant spread, not zeroed)');
+    assert.ok(Number(byId.get(big)!.estimated_monthly) > Number(byId.get(cheap)!.estimated_monthly), 'big > cheap');
+
+    // Σ estimated over the WHOLE fleet = the grant-corrected fleet total (the anchor).
+    const sumAll = (rows: typeof derived) => rows.reduce((s, r) => s + (r.estimated_monthly == null ? 0 : Number(r.estimated_monthly)), 0);
+    const anchor = Number(derived[0].fleet_billable_monthly);
+    assert.ok(Math.abs(sumAll(derived) - anchor) < 0.05, `fleet Σ estimated (${sumAll(derived).toFixed(2)}) = grant-corrected anchor (${anchor.toFixed(2)})`);
+
+    // With a target, the WHOLE-fleet Σ pins to it exactly.
+    const sumPinned = sumAll(await q(9.0));
+    assert.ok(Math.abs(sumPinned - 9.0) < 0.05, `target=9 → fleet Σ pins to 9.00 (got ${sumPinned.toFixed(2)})`);
+  } finally {
+    await pool.query(`DELETE FROM checks WHERE id = ANY($1)`, [[big, cheap, norun, arch]]);
+  }
+});
