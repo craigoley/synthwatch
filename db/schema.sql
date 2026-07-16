@@ -564,9 +564,14 @@ CREATE UNIQUE INDEX alert_routes_severity_uq ON alert_routes (severity, channel_
 CREATE UNIQUE INDEX alert_routes_check_uq ON alert_routes (check_id, channel_id) WHERE check_id IS NOT NULL;
 
 -- Default channels (empty config => dashboard fills targets) + severity-default routes.
+-- '__canary__' (0088): a DISABLED, unrouted email channel that anchors the notification canary's evidence
+-- rows in test_send_requests (channel_id = __canary__ marks a canary probe vs a user test-send). It is NEVER
+-- an alert-routing target (enabled=false + no alert_routes row); the canary probe delivers to CANARY_EMAIL_TO
+-- (runner env), not to this channel. See runner/canary.ts + db/migrations/0088_canary_channel.sql.
 INSERT INTO channels (name, type, config, enabled) VALUES
-    ('email',   'email',   '{}'::jsonb, true),
-    ('webhook', 'webhook', '{}'::jsonb, true);
+    ('email',      'email',   '{}'::jsonb, true),
+    ('webhook',    'webhook', '{}'::jsonb, true),
+    ('__canary__', 'email',   '{}'::jsonb, false);
 INSERT INTO alert_routes (severity, channel_id)
 SELECT s.sev, c.id FROM (VALUES ('critical'), ('warning')) AS s(sev)
   CROSS JOIN channels c WHERE c.name IN ('email', 'webhook');
