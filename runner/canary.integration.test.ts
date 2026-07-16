@@ -10,12 +10,7 @@
 import { test as nodeTest } from 'node:test';
 import assert from 'node:assert/strict';
 import { pool } from './db.js';
-import {
-  runCanaryIfDue,
-  checkCanaryStaleness,
-  CANARY_STALE_MS,
-  type CanaryDeps,
-} from './canary.js';
+import { runCanaryIfDue, checkCanaryStaleness, type CanaryDeps } from './canary.js';
 import type { AlertPayload, DispatchResult } from './alerts.js';
 
 const SKIP = !process.env.DATABASE_URL;
