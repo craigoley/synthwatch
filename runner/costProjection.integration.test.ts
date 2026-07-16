@@ -99,3 +99,41 @@ test('cost_projection: clean-multiplier rate + pure run-count divergence + count
     await pool.query(`DELETE FROM checks WHERE id = $1`, [checkId]); // cascades runs + check_locations
   }
 });
+
+// ★ 0089 — compute_share_pct is the HONEST per-monitor metric: share of fleet measured active-seconds. Proven
+// robustly against a SHARED fleet DB by (1) active_seconds_7d == Σduration/1000 exactly, and (2) the RATIO of
+// two controlled checks' shares == the ratio of their active-seconds (the fleet total cancels).
+test('cost_projection: active_seconds_7d = Σduration, share ratio = active-seconds ratio (0089)', async () => {
+  const mk = async (name: string) => {
+    const { rows } = await pool.query<{ id: number }>(
+      `INSERT INTO checks (name, kind, target_url, flow_name, spec_path, failure_threshold, severity, interval_seconds, enabled)
+       VALUES ($1, 'browser', 'https://example.test', 'noop', 'monitors/__test__/x.spec.ts', 1, 'critical', 300, true)
+       RETURNING id`, [name]);
+    await pool.query(`INSERT INTO check_locations (check_id, location) VALUES ($1, 'default')`, [rows[0].id]);
+    return rows[0].id;
+  };
+  const a = await mk('__share_A__');
+  const b = await mk('__share_B__');
+  try {
+    // A: 3 runs × 10_000ms = 30s. B: 3 runs × 20_000ms = 60s. So B's share == 2× A's, regardless of the fleet.
+    for (const [id, dur] of [[a, 10000], [b, 20000]] as const)
+      for (let i = 0; i < 3; i++)
+        await pool.query(
+          `INSERT INTO runs (check_id, status, started_at, finished_at, location, duration_ms)
+           VALUES ($1, 'pass', now() - make_interval(hours => $2::int), now(), 'default', $3)`,
+          [id, i + 1, dur]);
+
+    const q = async (id: number) => (await pool.query<{ active_seconds_7d: string; compute_share_pct: string | null }>(
+      `SELECT active_seconds_7d, compute_share_pct FROM cost_projection(0.00006::numeric) WHERE check_id = $1`, [id])).rows[0];
+    const ra = await q(a); const rb = await q(b);
+
+    assert.equal(Number(ra.active_seconds_7d), 30, 'A active-seconds = 3×10s');
+    assert.equal(Number(rb.active_seconds_7d), 60, 'B active-seconds = 3×20s');
+    assert.ok(ra.compute_share_pct != null && rb.compute_share_pct != null, 'shares present (fleet ran)');
+    // active_seconds ratio is EXACT (60/30); compute_share_pct is rounded 2dp so allow a small rounding band.
+    const ratio = Number(rb.compute_share_pct) / Number(ra.compute_share_pct);
+    assert.ok(Math.abs(ratio - 2) < 0.02, `B's compute share is ~2× A's (fleet total cancels): ${ratio}`);
+  } finally {
+    await pool.query(`DELETE FROM checks WHERE id = ANY($1)`, [[a, b]]);
+  }
+});

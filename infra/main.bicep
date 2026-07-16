@@ -233,6 +233,14 @@ var jobsOperatorRoleId = 'b9a307c4-5aa3-4b52-ba60-2b17c136cd7b'
 // AAD-signed, no account key. (It already holds Storage Blob Data Reader, granted in the API's own bicep.)
 var storageBlobDelegatorRoleId = 'db58b8e5-c6ad-4a2a-8342-4190687cbf4a'
 
+// Cost Management Reader built-in role — grants Microsoft.CostManagement/query + forecast (read-only). The
+// RUNNER MI needs this at the RESOURCE-GROUP scope so the daily rollup job (azureCost.ts) can PULL the actual
+// MTD + forecast the cost panel DISPLAYS (synthwatch-rg == the whole subscription's spend, so an RG-scoped
+// figure equals the portal number). RG scope — creatable by this RG-scoped deployment, no subscription-scope
+// deploy / elevated deployer needed. Absent → the pull 403s, refreshAzureCost writes nothing, and the UI
+// falls back to a Cost Management deep link (honestly absent beats falsely precise).
+var costManagementReaderRoleId = '72fafb9e-0df8-4a8f-8dc0-eddd6b7f19aa'
+
 // ---------------------------------------------------------------------------
 // Observability: Log Analytics workspace backing the ACA environment.
 // ---------------------------------------------------------------------------
@@ -442,6 +450,20 @@ resource acrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   scope: acr
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', acrPullRoleId)
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+// ★ Cost Management Reader for the RUNNER MI at the RESOURCE-GROUP scope (no `scope:` → this deployment's RG,
+// per targetScope='resourceGroup'). Lets the daily rollup job PULL the actual MTD + forecast (azureCost.ts →
+// azure_cost, 0090) the cost panel DISPLAYS. RG scope is deliberate: synthwatch-rg == the whole subscription's
+// spend, so the figure equals the portal number, and this stays within the RG-scoped deploy's own authority
+// (no subscription-scope role assignment / elevated deployer). Idempotent (deterministic guid name).
+resource runnerCostReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(resourceGroup().id, identity.id, costManagementReaderRoleId)
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', costManagementReaderRoleId)
     principalId: identity.properties.principalId
     principalType: 'ServicePrincipal'
   }
