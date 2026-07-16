@@ -578,6 +578,14 @@ resource acrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
     principalType: 'ServicePrincipal'
   }
 }
+resource runnerCostReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(resourceGroup().id, identity.id, costManagementReaderRoleId)
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', costManagementReaderRoleId)
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
 FIX
 )"
 expect_eq "bicep_var role GUID" "db58b8e5-c6ad-4a2a-8342-4190687cbf4a" "$(printf '%s' "${RBAC_FIXTURE}" | bicep_var storageBlobDelegatorRoleId)"
@@ -585,10 +593,13 @@ expect_eq "bicep_param principalId literal" "67f2bd0c-1334-42a7-b521-3005064d717
 expect_eq "bicep_param identityName" "synthwatch-runner-id" "$(printf '%s' "${RBAC_FIXTURE}" | bicep_param identityName)"
 expect_eq "bicep_param_array first origin" "https://synthwatch-dashboard.vercel.app" "$(printf '%s' "${RBAC_FIXTURE}" | bicep_param_array dashboardCorsOrigins | sed -n 1p)"
 expect_eq "bicep_param_array second origin" "https://preview.example.app" "$(printf '%s' "${RBAC_FIXTURE}" | bicep_param_array dashboardCorsOrigins | sed -n 2p)"
-# The two assignments, TSV, in declaration order.
+# The assignments, TSV, in declaration order.
 expect_eq "role_assignments_from_template row 1" "storageBlobDelegatorRoleId	apiManagedIdentityPrincipalId	storage" "$(printf '%s' "${RBAC_FIXTURE}" | role_assignments_from_template | sed -n 1p)"
 expect_eq "role_assignments_from_template row 2" "acrPullRoleId	identity.properties.principalId	acr" "$(printf '%s' "${RBAC_FIXTURE}" | role_assignments_from_template | sed -n 2p)"
-expect_eq "role_assignments count" "2" "$(printf '%s' "${RBAC_FIXTURE}" | role_assignments_from_template | grep -c .)"
+# ★ RG-scoped assignment (NO `scope:` in bicep) → scope token `resourceGroup`, NOT dropped. This is the gap
+# that let the runner's Cost Management Reader grant deploy "green" while silently failing — must be asserted.
+expect_eq "role_assignments_from_template row 3 (RG-scoped, no scope: line)" "costManagementReaderRoleId	identity.properties.principalId	resourceGroup" "$(printf '%s' "${RBAC_FIXTURE}" | role_assignments_from_template | sed -n 3p)"
+expect_eq "role_assignments count" "3" "$(printf '%s' "${RBAC_FIXTURE}" | role_assignments_from_template | grep -c .)"
 
 # ★ cors_origins_tokens: EVERY corsRule's allowedOrigins param token (not just the first) — so verify_cors's
 # data-driven guarantee is N-rules-deep (a 2nd rule referencing a different param can't slip past unasserted).

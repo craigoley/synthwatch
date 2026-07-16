@@ -416,7 +416,11 @@ bicep_param_array() {
 # resource: `<roleDefVarName>\t<principalToken>\t<scopeToken>` — the raw bicep tokens (verify() resolves each
 # to a live GUID / principalId / scope id, and FLUNKS an unknown token so a NEW assignment can't slip past
 # unasserted). Parses each top-level resource block (its closing `}` is at column 0; nested braces are
-# indented). Emits nothing for a malformed block (missing a field), which a count check in verify() catches.
+# indented). ★ A roleAssignment with NO `scope:` property is RG-scoped (bicep defaults it to the deployment's
+# target = the RG) — emit it with the `resourceGroup` scope token, NOT drop it. Dropping scope-less
+# assignments was the silent gap: the runner's Cost Management Reader grant (RG-scoped) slipped past verify()
+# entirely, so a broken grant deployed "green" twice. rv+pr are still both required (a block missing the
+# role/principal emits nothing → the count check in verify() catches that).
 role_assignments_from_template() {
   awk '
     /^resource[[:space:]].*Microsoft\.Authorization\/roleAssignments/ { inblk=1; rv=""; pr=""; sc=""; next }
@@ -428,7 +432,7 @@ role_assignments_from_template() {
       } else if ($0 ~ /^[[:space:]]*scope:/ && sc=="") {
         line=$0; sub(/^[[:space:]]*scope:[[:space:]]*/, "", line); sub(/[[:space:]].*/, "", line); sc=line
       }
-      if ($0 ~ /^}/) { if (rv!="" && pr!="" && sc!="") print rv "\t" pr "\t" sc; inblk=0 }
+      if ($0 ~ /^}/) { if (rv!="" && pr!="") { if (sc=="") sc="resourceGroup"; print rv "\t" pr "\t" sc } inblk=0 }
     }
   '
 }

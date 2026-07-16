@@ -820,6 +820,7 @@ verify_rbac() {
     esac
     if [[ -z "${principalId}" ]]; then flunk "rbac '${roleName}': could not resolve principal '${principalTok}'"; continue; fi
     case "${scopeTok}" in
+      resourceGroup) scopeId="/subscriptions/${sub_id}/resourceGroups/${RG}" ;;  # ★ RG-scoped (no `scope:` in bicep) — e.g. the runner's Cost Management Reader grant
       storage)      scopeId="/subscriptions/${sub_id}/resourceGroups/${RG}/providers/Microsoft.Storage/storageAccounts/${storage_acct}" ;;
       acr)          scopeId="/subscriptions/${sub_id}/resourceGroups/${RG}/providers/Microsoft.ContainerRegistry/registries/${acr_name}" ;;
       job)          scopeId="/subscriptions/${sub_id}/resourceGroups/${RG}/providers/Microsoft.App/jobs/${RUNNER_JOB}" ;;
