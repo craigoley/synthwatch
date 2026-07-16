@@ -239,7 +239,7 @@ var storageBlobDelegatorRoleId = 'db58b8e5-c6ad-4a2a-8342-4190687cbf4a'
 // figure equals the portal number). RG scope — creatable by this RG-scoped deployment, no subscription-scope
 // deploy / elevated deployer needed. Absent → the pull 403s, refreshAzureCost writes nothing, and the UI
 // falls back to a Cost Management deep link (honestly absent beats falsely precise).
-var costManagementReaderRoleId = '72fafb9e-0df8-4a8f-8dc0-eddd6b7f19aa'
+var costManagementReaderRoleId = '72fafb9e-0641-4937-9268-a91bfd8191a3'
 
 // ---------------------------------------------------------------------------
 // Observability: Log Analytics workspace backing the ACA environment.
