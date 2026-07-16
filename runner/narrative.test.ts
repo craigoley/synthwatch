@@ -22,7 +22,7 @@ function factPack(over: Partial<FactPack> = {}): FactPack {
       fleetProjected: 67.64, fleetMeasured: 50.17, fleetDivergence: 0.742,
       topDrivers: [{ name: 'recipe-nav', projected: 8.85 }],
       notable: [
-        { name: 'rca-demo', projected: 5.2, measured: 12.9, divergence: 2.48, divergenceFlag: true, availabilityPct: 0.0 },
+        { name: 'rca-demo', sharePct: 18.4, projected: 5.2, measured: 12.9, divergence: 2.48, divergenceFlag: true, availabilityPct: 0.0 },
       ],
     },
     deployMarkers: [

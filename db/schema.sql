@@ -1158,13 +1158,15 @@ $$;
 COMMENT ON FUNCTION flake_status(bigint, timestamptz, timestamptz) IS
     'Per-check MONITOR trust budget over [p_from, p_to): consumed = MONITOR-SIDE transients ONLY (service-side + indeterminate surfaced, never consumed). budget = flake_target × scheduled_runs; fleet default 2% via COALESCE. READ-ONLY — never mutes an alert; a breach surfaces a directed monitor-health task.';
 
--- cost_projection(rate) — the SINGLE shared cost model (0069, +run-count columns 0078) both /reports/cost
--- (api) and the narrative fact pack (runner) call, so their $ figures are identical by construction.
--- projected = avg_s × (2,592,000/interval) × regions × rate; measured = Σsec_7d × rate × 30/7; divergence =
--- measured/projected (flag > 1.5). Sum projected_raw/measured_raw for the fleet total, then round. The rate
--- is a DERIVED $/active-second (two ACA meters × the live allocation — see runner/costModel.ts), NOT a
--- single "vCPU rate". divergence = run_count_7d / expected is a PURE run-count ratio (duration cancels), so
--- the count columns attribute a flag to config-change/confirmation/sandbox — NEVER retries (0078).
+-- cost_projection(rate) — the SINGLE shared cost model (0069, +run-counts 0078, +compute-share 0089) both
+-- /reports/cost (api) and the narrative fact pack (runner) call, so their figures are identical by
+-- construction. ★ compute_share_pct (0089) is the HONEST per-monitor metric: every check runs on the same
+-- runner allocation, so its share of fleet compute = its share of measured active-seconds — attributable and
+-- measured, unlike a per-monitor $ (which ignores the per-subscription free grant + non-ACA line items). The
+-- projected/measured $ columns are DEMOTED (kept for the staged api/dashboard migration); the fleet DOLLAR
+-- headline is Azure Cost Management (azure_cost, 0090), not this function. divergence = run_count_7d /
+-- expected is a PURE run-count ratio (duration cancels) and SURVIVES — the count columns attribute a flag to
+-- config-change/confirmation/sandbox, NEVER retries (0078).
 CREATE OR REPLACE FUNCTION cost_projection(p_rate numeric)
 RETURNS TABLE (
     check_id              bigint,
@@ -1174,8 +1176,10 @@ RETURNS TABLE (
     interval_seconds      integer,
     region_count          integer,
     avg_duration_s        double precision,
-    projected             numeric,   -- rounded 2dp (display)
-    measured              numeric,   -- rounded 2dp (display)
+    active_seconds_7d     numeric,   -- ★ 0089: Σ measured active-seconds over 7d (all runs/regions) — the attributable compute
+    compute_share_pct     numeric,   -- ★ 0089: 100 × this check's active_seconds_7d / fleet total; null when fleet total is 0
+    projected             numeric,   -- rounded 2dp (display) — DEMOTED from-zero $, superseded by share + Azure headline
+    measured              numeric,   -- rounded 2dp (display) — DEMOTED ×30/7 annualizer, superseded as above
     divergence            numeric,   -- rounded 3dp; null when projected = 0
     divergence_flag       boolean,   -- divergence > 1.5
     projected_raw         numeric,   -- unrounded — sum these for the fleet total, THEN round
@@ -1221,6 +1225,9 @@ AS $$
     ),
     scored AS (
         SELECT b.*,
+               -- ★ 0089: measured active-seconds + fleet total (window sum) for a single-pass share.
+               coalesce(b.sum_duration_s_7d, 0)::numeric                          AS active_seconds_7d,
+               sum(coalesce(b.sum_duration_s_7d, 0)::numeric) OVER ()             AS fleet_active_seconds_7d,
                CASE WHEN b.avg_duration_s IS NOT NULL AND b.interval_seconds > 0
                     THEN b.avg_duration_s::numeric * (2592000::numeric / b.interval_seconds) * b.region_count * p_rate
                     ELSE 0 END AS p_raw,
@@ -1230,6 +1237,10 @@ AS $$
           FROM base b
     )
     SELECT s.check_id, s.source_key, s.check_name, s.kind, s.interval_seconds, s.region_count, s.avg_duration_s,
+           round(s.active_seconds_7d, 3) AS active_seconds_7d,
+           CASE WHEN s.fleet_active_seconds_7d > 0
+                THEN round(100 * s.active_seconds_7d / s.fleet_active_seconds_7d, 2)
+                ELSE NULL END AS compute_share_pct,
            round(s.p_raw, 2) AS projected,
            round(s.m_raw, 2) AS measured,
            CASE WHEN s.p_raw > 0 THEN round(s.m_raw / s.p_raw, 3) ELSE NULL END AS divergence,
@@ -1240,7 +1251,24 @@ AS $$
       FROM scored s
 $$;
 COMMENT ON FUNCTION cost_projection(numeric) IS
-    'Shared cost model (0069, +run-count columns 0078): per-check projected/measured/divergence for a given $/active-second rate. Called by /reports/cost (api) + the narrative fact pack (runner) so figures match. Sum projected_raw/measured_raw for the fleet total, then round. divergence = run_count_7d / expected (a pure run-count ratio: duration cancels) — attribute a flag from the count columns, NEVER retries.';
+    'Shared cost model (0069, +run-counts 0078, +compute-share 0089): per-check compute_share_pct (share of fleet measured active-seconds — the ATTRIBUTABLE metric; per-monitor $ is NOT supportable under a per-subscription free grant) + active_seconds_7d, plus the SURVIVING divergence run-count ratio. projected/measured are DEMOTED from-zero-$ columns kept only for the staged api/dashboard migration; the fleet DOLLAR headline is Azure Cost Management (azure_cost, 0090), not this function.';
+
+-- azure_cost (0090) — single-row cache of what the runner PULLS from Azure Cost Management (rollup job,
+-- azureCost.ts): MTD actual + Azure's own forecast for the RG scope. The cost panel DISPLAYS this (not a
+-- modeled number); a stale/absent row → the UI deep-links to the portal (honestly absent beats falsely
+-- precise). Runner writes (owner); api reads (SELECT grant below).
+CREATE TABLE IF NOT EXISTS azure_cost (
+    id             smallint    PRIMARY KEY DEFAULT 1,
+    scope          text        NOT NULL,
+    currency       text        NOT NULL,
+    billing_month  date        NOT NULL,
+    mtd_actual     numeric     NOT NULL,
+    mtd_days       integer     NOT NULL,
+    forecast_month numeric,
+    portal_url     text        NOT NULL,
+    fetched_at     timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT azure_cost_singleton CHECK (id = 1)
+);
 
 -- slo_burn_status (0055): the SHARED, location-aware SLO burn STATE — reproduces the runner's
 -- maybeBurnAlert threshold decision EXACTLY (read == page). STATE ONLY (no dispatch suppressors). See

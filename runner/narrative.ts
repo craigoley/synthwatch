@@ -45,6 +45,7 @@ export interface IncidentFact {
  *  /reports/cost by construction. divergence = measured/projected (null when projected 0). */
 export interface CostFact {
   name: string;
+  sharePct: number | null; // ★ 0089: this monitor's share of FLEET measured compute (active-seconds) — the ATTRIBUTABLE metric; null when no monitor ran in the window
   projected: number;
   measured: number;
   divergence: number | null;
@@ -191,10 +192,10 @@ const costRate = costRatePerActiveSecond;
 async function costFacts(checkId: number | null, startDay: string, endDay: string): Promise<CostFacts | null> {
   try {
     const cost = await pool.query<{
-      check_id: string; check_name: string; projected: string; measured: string;
+      check_id: string; check_name: string; compute_share_pct: string | null; projected: string; measured: string;
       divergence: string | null; divergence_flag: boolean; projected_raw: string; measured_raw: string;
     }>(
-      `SELECT check_id, check_name, projected, measured, divergence, divergence_flag, projected_raw, measured_raw
+      `SELECT check_id, check_name, compute_share_pct, projected, measured, divergence, divergence_flag, projected_raw, measured_raw
          FROM cost_projection($1::numeric)`,
       [costRate()],
     );
@@ -209,6 +210,7 @@ async function costFacts(checkId: number | null, startDay: string, endDay: strin
       id: r.check_id,
       fact: {
         name: r.check_name,
+        sharePct: r.compute_share_pct == null ? null : Number(r.compute_share_pct),
         projected: Number(r.projected),
         measured: Number(r.measured),
         divergence: r.divergence == null ? null : Number(r.divergence),
