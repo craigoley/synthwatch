@@ -68,6 +68,34 @@ export function costRatePerActiveSecond(env: NodeJS.ProcessEnv = process.env): n
   return activeSecondRate(a.cpu, a.memoryGib);
 }
 
+// The per-SUBSCRIPTION monthly free grant (ACA Consumption): 180,000 vCPU-s + 360,000 GiB-s, consumed by the
+// WHOLE FLEET collectively before billing. It is a FLEET-level discount, so it applies to the fleet TOTAL,
+// not per-check: its $ value (at the meters) is subtracted from the from-zero fleet total, and that
+// grant-corrected total is allocated across monitors BY their compute share (spreading the discount
+// proportionally — a monitor that runs keeps an attributable share of the paid compute ABOVE the grant, so a
+// cheap high-frequency check is discounted, never zeroed). This is the "get the estimates closer to Azure"
+// correction: the old from-zero Σ (~$85) over-priced by pricing every second from zero.
+export const FREE_GRANT_VCPU_SECONDS = 180_000;
+export const FREE_GRANT_GIB_SECONDS = 360_000;
+
+/** The $ value of the per-subscription free grant at the two meters — a flat monthly discount to the FLEET
+ *  total. Valid as a flat subtraction because the fleet's monthly vCPU-s AND GiB-s both far exceed the grant
+ *  (so both meters bill above zero); then (FV−free_v)·rv + (FG−free_g)·rg = FZ − freeGrantDollars exactly.
+ *  Independent of the container SHAPE (the grant is in seconds, priced at the meter rates). */
+export function freeGrantDollars(): number {
+  return FREE_GRANT_VCPU_SECONDS * VCPU_SECOND_RATE + FREE_GRANT_GIB_SECONDS * GIB_SECOND_RATE;
+}
+
+/** The fleet $ the per-monitor estimates reconcile to (Σ estimated ≈ this). null ⇒ use the DERIVED
+ *  grant-corrected fleet total (from-zero Σ − freeGrantDollars), which tracks the fleet with no magic number.
+ *  Set COST_RECONCILE_TARGET_MONTHLY to PIN Σ to Azure's steady-state figure instead — forecast (~76) or MTD
+ *  (~47) — a one-line, deploy-free change (the estimate is an "est.", so pinning it to Azure's own number is
+ *  the honest amount of confidence). */
+export function reconcileTargetMonthly(env: NodeJS.ProcessEnv = process.env): number | null {
+  const n = Number(env.COST_RECONCILE_TARGET_MONTHLY);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
 /** Human basis of the rate, for logs / the self-describing cost report. */
 export function costRateSource(env: NodeJS.ProcessEnv = process.env): string {
   const o = override(env);

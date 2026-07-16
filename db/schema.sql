@@ -1158,16 +1158,13 @@ $$;
 COMMENT ON FUNCTION flake_status(bigint, timestamptz, timestamptz) IS
     'Per-check MONITOR trust budget over [p_from, p_to): consumed = MONITOR-SIDE transients ONLY (service-side + indeterminate surfaced, never consumed). budget = flake_target × scheduled_runs; fleet default 2% via COALESCE. READ-ONLY — never mutes an alert; a breach surfaces a directed monitor-health task.';
 
--- cost_projection(rate) — the SINGLE shared cost model (0069, +run-counts 0078, +compute-share 0089) both
--- /reports/cost (api) and the narrative fact pack (runner) call, so their figures are identical by
--- construction. ★ compute_share_pct (0089) is the HONEST per-monitor metric: every check runs on the same
--- runner allocation, so its share of fleet compute = its share of measured active-seconds — attributable and
--- measured, unlike a per-monitor $ (which ignores the per-subscription free grant + non-ACA line items). The
--- projected/measured $ columns are DEMOTED (kept for the staged api/dashboard migration); the fleet DOLLAR
--- headline is Azure Cost Management (azure_cost, 0090), not this function. divergence = run_count_7d /
--- expected is a PURE run-count ratio (duration cancels) and SURVIVES — the count columns attribute a flag to
--- config-change/confirmation/sandbox, NEVER retries (0078).
-CREATE OR REPLACE FUNCTION cost_projection(p_rate numeric)
+-- cost_projection — the SINGLE shared cost model (0069, +run-counts 0078, +compute-share 0089, +per-monitor
+-- DOLLAR 0091). The 3-param cost_projection(rate, free_grant_$, reconcile_target) is the real model:
+-- estimated_monthly is the PRIMARY per-monitor $ (free-grant-aware, Σ = the reconcile anchor); active_seconds_7d
+-- + compute_share_pct are the SECONDARY share. The 1-param cost_projection(rate) is a deploy-safe WRAPPER
+-- (legacy 20-col shape) the api used before PR2 — a later cleanup drops it. divergence SURVIVES (pure run-count
+-- ratio). See runner/costModel.ts for the rate + freeGrantDollars() + reconcileTargetMonthly().
+CREATE OR REPLACE FUNCTION cost_projection(p_rate numeric, p_free_grant_dollars numeric, p_reconcile_target numeric)
 RETURNS TABLE (
     check_id              bigint,
     source_key            text,
@@ -1176,26 +1173,26 @@ RETURNS TABLE (
     interval_seconds      integer,
     region_count          integer,
     avg_duration_s        double precision,
-    active_seconds_7d     numeric,   -- ★ 0089: Σ measured active-seconds over 7d (all runs/regions) — the attributable compute
-    compute_share_pct     numeric,   -- ★ 0089: 100 × this check's active_seconds_7d / fleet total; null when fleet total is 0
-    projected             numeric,   -- rounded 2dp (display) — DEMOTED from-zero $, superseded by share + Azure headline
-    measured              numeric,   -- rounded 2dp (display) — DEMOTED ×30/7 annualizer, superseded as above
-    divergence            numeric,   -- rounded 3dp; null when projected = 0
+    active_seconds_7d     numeric,   -- 0089: Σ measured active-seconds over 7d — the attributable compute (SECONDARY)
+    compute_share_pct     numeric,   -- 0089: 100 × active_seconds_7d / fleet total; null when fleet total is 0 (SECONDARY)
+    projected             numeric,   -- from-zero $ (the compute WEIGHT + drift reference) — no longer the display $
+    measured              numeric,   -- ×30/7 annualizer (drift reference)
+    divergence            numeric,   -- rounded 3dp; null when projected = 0 — SURVIVES (pure run-count ratio)
     divergence_flag       boolean,   -- divergence > 1.5
-    projected_raw         numeric,   -- unrounded — sum these for the fleet total, THEN round
+    projected_raw         numeric,   -- unrounded from-zero — sum for the fleet FZ / drift, THEN round
     measured_raw          numeric,
-    run_count_7d          integer,   -- runs (duration_ms NOT NULL) in the last 7d = the N in divergence = N/expected
-    confirmation_count_7d integer,   -- of those, confirmation re-runs (confirmation_of_run_id NOT NULL, 0077)
-    sandbox_count_7d      integer,   -- of those, sandbox / on-demand fires (runs.sandbox, 0065)
-    run_count_recent      integer,   -- runs in the RECENT half of the window (last 3.5d)
-    run_count_prior       integer    -- runs in the PRIOR half (3.5–7d ago); recent≠prior ⇒ a cadence change
+    run_count_7d          integer,
+    confirmation_count_7d integer,
+    sandbox_count_7d      integer,
+    run_count_recent      integer,
+    run_count_prior       integer,
+    estimated_monthly     numeric,   -- ★ 0091: the PRIMARY per-monitor $ — free-grant-aware, Σ = the reconcile anchor; null when no runs
+    fleet_billable_monthly numeric   -- ★ 0091: grant-corrected fleet total (FZ − free grant $), CONSTANT per row — for the drift check
 )
 LANGUAGE sql
 STABLE
 AS $$
     WITH run_stats AS (
-        -- ONE grouped pass over the measured set (duration_ms NOT NULL, last 7d), byte-identical avg/Σ to
-        -- 0069's two correlated subqueries, plus the run-count columns.
         SELECT r.check_id,
                (avg(r.duration_ms) / 1000.0)::float8 AS avg_duration_s,
                (sum(r.duration_ms) / 1000.0)::float8 AS sum_duration_s_7d,
@@ -1220,12 +1217,11 @@ AS $$
                coalesce(rs.run_count_prior, 0)       AS run_count_prior
           FROM checks c
           LEFT JOIN run_stats rs ON rs.check_id = c.id
-         -- ★ 0086: exclude ARCHIVED checks (matches #254 at the source — the last surface it missed).
+         -- ★ 0086/#313: exclude ARCHIVED checks — every ACTIVE monitor appears (the truncation fix is client-side).
          WHERE c.enabled AND c.archived_at IS NULL
     ),
     scored AS (
         SELECT b.*,
-               -- ★ 0089: measured active-seconds + fleet total (window sum) for a single-pass share.
                coalesce(b.sum_duration_s_7d, 0)::numeric                          AS active_seconds_7d,
                sum(coalesce(b.sum_duration_s_7d, 0)::numeric) OVER ()             AS fleet_active_seconds_7d,
                CASE WHEN b.avg_duration_s IS NOT NULL AND b.interval_seconds > 0
@@ -1235,23 +1231,74 @@ AS $$
                     THEN b.sum_duration_s_7d::numeric * p_rate * (30::numeric / 7::numeric)
                     ELSE 0 END AS m_raw
           FROM base b
+    ),
+    fleeted AS (
+        -- ★ 0091: fleet from-zero total FZ (window sum of p_raw), and the grant-corrected + reconcile anchor.
+        SELECT s.*,
+               sum(s.p_raw) OVER ()                                              AS fleet_p_raw,
+               greatest(0::numeric, sum(s.p_raw) OVER () - coalesce(p_free_grant_dollars, 0)) AS fleet_billable
+          FROM scored s
     )
-    SELECT s.check_id, s.source_key, s.check_name, s.kind, s.interval_seconds, s.region_count, s.avg_duration_s,
-           round(s.active_seconds_7d, 3) AS active_seconds_7d,
-           CASE WHEN s.fleet_active_seconds_7d > 0
-                THEN round(100 * s.active_seconds_7d / s.fleet_active_seconds_7d, 2)
+    SELECT f.check_id, f.source_key, f.check_name, f.kind, f.interval_seconds, f.region_count, f.avg_duration_s,
+           round(f.active_seconds_7d, 3) AS active_seconds_7d,
+           CASE WHEN f.fleet_active_seconds_7d > 0
+                THEN round(100 * f.active_seconds_7d / f.fleet_active_seconds_7d, 2)
                 ELSE NULL END AS compute_share_pct,
-           round(s.p_raw, 2) AS projected,
-           round(s.m_raw, 2) AS measured,
-           CASE WHEN s.p_raw > 0 THEN round(s.m_raw / s.p_raw, 3) ELSE NULL END AS divergence,
-           CASE WHEN s.p_raw > 0 THEN round(s.m_raw / s.p_raw, 3) > 1.5 ELSE false END AS divergence_flag,
-           s.p_raw AS projected_raw,
-           s.m_raw AS measured_raw,
-           s.run_count_7d, s.confirmation_count_7d, s.sandbox_count_7d, s.run_count_recent, s.run_count_prior
-      FROM scored s
+           round(f.p_raw, 2) AS projected,
+           round(f.m_raw, 2) AS measured,
+           CASE WHEN f.p_raw > 0 THEN round(f.m_raw / f.p_raw, 3) ELSE NULL END AS divergence,
+           CASE WHEN f.p_raw > 0 THEN round(f.m_raw / f.p_raw, 3) > 1.5 ELSE false END AS divergence_flag,
+           f.p_raw AS projected_raw,
+           f.m_raw AS measured_raw,
+           f.run_count_7d, f.confirmation_count_7d, f.sandbox_count_7d, f.run_count_recent, f.run_count_prior,
+           -- ★ 0091: allocate the reconcile anchor (target, or grant-corrected fleet) BY compute share. NULL
+           -- when this monitor has no from-zero compute (no runs) — never a fake $0. Σ = the anchor.
+           CASE WHEN f.fleet_p_raw > 0 AND f.p_raw > 0
+                THEN round(f.p_raw / f.fleet_p_raw * coalesce(p_reconcile_target, f.fleet_billable), 2)
+                ELSE NULL END AS estimated_monthly,
+           round(f.fleet_billable, 2) AS fleet_billable_monthly
+      FROM fleeted f
 $$;
-COMMENT ON FUNCTION cost_projection(numeric) IS
-    'Shared cost model (0069, +run-counts 0078, +compute-share 0089): per-check compute_share_pct (share of fleet measured active-seconds — the ATTRIBUTABLE metric; per-monitor $ is NOT supportable under a per-subscription free grant) + active_seconds_7d, plus the SURVIVING divergence run-count ratio. projected/measured are DEMOTED from-zero-$ columns kept only for the staged api/dashboard migration; the fleet DOLLAR headline is Azure Cost Management (azure_cost, 0090), not this function.';
+
+COMMENT ON FUNCTION cost_projection(numeric, numeric, numeric) IS
+    'Free-grant-aware cost model (0091). estimated_monthly = per-monitor $ = (from-zero compute share) × the reconcile anchor, where anchor = coalesce(p_reconcile_target, grant-corrected fleet total = Σprojected − p_free_grant_dollars). Σ estimated_monthly = the anchor; the free grant is spread proportionally (cheap checks discounted, never zeroed); null when no runs. compute_share_pct/active_seconds_7d are the SECONDARY signal; fleet_billable_monthly + projected_raw feed the drift check vs Azure''s forecast.';
+
+-- ★ Deploy-safe: rewrite the 1-param as a thin WRAPPER over the 3-param (same 20-col return), so the still-old
+-- api keeps working until PR2 switches it. grant$=0 / target=NULL is irrelevant here (the wrapper drops the two
+-- new columns). Return type UNCHANGED → CREATE OR REPLACE (no DROP).
+CREATE OR REPLACE FUNCTION cost_projection(p_rate numeric)
+RETURNS TABLE (
+    check_id              bigint,
+    source_key            text,
+    check_name            text,
+    kind                  text,
+    interval_seconds      integer,
+    region_count          integer,
+    avg_duration_s        double precision,
+    active_seconds_7d     numeric,
+    compute_share_pct     numeric,
+    projected             numeric,
+    measured              numeric,
+    divergence            numeric,
+    divergence_flag       boolean,
+    projected_raw         numeric,
+    measured_raw          numeric,
+    run_count_7d          integer,
+    confirmation_count_7d integer,
+    sandbox_count_7d      integer,
+    run_count_recent      integer,
+    run_count_prior       integer
+)
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT check_id, source_key, check_name, kind, interval_seconds, region_count, avg_duration_s,
+           active_seconds_7d, compute_share_pct, projected, measured, divergence, divergence_flag,
+           projected_raw, measured_raw, run_count_7d, confirmation_count_7d, sandbox_count_7d,
+           run_count_recent, run_count_prior
+      FROM cost_projection(p_rate, 0::numeric, NULL::numeric)
+$$;
+
 
 -- azure_cost (0090) — single-row cache of what the runner PULLS from Azure Cost Management (rollup job,
 -- azureCost.ts): MTD actual + Azure's own forecast for the RG scope. The cost panel DISPLAYS this (not a

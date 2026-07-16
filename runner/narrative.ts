@@ -11,7 +11,7 @@
 // Opt-in on AZURE_OPENAI_* (same as RCA): absent => the job no-ops (Layer 3 dark, zero cost).
 import { pool } from './db.js';
 import { aoaiConfigured, chatCompletionContent, extractJson, DEFAULT_DEPLOYMENT } from './aoai.js';
-import { costRatePerActiveSecond } from './costModel.js';
+import { costRatePerActiveSecond, freeGrantDollars, reconcileTargetMonthly } from './costModel.js';
 
 const WINDOW = '7d';
 const WINDOW_DAYS = 7;
@@ -45,7 +45,8 @@ export interface IncidentFact {
  *  /reports/cost by construction. divergence = measured/projected (null when projected 0). */
 export interface CostFact {
   name: string;
-  sharePct: number | null; // ★ 0089: this monitor's share of FLEET measured compute (active-seconds) — the ATTRIBUTABLE metric; null when no monitor ran in the window
+  estimatedMonthly: number | null; // ★ 0091: the PRIMARY per-monitor $ — free-grant-aware, Σ = the reconcile anchor; null when no runs
+  sharePct: number | null; // 0089: this monitor's share of FLEET measured compute (active-seconds) — the SECONDARY metric; null when no monitor ran
   projected: number;
   measured: number;
   divergence: number | null;
@@ -192,12 +193,15 @@ const costRate = costRatePerActiveSecond;
 async function costFacts(checkId: number | null, startDay: string, endDay: string): Promise<CostFacts | null> {
   try {
     const cost = await pool.query<{
-      check_id: string; check_name: string; compute_share_pct: string | null; projected: string; measured: string;
+      check_id: string; check_name: string; estimated_monthly: string | null; compute_share_pct: string | null;
+      projected: string; measured: string;
       divergence: string | null; divergence_flag: boolean; projected_raw: string; measured_raw: string;
     }>(
-      `SELECT check_id, check_name, compute_share_pct, projected, measured, divergence, divergence_flag, projected_raw, measured_raw
-         FROM cost_projection($1::numeric)`,
-      [costRate()],
+      // ★ 0091: the free-grant-aware 3-param model. estimated_monthly is the PRIMARY per-monitor $ (Σ = the
+      // reconcile anchor: coalesce(target, grant-corrected fleet)); compute_share_pct is the SECONDARY share.
+      `SELECT check_id, check_name, estimated_monthly, compute_share_pct, projected, measured, divergence, divergence_flag, projected_raw, measured_raw
+         FROM cost_projection($1::numeric, $2::numeric, $3::numeric)`,
+      [costRate(), freeGrantDollars(), reconcileTargetMonthly()],
     );
     if (cost.rows.length === 0) return null;
     const av = await pool.query<{ check_id: string; pct: string | null }>(
@@ -210,6 +214,7 @@ async function costFacts(checkId: number | null, startDay: string, endDay: strin
       id: r.check_id,
       fact: {
         name: r.check_name,
+        estimatedMonthly: r.estimated_monthly == null ? null : Number(r.estimated_monthly),
         sharePct: r.compute_share_pct == null ? null : Number(r.compute_share_pct),
         projected: Number(r.projected),
         measured: Number(r.measured),
