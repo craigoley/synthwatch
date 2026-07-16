@@ -212,6 +212,9 @@ param rcaMaxTokens string = '4000'
 @description('Verified ACS sender for alert emails (ALERT_EMAIL_FROM). NON-secret — a property of the ACS-owned domain, set once here; the ACS connection string stays out-of-band (secret).')
 param alertEmailFrom string = 'donotreply@0ad660ff-ac71-4b63-a5f6-ce885666c796.azurecomm.net'
 
+@description('Recipient mailbox for the notification CANARY probe (CANARY_EMAIL_TO on the runner jobs). A deliverability sink the operator does NOT watch: a healthy canary lands here (recorded, never paged); failures/staleness page the DB-managed critical channels instead. OPTIONAL — empty default => the email canary is off (surfaced as a throttled canary-misconfigured runner_errors row, never a silent gap). Supply a mailbox to activate it. NON-secret (like alertEmailFrom), kept out of git; set via deploy param or ~/.synthwatch.env. See runner/canary.ts.')
+param canaryEmailTo string = ''
+
 @description('Recipient address for the EXTERNAL fleet-liveness alerts (the Action Group below). An operator email — NOT a secret, but deliberately NOT committed (the repo keeps recipients out of git; the runner\'s own recipients are DB-managed). Supplied at deploy like postgresAdminPassword: scripts/deploy.sh sources it from ~/.synthwatch.env as ALERT_RECIPIENT_EMAIL. No default → a deploy without it fails fast rather than creating an Action Group that notifies nobody.')
 param alertRecipientEmail string
 
@@ -700,6 +703,13 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
               value: alertEmailFrom
             }
             {
+              // Notification-canary probe recipient (CANARY_EMAIL_TO). A deliverability sink the operator does
+              // NOT watch: a healthy canary lands here (recorded, never paged). Empty => the email canary is
+              // off (surfaced as a canary-misconfigured runner_errors row). See runner/canary.ts.
+              name: 'CANARY_EMAIL_TO'
+              value: canaryEmailTo
+            }
+            {
               // ACS email transport (secret) — from the bicep-owned secret above, so a
               // redeploy PRESERVES it instead of wiping it (ends the recurring defect).
               name: 'ACS_EMAIL_CONNECTION_STRING'
@@ -906,6 +916,13 @@ resource centralusJob 'Microsoft.App/jobs@2024-03-01' = {
               value: alertEmailFrom
             }
             {
+              // Notification-canary probe recipient (CANARY_EMAIL_TO). A deliverability sink the operator does
+              // NOT watch: a healthy canary lands here (recorded, never paged). Empty => the email canary is
+              // off (surfaced as a canary-misconfigured runner_errors row). See runner/canary.ts.
+              name: 'CANARY_EMAIL_TO'
+              value: canaryEmailTo
+            }
+            {
               // ACS email transport (secret) — from the bicep-owned secret above, so a
               // redeploy PRESERVES it instead of wiping it (ends the recurring defect).
               name: 'ACS_EMAIL_CONNECTION_STRING'
@@ -1099,6 +1116,13 @@ resource westus2Job 'Microsoft.App/jobs@2024-03-01' = {
               // Email sender — non-secret transport property, template-owned (see the eastus2 job).
               name: 'ALERT_EMAIL_FROM'
               value: alertEmailFrom
+            }
+            {
+              // Notification-canary probe recipient (CANARY_EMAIL_TO). A deliverability sink the operator does
+              // NOT watch: a healthy canary lands here (recorded, never paged). Empty => the email canary is
+              // off (surfaced as a canary-misconfigured runner_errors row). See runner/canary.ts.
+              name: 'CANARY_EMAIL_TO'
+              value: canaryEmailTo
             }
             {
               // ACS email transport (secret) — from the bicep-owned secret above, so a

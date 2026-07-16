@@ -16,28 +16,10 @@ import {
   type AlertPayload,
 } from './alerts.js';
 
-// ★ CANARY (0082): re-enqueue a scheduled test-send if the last one is older than this. The notifier is
-// otherwise the only unmonitored component — 27 incidents opened and nothing had ever PROVEN a channel
-// delivers. A canary that reds (writes runner_errors on failure, below) fixes that.
-const CANARY_INTERVAL_MS = 20 * 60 * 60 * 1000; // ~daily, with slack so a missed tick still fires next day
-
-/**
- * If no channel test-send has been requested within CANARY_INTERVAL_MS, enqueue one per enabled channel.
- * Delivered on the next drainTestSends through the REAL dispatch path; a failure writes runner_errors (see
- * finish()). Best-effort + idempotent-enough: a rare duplicate canary across region runners is harmless.
- */
-export async function maybeEnqueueCanary(): Promise<number> {
-  const { rows } = await pool.query<{ last: Date | null }>(
-    `SELECT max(requested_at) AS last FROM test_send_requests`,
-  );
-  const last = rows[0]?.last;
-  if (last && Date.now() - new Date(last).getTime() < CANARY_INTERVAL_MS) return 0;
-  const { rowCount } = await pool.query(
-    `INSERT INTO test_send_requests (channel_id) SELECT id FROM channels WHERE enabled`,
-  );
-  if (rowCount) console.log(`[canary] enqueued ${rowCount} scheduled channel canary send(s)`);
-  return rowCount ?? 0;
-}
+// ★ The scheduled notification CANARY moved to canary.ts (0088) — it no longer enqueues [TEST] sends to every
+// channel here. It now delivers a deliverability probe to CANARY_EMAIL_TO, records the evidence row, and
+// EMAILS only on FAILURE (+ a staleness guard). drainTestSends below stays USER-initiated test-sends only:
+// a "test this channel" request from the dashboard, which SHOULD deliver to that channel's recipients.
 
 /** A [TEST] alert payload — checkId 0, no incident; only the content is flagged test. */
 function testPayload(channelName: string): AlertPayload {
