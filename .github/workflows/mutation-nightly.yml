@@ -1,7 +1,9 @@
 name: Mutation nightly (full)
 
 # ★ Nightly FULL mutation over all 6 modules (~50-60 min). Two jobs it does that the PR gate can't:
-#   1. Refreshes the --incremental cache the PR gate restores (so PRs stay at ~1-2 min).
+#   1. WARMS the --incremental cache the PR gate restores (so PRs stay at ~1-2 min). ★ It only actually warms
+#      it because it now runs `--full-refresh` (incremental:true) — Stryker writes the cache ONLY in that mode.
+#      The bare invocation it used before wrote nothing, so every saved cache was empty and every PR ran full.
 #   2. Catches a regression the incremental gate might miss (a change that lowers a mutant far from the diff),
 #      and OPENS AN ISSUE — non-blocking, because nightly failures shouldn't wedge the merge queue.
 
@@ -45,9 +47,14 @@ jobs:
           for i in $(seq 1 30); do PGPASSWORD=pg psql -h 127.0.0.1 -p 5544 -U postgres -d synthwatch -c 'select 1' >/dev/null 2>&1 && break; sleep 1; done
           PGPASSWORD=pg psql -h 127.0.0.1 -p 5544 -U postgres -d synthwatch -c "SET check_function_bodies=false;" -f ../db/schema.sql >/dev/null
           for f in $(ls ../db/migrations/*.sql | sort); do PGPASSWORD=pg psql -h 127.0.0.1 -p 5544 -U postgres -d synthwatch -c "SET check_function_bodies=false;" -f "$f" >/dev/null; done
-      - name: Full mutation — ${{ matrix.module }}
+      - name: Full mutation — ${{ matrix.module }} (--full-refresh, full sweep + persist the cache)
         id: mut
-        run: bash scripts/mutation.sh ${{ matrix.module }}
+        # ★ --full-refresh, NOT bare: the bare invocation set incremental:false, and Stryker only WRITES the
+        #   cache when incremental:true — so the nightly saved a ~200-byte EMPTY cache and every PR restored
+        #   empty and re-ran the FULL module (evaluate = 55 min). --full-refresh clears the incremental file
+        #   (so this stays a true full sweep of every mutant — catches drift far from any diff) then runs with
+        #   incremental ENABLED so the ~100KB+ cache below is a REAL one the PR gate can reuse.
+        run: bash scripts/mutation.sh ${{ matrix.module }} --full-refresh
       # Persist the refreshed incremental cache for tomorrow's PRs.
       - name: Save mutation incremental cache
         if: always()

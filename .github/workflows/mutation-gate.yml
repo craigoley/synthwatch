@@ -4,10 +4,15 @@ name: Mutation gate (PR)
 # entirely unpinned (#307: you could have changed the rule that wakes a human and no test would have died) and
 # the rca redaction seam (#306). This makes it CONTINUOUS: the next PR to touch these modules is protected.
 #
-# Per-module, --incremental: Stryker re-tests only the mutants in changed code, so a PR touching ~30 LOC of
-# evaluate.ts pays ~1-2 min, not the full run. Each module FAILS below its own ratcheting break threshold
-# (scripts/mutation.sh) — a single global floor would let retry.ts (100%, zero survivors) rot to 20%.
-# The incremental cache is warmed by the nightly (mutation-nightly.yml) and restored here.
+# Two-layer cost control:
+#   1. SCOPE (the `detect` job): mutate only the modules whose source/test files this PR changed. A PR
+#      touching only reconcile.ts runs ONE job; a mapper/doc PR runs ZERO. Fail-safe → all 6 on any doubt.
+#   2. --incremental: for each selected module, Stryker restores the nightly's cache and re-tests only the
+#      mutants in changed code (~1-2 min), not the full module. Each FAILS below its own ratcheting break
+#      threshold (scripts/mutation.sh) — a single global floor would let retry.ts (100%) rot to 20%.
+# ★ The incremental cache is warmed by the nightly (mutation-nightly.yml, --full-refresh) and restored here.
+#   Both layers depend on that cache being REAL: before the --full-refresh fix the nightly saved an empty
+#   cache, so layer 2 silently re-ran full (evaluate = 55 min) no matter how well layer 1 scoped.
 
 on:
   pull_request:
@@ -20,13 +25,63 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # ★ Scope the matrix to only the modules this PR can actually affect. A PR touching only reconcile.ts runs
+  #   ONE job; a PR touching a mapper/doc (no gated file) runs ZERO jobs (near-instant). The nightly's warm
+  #   cache makes each selected job ~1-2 min, so the whole gate is now a couple of minutes, not 30-55.
+  # ★★ FAIL-SAFE: ANY doubt — diff error, --deps error, or a change to the gate's own logic (mutation.sh) —
+  #   runs ALL 6. A scoping bug MUST fail toward MORE coverage: a PR that silently skips the mutation gate
+  #   because change-detection broke is exactly the vacuous-pass this gate exists to prevent.
+  detect:
+    name: mutation scope
+    runs-on: ubuntu-latest
+    outputs:
+      modules: ${{ steps.scope.outputs.modules }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0   # need base+head history to diff the PR's real changes
+      - id: scope
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          ALL='["retry","transientClass","traceSignals","rca","evaluate","reconcile"]'
+          fail_safe() { echo "$1 → running ALL 6 (fail-safe: scope toward MORE coverage)"; echo "modules=$ALL" >> "$GITHUB_OUTPUT"; exit 0; }
+
+          git rev-parse -q --verify "${BASE_SHA}^{commit}" >/dev/null 2>&1 || git fetch -q --no-tags origin "$BASE_SHA" >/dev/null 2>&1 || true
+          CHANGED="$(git diff --name-only "${BASE_SHA}...${HEAD_SHA}" 2>/dev/null)" || fail_safe "git diff failed"
+          [ -n "$CHANGED" ] || fail_safe "empty diff (unexpected on a triggered PR)"
+          echo "changed files:"; printf '%s\n' "$CHANGED" | sed 's/^/  /'
+
+          # A change to the gate's OWN logic (mutation.sh — which also generates the stryker config) can shift
+          # ANY module's mutants, so mutate everything. This is also what keeps --deps drift-proof: editing
+          # CMD/MUTATE in mutation.sh forces all 6, and every other PR reads --deps live from the same file.
+          if grep -qxF 'runner/scripts/mutation.sh' <<<"$CHANGED"; then
+            fail_safe "gate logic (mutation.sh) changed"
+          fi
+
+          # Per-module: run a module's job iff one of its source/test files (from `mutation.sh <m> --deps`)
+          # is in the diff. --deps is the single source of truth, read live — no hardcoded map to drift.
+          selected='[]'
+          for m in retry transientClass traceSignals rca evaluate reconcile; do
+            deps="$(bash runner/scripts/mutation.sh "$m" --deps)" || fail_safe "mutation.sh --deps failed for $m"
+            if grep -qxFf <(printf '%s\n' "$deps") <(printf '%s\n' "$CHANGED"); then
+              selected="$(jq -cn --argjson s "$selected" --arg m "$m" '$s + [$m]')"
+            fi
+          done
+          echo "selected modules: $selected"
+          echo "modules=$selected" >> "$GITHUB_OUTPUT"
+
   mutate:
     name: mutation ${{ matrix.module }}
+    needs: detect
+    if: needs.detect.outputs.modules != '[]'   # no gated file changed → no jobs, near-instant
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        module: [retry, transientClass, traceSignals, rca, evaluate, reconcile]
+        module: ${{ fromJSON(needs.detect.outputs.modules) }}
     services:
       postgres:
         image: postgres:16
