@@ -1039,7 +1039,15 @@ export async function maybeBurnAlert(check: Check): Promise<void> {
         summary,
         runId: null, // budget-level, not tied to a single run (no bogus "Run #0")
       },
-      await resolveChannels(check.id, check.severity),
+      // ★ Resolve the channels at the ALERT's OWN severity (the BURN severity), NOT check.severity —
+      // the same invariant the recovery path states at the top of this file: the severity you DISPATCH at
+      // must be the severity you RESOLVE at. resolveChannels picks the severity-default route with
+      // `alert_routes.severity = $2 AND check_id IS NULL`, so passing check.severity routed a SLOW burn
+      // (warning-class) to the CRITICAL channel — check.severity is 'critical' for nearly every check, so
+      // a warning-class budget ticket paged on-call at 3am — and a FAST burn on a warning-severity check
+      // under-paged to the warning route. Per-check + tag routes are severity-independent unions and were
+      // never affected, which is why this mis-routed quietly instead of failing loudly.
+      await resolveChannels(check.id, severity),
     );
     await pool.query(`UPDATE checks SET last_burn_notified_at = now() WHERE id = $1`, [check.id]);
     console.log(`[runner] check ${check.id} "${check.name}" SLO ${label} alert (burn ${burn.toFixed(1)}x/${windowLabel})`);
