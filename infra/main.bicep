@@ -519,6 +519,8 @@ param sandboxReplicaTimeout int = 180
 
 // Storage Blob Data Contributor (built-in) — granted to the sandbox MI on its OWN container only (below).
 var storageBlobDataContributorRoleId = 'ba92f5b4-2d11-453d-a403-e96b0029c9fe'
+// Storage Blob Data Reader (built-in) — the API MI's read on the sandbox container (the GET poll), below.
+var storageBlobDataReaderRoleId = '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'
 
 resource sandboxIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: sandboxIdentityName
@@ -553,6 +555,21 @@ resource sandboxBlobWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' 
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', storageBlobDataContributorRoleId)
     principalId: sandboxIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+// ★ Blob READ for the API MI, SCOPED TO THE SANDBOX CONTAINER ONLY — GET /api/preview/{token} polls the sandbox
+//   job's trace result here. Container-scoped, NOT account-scoped: an account-scoped read would let the API MI
+//   read the prod synthwatch-artifacts traces, which the poll never needs. READER (not Contributor): the API
+//   only reads the sandbox's output; it never writes this container. This is on the API MI, DISTINCT from the
+//   sandbox MI's grants — so it does NOT change verify_sandbox_least_privilege's exact-two set for the sandbox.
+resource apiSandboxBlobReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(sandboxContainer.id, apiManagedIdentityPrincipalId, storageBlobDataReaderRoleId)
+  scope: sandboxContainer
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', storageBlobDataReaderRoleId)
+    principalId: apiManagedIdentityPrincipalId
     principalType: 'ServicePrincipal'
   }
 }

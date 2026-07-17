@@ -794,7 +794,7 @@ reconcile_resources() {
 # An UNKNOWN principal/scope token FLUNKS (never silently skips) so a new assignment can't slip past
 # unasserted. Sets ok/flunk via the same check() plumbing as the rest of verify().
 verify_rbac() {
-  local tmpl sub_id p_api id_name storage_acct acr_name rows
+  local tmpl sub_id p_api id_name storage_acct acr_name rows sandbox_id_name sandbox_container
   tmpl="$(cat "${TEMPLATE}" 2>/dev/null || true)"
   if [[ -z "${tmpl}" ]]; then flunk "rbac: could not read the template ${TEMPLATE}"; return; fi
   sub_id="$(az account show --query id -o tsv 2>/dev/null || true)"
@@ -803,6 +803,8 @@ verify_rbac() {
   id_name="$(printf '%s' "${tmpl}" | bicep_param identityName)"
   storage_acct="$(printf '%s' "${tmpl}" | bicep_param storageAccountName)"
   acr_name="$(printf '%s' "${tmpl}" | bicep_param acrName)"
+  sandbox_id_name="$(printf '%s' "${tmpl}" | bicep_param sandboxIdentityName)"      # sandbox preview grants
+  sandbox_container="$(printf '%s' "${tmpl}" | bicep_param sandboxContainerName)"
   rows="$(printf '%s' "${tmpl}" | role_assignments_from_template)"
   if [[ -z "${rows}" ]]; then flunk "rbac: template declares NO role assignments (parser broke or bicep changed shape)"; return; fi
 
@@ -816,6 +818,7 @@ verify_rbac() {
     case "${principalTok}" in
       apiManagedIdentityPrincipalId) principalId="${p_api}" ;;
       identity.properties.principalId) principalId="$(az identity show -n "${id_name}" -g "${RG}" --query principalId -o tsv 2>/dev/null </dev/null || true)" ;;
+      sandboxIdentity.properties.principalId) principalId="$(az identity show -n "${sandbox_id_name}" -g "${RG}" --query principalId -o tsv 2>/dev/null </dev/null || true)" ;;  # sandbox preview MI
       *) flunk "rbac '${roleName}': UNKNOWN principal token '${principalTok}' — verify() needs a resolver (refusing to skip)"; continue ;;
     esac
     if [[ -z "${principalId}" ]]; then flunk "rbac '${roleName}': could not resolve principal '${principalTok}'"; continue; fi
@@ -827,6 +830,8 @@ verify_rbac() {
       centralusJob) scopeId="/subscriptions/${sub_id}/resourceGroups/${RG}/providers/Microsoft.App/jobs/${CENTRALUS_RUNNER_JOB}" ;;
       westus2Job)   scopeId="/subscriptions/${sub_id}/resourceGroups/${RG}/providers/Microsoft.App/jobs/${WESTUS2_RUNNER_JOB}" ;;
       reconcileJob) scopeId="/subscriptions/${sub_id}/resourceGroups/${RG}/providers/Microsoft.App/jobs/${RECONCILE_JOB}" ;;
+      sandboxJob)   scopeId="/subscriptions/${sub_id}/resourceGroups/${RG}/providers/Microsoft.App/jobs/synthwatch-sandbox" ;;  # sandbox preview job (literal name in bicep)
+      sandboxContainer) scopeId="/subscriptions/${sub_id}/resourceGroups/${RG}/providers/Microsoft.Storage/storageAccounts/${storage_acct}/blobServices/default/containers/${sandbox_container}" ;;  # sandbox blob container (sandboxBlobWriter + apiSandboxBlobReader)
       *) flunk "rbac '${roleName}': UNKNOWN scope token '${scopeTok}' — verify() needs a resolver (refusing to skip)"; continue ;;
     esac
     # Match (role, scope) over ALL of the principal's assignments, scope compared LOWERCASED — `az role
