@@ -880,7 +880,7 @@ verify_sandbox_least_privilege() {
   local extra=0 row
   while IFS= read -r row; do
     [[ -z "${row}" ]] && continue
-    if ! printf '%s' "${allowed}" | grep -qxF "${row}"; then
+    if ! contains_line "${row}" <<<"${allowed}"; then
       flunk "sandbox-rbac: UNEXPECTED live grant on the sandbox MI → '${row}' — ONLY AcrPull + the sandbox blob container are allowed (RCE blast-radius widened)"
       extra=1
     fi
@@ -890,7 +890,7 @@ verify_sandbox_least_privilege() {
   local missing=0
   while IFS= read -r row; do
     [[ -z "${row}" ]] && continue
-    printf '%s' "${live}" | grep -qxF "${row}" || { flunk "sandbox-rbac: MISSING expected grant '${row}'"; missing=1; }
+    contains_line "${row}" <<<"${live}" || { flunk "sandbox-rbac: MISSING expected grant '${row}'"; missing=1; }
   done <<< "${allowed}"
 
   # ★ Postgres Entra admin is NOT an RBAC role assignment (set via `az postgres`), so it never appears above.
@@ -900,7 +900,7 @@ verify_sandbox_least_privilege() {
   pg_name="$(printf '%s' "${tmpl}" | bicep_param postgresServerName 2>/dev/null || true)"
   if [[ -n "${pg_name}" ]]; then
     pg_admins="$(az postgres flexible-server ad-admin list -g "${RG}" -s "${pg_name}" --query "[].principalName" -o tsv 2>/dev/null </dev/null | tr '[:upper:]' '[:lower:]' || true)"
-    if printf '%s' "${pg_admins}" | grep -qiF "${sandbox_id_name,,}"; then
+    if grep -qiF "${sandbox_id_name,,}" <<<"${pg_admins}"; then
       flunk "sandbox-rbac: the sandbox MI is a Postgres Entra ADMIN — it must have NO DB access at all"
     fi
   fi
