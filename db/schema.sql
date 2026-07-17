@@ -874,6 +874,22 @@ CREATE OR REPLACE VIEW countable_run AS
        AND confirmation_of_run_id IS NULL
        AND NOT sandbox;
 
+-- ★ latency_sample (0092): the canonical "real measured latency sample" — a pass/warn, NON-sandbox run.
+-- Sibling of countable_run but a DELIBERATELY DIFFERENT predicate, and NOT a bug vs it (do not "unify"):
+--   • KEEPS confirmations — a confirmation's DURATION is a real measurement; the re-roll bias countable_run
+--     corrects is an AVAILABILITY problem, not a latency one, so latency counts every real sample.
+--   • EXCLUDES sandbox — a test-send must not move a reported percentile.
+--   • status IN ('pass','warn') — only runs that produced a duration (this also makes superseded moot: we
+--     only re-check failures, so a pass/warn run is essentially never superseded).
+--   • Maintenance-window exclusion stays PER-CONSUMER (contextual), like countable_run.
+-- Consumers: narrative.ts latency percentiles + synthwatch-api /reports/performance. Explicit column list
+-- (the 0083 lesson) — only what they read. See db/migrations/0092_latency_sample_view.sql for the rationale.
+CREATE OR REPLACE VIEW latency_sample AS
+    SELECT id, check_id, status, started_at, duration_ms
+      FROM runs
+     WHERE status IN ('pass', 'warn')
+       AND NOT sandbox;
+
 CREATE OR REPLACE FUNCTION sla_availability(p_from timestamptz, p_to timestamptz)
 RETURNS TABLE (
     check_id         bigint,

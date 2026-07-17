@@ -128,12 +128,16 @@ async function periodFacts(
     [checkId, startDay, endDay],
   );
   const lat = await pool.query<{ p50: number | null; p95: number | null; p99: number | null; n: string }>(
+    // ★ latency_sample (0092): pass/warn + NON-sandbox. Excludes sandbox test-sends (a test at an outlier
+    // latency must not move the reported percentile) and pins the pass/warn filter in ONE place. KEEPS
+    // confirmations by design — a confirmation's duration is a real measurement (see the view comment). The
+    // maintenance-window exclusion stays here (per-consumer, contextual), not in the view.
     `SELECT round(percentile_cont(0.5)  WITHIN GROUP (ORDER BY r.duration_ms))::int AS p50,
             round(percentile_cont(0.95) WITHIN GROUP (ORDER BY r.duration_ms))::int AS p95,
             round(percentile_cont(0.99) WITHIN GROUP (ORDER BY r.duration_ms))::int AS p99,
             count(*) AS n
-       FROM runs r
-      WHERE r.started_at >= $2 AND r.started_at < $3 AND r.status IN ('pass','warn')
+       FROM latency_sample r
+      WHERE r.started_at >= $2 AND r.started_at < $3
         AND ($1::bigint IS NULL OR r.check_id = $1)
         AND NOT EXISTS (
           SELECT 1 FROM maintenance_windows mw
