@@ -635,14 +635,20 @@ async function aggregateVerdict(check: Check): Promise<Verdict> {
  * aggregateVerdict's `failing` count (all of the recent failure_threshold runs down,
  * and reporting within STALE_LOCATION). For the alert email's "Locations" fact.
  */
-async function failingLocationNames(check: Check): Promise<string[]> {
+export async function failingLocationNames(check: Check): Promise<string[]> {
   const { rows } = await pool.query<{ location: string }>(
+    // ★ FROM countable_run — MUST match aggregateVerdict's predicate: this email names WHAT THE PAGER
+    // DECIDED. aggregateVerdict (the query that decides to open the incident) reads countable_run
+    // (non-superseded + non-confirmation + non-sandbox); reading raw `runs` here let the email name a
+    // DIFFERENT failing-location set than the decision that sent it — e.g. a location that fails a scheduled
+    // run then confirms-passes is DOWN per the verdict (the confirmation is excluded) but was OMITTED here
+    // (the raw query saw the confirmation pass as its "latest"). Same view, same window semantics, one truth.
     `WITH recent AS (
        SELECT location, status,
               row_number() OVER (PARTITION BY location ORDER BY started_at DESC) AS rn,
               max(started_at) OVER (PARTITION BY location) AS loc_last
-         FROM runs
-        WHERE check_id = $1 AND status NOT IN ('running', 'infra_error')
+         FROM countable_run
+        WHERE check_id = $1
      )
      SELECT location
        FROM recent
