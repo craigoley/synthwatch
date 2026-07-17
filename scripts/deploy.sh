@@ -46,6 +46,32 @@
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
+# ★ bash-version guard — WHY THIS EXISTS: macOS ships bash 3.2 as /bin/bash, which `#!/usr/bin/env bash`
+# resolves to on a Mac. A bash-4-only expansion (${var,,}) 'bad substitution's MID-VERIFY — the deploy
+# then prints SUCCESS while a security gate (e.g. verify_sandbox_least_privilege) silently DID NOT RUN.
+# Two layers of defense: (1) every construct in this script is audited 3.2-portable (no ${var,,}/${var^^}/
+# mapfile/declare -A); (2) this guard re-execs under a modern bash if one is installed, so a FUTURE
+# bash-4-ism can't silently skip a gate on the operator's default shell either. If no bash 4+ is found we
+# CONTINUE (the script is 3.2-portable) but say so once — never silently, never blocking a fresh Mac.
+# Same handover class as the esbuild-arm64 day-one trap.
+# ---------------------------------------------------------------------------
+if [ "${BASH_VERSINFO:-0}" -lt 4 ] && [ -z "${SW_DEPLOY_BASH_REEXEC:-}" ]; then
+  _bash4=''
+  for _cand in "$(command -v brew >/dev/null 2>&1 && printf '%s' "$(brew --prefix 2>/dev/null)/bin/bash")" \
+               /opt/homebrew/bin/bash /usr/local/bin/bash; do
+    [ -n "${_cand}" ] && [ -x "${_cand}" ] || continue
+    _v="$("${_cand}" -c 'printf %s "${BASH_VERSINFO[0]}"' 2>/dev/null || printf 0)"
+    if [ "${_v:-0}" -ge 4 ] 2>/dev/null; then _bash4="${_cand}"; break; fi
+  done
+  if [ -n "${_bash4}" ]; then
+    export SW_DEPLOY_BASH_REEXEC=1
+    exec "${_bash4}" "$0" "$@"
+  fi
+  printf '  note: running under bash %s — no bash 4+ found to re-exec under. This script is 3.2-portable, so\n' "${BASH_VERSION:-?}" >&2
+  printf '        continuing; `brew install bash` is recommended so future bash-4 features can never skip a gate.\n' >&2
+fi
+
+# ---------------------------------------------------------------------------
 # Constants — pinned to the live -e2 / eastus2 stack (see README "Re-running…").
 # ---------------------------------------------------------------------------
 readonly RG='synthwatch-rg'
@@ -870,11 +896,16 @@ verify_sandbox_least_privilege() {
   sandbox_pid="$(az identity show -n "${sandbox_id_name}" -g "${RG}" --query principalId -o tsv 2>/dev/null </dev/null || true)"
   if [[ -z "${sandbox_pid}" ]]; then flunk "sandbox-rbac: could not resolve the sandbox MI principalId (identity '${sandbox_id_name}' not deployed?)"; return; fi
 
-  # The ONLY two grants allowed, as lowercased "roleName<TAB>scope" (Azure stores mixed casing).
-  local acr_scope container_scope allowed
+  # The ONLY two grants allowed, as lowercased "roleName<TAB>scope" (Azure stores mixed casing — RG/acr/storage
+  # names may be mixed-case, and `live` below is tr-lowercased, so `allowed` must match). ★ bash 3.2: lowercase
+  # via `tr`, NEVER ${var,,} — that is a bash-4 expansion and 'bad substitution's on the macOS default shell,
+  # crashing this gate MID-VERIFY so the deploy reports SUCCESS while the gate silently did not run.
+  local acr_scope container_scope allowed acr_scope_lc container_scope_lc
   acr_scope="/subscriptions/${sub_id}/resourcegroups/${RG}/providers/microsoft.containerregistry/registries/${acr_name}"
   container_scope="/subscriptions/${sub_id}/resourcegroups/${RG}/providers/microsoft.storage/storageaccounts/${storage_acct}/blobservices/default/containers/${sandbox_container}"
-  allowed="$(printf 'acrpull\t%s\nstorage blob data contributor\t%s\n' "${acr_scope,,}" "${container_scope,,}")"
+  acr_scope_lc="$(printf '%s' "${acr_scope}" | tr '[:upper:]' '[:lower:]')"
+  container_scope_lc="$(printf '%s' "${container_scope}" | tr '[:upper:]' '[:lower:]')"
+  allowed="$(printf 'acrpull\t%s\nstorage blob data contributor\t%s\n' "${acr_scope_lc}" "${container_scope_lc}")"
 
   # ALL live assignments for the sandbox MI, lowercased "roleName<TAB>scope".
   local live
@@ -905,7 +936,7 @@ verify_sandbox_least_privilege() {
   pg_name="$(printf '%s' "${tmpl}" | bicep_param postgresServerName 2>/dev/null || true)"
   if [[ -n "${pg_name}" ]]; then
     pg_admins="$(az postgres flexible-server ad-admin list -g "${RG}" -s "${pg_name}" --query "[].principalName" -o tsv 2>/dev/null </dev/null | tr '[:upper:]' '[:lower:]' || true)"
-    if grep -qiF "${sandbox_id_name,,}" <<<"${pg_admins}"; then
+    if grep -qiF "${sandbox_id_name}" <<<"${pg_admins}"; then  # grep -i already case-folds; NO ${var,,} (bash-4)
       flunk "sandbox-rbac: the sandbox MI is a Postgres Entra ADMIN — it must have NO DB access at all"
     fi
   fi
