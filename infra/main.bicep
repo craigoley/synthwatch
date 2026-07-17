@@ -498,6 +498,134 @@ resource apiReconcileJobStart 'Microsoft.Authorization/roleAssignments@2022-04-0
   }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════
+// SANDBOX PREVIEW — the RCE-bounded, LOW-PRIVILEGE box for preview-running an UPLOADED, UNMERGED spec. A spec is
+// arbitrary Node at runner privilege (runner/specfetch/compileSpec.ts's RCE boundary) WITHOUT the monitors-repo
+// merge gate, so it runs under a SEPARATE identity that has NOTHING to steal and nowhere to write:
+//   • its own MI (NOT synthwatch-runner-id — no Postgres Entra admin, no DB secret, no cost reader);
+//   • a SECRET-FREE job env (no CRED_ENC_KEY, no prod database-url, no ACS) — the two prove-can-fails
+//     (runner/sandbox/sandboxIsolation.test.ts) verify a hostile spec sees no secret and can't reach the DB;
+//   • AcrPull only, and Blob write to a DEDICATED sandbox container ONLY — never prod traces, never the DB.
+// The only path to a REAL monitor stays the repo PR. Pass-1 unauth-only (no test-cred store — a later gated tier).
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════
+@description('User-assigned MI for the sandbox preview job — DELIBERATELY separate from synthwatch-runner-id, minimal RBAC.')
+param sandboxIdentityName string = 'synthwatch-sandbox-id'
+
+@description('Sandbox artifacts blob container — the sandbox identity\'s ONLY storage grant, separate from synthwatch-artifacts so a hostile preview can never touch prod traces.')
+param sandboxContainerName string = 'synthwatch-sandbox'
+
+@description('Sandbox job hard wall-clock timeout (s) — the DoS-on-your-own-bill guard; mirrors runSandboxPreview\'s SANDBOX_DEFAULT_TIMEOUT_MS.')
+param sandboxReplicaTimeout int = 180
+
+// Storage Blob Data Contributor (built-in) — granted to the sandbox MI on its OWN container only (below).
+var storageBlobDataContributorRoleId = 'ba92f5b4-2d11-453d-a403-e96b0029c9fe'
+
+resource sandboxIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
+  name: sandboxIdentityName
+  location: location
+}
+
+// AcrPull ONLY — pull the shared runner image. No other registry rights.
+resource sandboxAcrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(acr.id, sandboxIdentity.id, acrPullRoleId)
+  scope: acr
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', acrPullRoleId)
+    principalId: sandboxIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+// A dedicated container for the sandbox's throwaway trace output — the sandbox MI's ONLY data-plane grant.
+resource sandboxContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {
+  parent: blobService
+  name: sandboxContainerName
+  properties: {
+    publicAccess: 'None'
+  }
+}
+
+// ★ Blob write SCOPED TO THE SANDBOX CONTAINER ONLY (not the account, not synthwatch-artifacts) — so even a
+//   fully-hostile preview can only touch its own throwaway container, never the prod traces and never the DB.
+resource sandboxBlobWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(sandboxContainer.id, sandboxIdentity.id, storageBlobDataContributorRoleId)
+  scope: sandboxContainer
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', storageBlobDataContributorRoleId)
+    principalId: sandboxIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+// The sandbox job — Manual trigger (api-started per preview), the sandbox identity, a SECRET-FREE env.
+resource sandboxJob 'Microsoft.App/jobs@2024-03-01' = {
+  name: 'synthwatch-sandbox'
+  location: location
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${sandboxIdentity.id}': {}
+    }
+  }
+  properties: {
+    environmentId: managedEnvironment.id
+    configuration: {
+      triggerType: 'Manual' // ★ event-triggered by the api per preview — never a cron.
+      replicaTimeout: sandboxReplicaTimeout // ★ hard kill — bounds runaway/hostile code.
+      replicaRetryLimit: 0 // a preview never retries.
+      manualTriggerConfig: {
+        parallelism: 1
+        replicaCompletionCount: 1
+      }
+      registries: [
+        {
+          server: acr.properties.loginServer
+          identity: sandboxIdentity.id
+        }
+      ]
+      // ★ NO `secrets:` block — deliberately absent. A secretRef here would defeat the isolation boundary.
+    }
+    template: {
+      containers: [
+        {
+          name: 'sandbox'
+          image: runnerImage
+          command: [ 'node' ]
+          args: [ 'dist/sandbox/sandboxMain.js' ]
+          resources: {
+            cpu: json('1.0')
+            memory: '2.0Gi'
+          }
+          // ★ ALLOWLIST env — only non-secret vars. The spec + target are injected per-run by the api on
+          //   jobs/start (SW_SANDBOX_SPEC_B64 / SW_SANDBOX_TARGET_URL); NOTHING sensitive is baked in.
+          env: [
+            {
+              name: 'SW_SANDBOX'
+              value: '1'
+            }
+            {
+              name: 'SANDBOX_CONTAINER'
+              value: sandboxContainerName
+            }
+          ]
+        }
+      ]
+    }
+  }
+}
+
+// Let the API MI START the sandbox job (jobs/start), scoped to JUST this job — same least-privilege pattern as
+// apiRunnerJobStart / apiReconcileJobStart. The api gates the trigger (AuthGate editor/admin + rate/concurrency).
+resource apiSandboxJobStart 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(sandboxJob.id, apiManagedIdentityPrincipalId, jobsOperatorRoleId)
+  scope: sandboxJob
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', jobsOperatorRoleId)
+    principalId: apiManagedIdentityPrincipalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
 // ★ CONFIRMATION-RETRY (0077 / D1): let the RUNNER's own managed identity START the runner job it is running as
 // (its `jobs/start` ARM call for a failed browser/multistep check's confirmation run — a dedicated fresh
 // execution with the full 660s to itself). One assignment per regional runner job, each scoped to JUST that job
