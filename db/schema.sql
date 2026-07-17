@@ -637,6 +637,28 @@ CREATE INDEX run_requests_pending_idx ON run_requests (requested_at) WHERE statu
 -- Idempotency: at most one pending request per check (re-clicks coalesce).
 CREATE UNIQUE INDEX run_requests_one_pending_per_check ON run_requests (check_id) WHERE status = 'pending';
 
+-- sandbox_preview (0093): the lifecycle + AUDIT record for a spec preview-run (POST /api/preview). ★ Written by
+-- the API, NOT the sandbox job (the synthwatch-sandbox ACA job is DB-less by design — part of its low-priv
+-- shape). The API INSERTs 'running', starts the job, then UPDATEs on completion. ★ Stores the spec SHA-256, NOT
+-- the body (retention: the body rides an ephemeral env override to the sandbox; the trace lives in the TTL'd
+-- sandbox-artifacts blob). See db/migrations/0093_sandbox_preview.sql.
+CREATE TABLE sandbox_preview (
+    id            BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    token         TEXT        NOT NULL UNIQUE,   -- opaque result token (API-generated); names the blob + the GET poll
+    actor_email   TEXT        NOT NULL,          -- WHO (IAuthPrincipal) — audit actor + per-user rate-limit key
+    actor_ip      TEXT,
+    spec_sha256   TEXT        NOT NULL,          -- WHAT (the hash, never the body)
+    target_url    TEXT        NOT NULL,
+    status        TEXT        NOT NULL DEFAULT 'running'
+                              CHECK (status IN ('running', 'done', 'failed', 'timeout')),
+    requested_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at  TIMESTAMPTZ,
+    exit_code     INTEGER,
+    error         TEXT
+);
+CREATE INDEX sandbox_preview_actor_idx ON sandbox_preview (actor_email, requested_at DESC);
+CREATE INDEX sandbox_preview_running_idx ON sandbox_preview (requested_at) WHERE status = 'running';
+
 -- ---------------------------------------------------------------------------
 -- flow_manifest: available browser flows (mirrors 0009_flow_manifest.sql).
 -- Populated by the runner (it discovers its own flow modules at tick start and
