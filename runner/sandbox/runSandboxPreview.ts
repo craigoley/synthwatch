@@ -60,17 +60,34 @@ export async function runSandboxPreview(
 
 function runChild(specFile: string, vars: SandboxRunVars): Promise<PreviewResult> {
   return new Promise((resolve) => {
+    let stdout = '';
+    let stderr = '';
+    let timedOut = false;
+    // ★ detached — the child leads its OWN process group, so the timeout kill reaps grandchildren too
+    //   (a hostile spec that spawns a detached grandchild cannot outlive the budget by escaping its parent).
     const child = spawn(process.execPath, [CHILD_ENTRY, specFile], {
       env: buildSandboxEnv(vars), // ★ allowlist — the child NEVER inherits the parent's secrets
       cwd: tmpdir(),
       stdio: ['ignore', 'pipe', 'pipe'],
+      detached: true,
     });
-    let stdout = '';
-    let stderr = '';
-    let timedOut = false;
+
+    // ★ hard kill the whole process GROUP — a runaway/infinite spec (or a detached grandchild it spawned)
+    //   cannot outlive the budget. `-pid` targets the group; fall back to the direct child if pid is unset.
+    const hardKill = (): void => {
+      if (typeof child.pid === 'number') {
+        try {
+          process.kill(-child.pid, 'SIGKILL');
+          return;
+        } catch {
+          /* group already gone (ESRCH) or unsupported — fall through to the direct-child kill */
+        }
+      }
+      child.kill('SIGKILL');
+    };
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill('SIGKILL'); // ★ hard kill — a runaway/infinite spec cannot outlive the budget
+      hardKill();
     }, vars.timeoutMs);
 
     child.stdout.on('data', (d) => {
@@ -78,6 +95,12 @@ function runChild(specFile: string, vars: SandboxRunVars): Promise<PreviewResult
     });
     child.stderr.on('data', (d) => {
       stderr += d;
+    });
+    // ★ spawn failure (EMFILE/ENOMEM under load, a bad CHILD_ENTRY path) emits 'error' — WITHOUT this listener
+    //   Node re-throws it as uncaught, 'close' never fires, and the promise (plus the temp dir) hangs forever.
+    child.on('error', (e) => {
+      clearTimeout(timer);
+      resolve({ ok: false, tests: [], stdout, stderr: stderr + `sandbox spawn error: ${e.message}\n`, timedOut, exitCode: null });
     });
     child.on('close', (code) => {
       clearTimeout(timer);

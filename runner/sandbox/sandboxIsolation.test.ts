@@ -64,9 +64,12 @@ test('★ a spec that dumps process.env sees NO prod secret (allowlist env, not 
 });
 
 // ── PROVE-CAN-FAIL 2: a spec cannot reach or write the prod DB ──────────────────────────────────────────
-test('★ a spec cannot reach the prod DB — DATABASE_URL is absent, and a Postgres client cannot even be imported', async () => {
+test('★ a spec cannot locate or authenticate to the prod DB — DATABASE_URL/creds are absent (and the DB client cannot be imported)', async () => {
   await withPlantedSecrets(async () => {
-    // (a) DATABASE_URL is not in the child env — you cannot write a DB you cannot locate or authenticate to.
+    // (a) THE REAL DEFENSE: DATABASE_URL (and every cred) is absent from the child env — you cannot reach a DB
+    //     you cannot locate or authenticate to. NB: node:net/node:tls remain available, so the compile gate is
+    //     NOT a network boundary — a hostile spec could speak the Postgres wire protocol raw; it just has no
+    //     host, no user, no password. Secret-absence is what holds, not the gate.
     const probe = `
       import { test } from '../../lib/flow';
       console.log('__DBURL__' + (process.env.DATABASE_URL ? 'PRESENT' : 'ABSENT'));
@@ -76,8 +79,9 @@ test('★ a spec cannot reach the prod DB — DATABASE_URL is absent, and a Post
     assert.equal(r.ok, true, `spec should load; stderr=${r.stderr}`);
     assert.ok(r.stdout.includes('__DBURL__ABSENT'), 'DATABASE_URL must be absent in the sandbox');
 
-    // (b) a spec importing a Postgres client FAILS the static gate (esbuild bundles only node built-ins +
-    //     the lib/flow alias; an npm package cannot be resolved) → it never runs at all.
+    // (b) SECONDARY (defense-in-depth, NOT a network boundary): a spec importing a Postgres client FAILS the
+    //     static gate (esbuild bundles only node built-ins + the lib/flow alias; an npm package cannot be
+    //     resolved) → the convenient path never even compiles. This raises the bar; (a) is what guarantees it.
     const dbWrite = `
       import { test } from '../../lib/flow';
       import { Pool } from 'pg';
