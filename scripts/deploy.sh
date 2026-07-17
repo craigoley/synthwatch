@@ -844,6 +844,70 @@ verify_rbac() {
   done <<< "${rows}"
 }
 
+# ★ NEGATIVE least-privilege assertion for the SANDBOX MI (the #327 silent-failure class, inverted). The
+# sandbox runs UPLOADED, UNMERGED code (RCE) — so its blast radius is exactly its grants. verify_rbac() above
+# proves the DECLARED grants are LIVE (positive); this proves NOTHING ELSE is. An EXTRA live grant — a stale
+# assignment, a manual portal change, a bicep bug that reads green — would silently widen the box. So: list
+# ALL of the sandbox MI's live role assignments and FLUNK unless the set is EXACTLY {AcrPull on the ACR,
+# Storage Blob Data Contributor on the sandbox container}. Same silent-drift class as the #327 Cost-Reader GUID
+# that failed twice while reading green — asserted against the LIVE TENANT, not just the template.
+verify_sandbox_least_privilege() {
+  local tmpl sub_id sandbox_id_name sandbox_pid acr_name storage_acct sandbox_container
+  tmpl="$(cat "${TEMPLATE}" 2>/dev/null || true)"
+  if [[ -z "${tmpl}" ]]; then flunk "sandbox-rbac: could not read the template ${TEMPLATE}"; return; fi
+  sub_id="$(az account show --query id -o tsv 2>/dev/null || true)"
+  if [[ -z "${sub_id}" ]]; then flunk "sandbox-rbac: could not resolve the subscription id"; return; fi
+  sandbox_id_name="$(printf '%s' "${tmpl}" | bicep_param sandboxIdentityName)"
+  acr_name="$(printf '%s' "${tmpl}" | bicep_param acrName)"
+  storage_acct="$(printf '%s' "${tmpl}" | bicep_param storageAccountName)"
+  sandbox_container="$(printf '%s' "${tmpl}" | bicep_param sandboxContainerName)"
+  if [[ -z "${sandbox_id_name}" ]]; then flunk "sandbox-rbac: sandboxIdentityName not in template (bicep changed shape)"; return; fi
+  sandbox_pid="$(az identity show -n "${sandbox_id_name}" -g "${RG}" --query principalId -o tsv 2>/dev/null </dev/null || true)"
+  if [[ -z "${sandbox_pid}" ]]; then flunk "sandbox-rbac: could not resolve the sandbox MI principalId (identity '${sandbox_id_name}' not deployed?)"; return; fi
+
+  # The ONLY two grants allowed, as lowercased "roleName<TAB>scope" (Azure stores mixed casing).
+  local acr_scope container_scope allowed
+  acr_scope="/subscriptions/${sub_id}/resourcegroups/${RG}/providers/microsoft.containerregistry/registries/${acr_name}"
+  container_scope="/subscriptions/${sub_id}/resourcegroups/${RG}/providers/microsoft.storage/storageaccounts/${storage_acct}/blobservices/default/containers/${sandbox_container}"
+  allowed="$(printf 'acrpull\t%s\nstorage blob data contributor\t%s\n' "${acr_scope,,}" "${container_scope,,}")"
+
+  # ALL live assignments for the sandbox MI, lowercased "roleName<TAB>scope".
+  local live
+  live="$(az role assignment list --assignee "${sandbox_pid}" --all --query "[].[roleDefinitionName, scope]" -o tsv 2>/dev/null </dev/null | tr '[:upper:]' '[:lower:]' || true)"
+
+  # ★ NEGATIVE: any live grant NOT in the allowed set is a widened blast radius reading green → FLUNK. This is
+  #   what catches a Key Vault / prod-DB / prod-storage / broader-scope grant that the positive check can't.
+  local extra=0 row
+  while IFS= read -r row; do
+    [[ -z "${row}" ]] && continue
+    if ! printf '%s' "${allowed}" | grep -qxF "${row}"; then
+      flunk "sandbox-rbac: UNEXPECTED live grant on the sandbox MI → '${row}' — ONLY AcrPull + the sandbox blob container are allowed (RCE blast-radius widened)"
+      extra=1
+    fi
+  done <<< "${live}"
+
+  # POSITIVE: both expected grants must be present (else the sandbox can't pull its image / write its trace).
+  local missing=0
+  while IFS= read -r row; do
+    [[ -z "${row}" ]] && continue
+    printf '%s' "${live}" | grep -qxF "${row}" || { flunk "sandbox-rbac: MISSING expected grant '${row}'"; missing=1; }
+  done <<< "${allowed}"
+
+  # ★ Postgres Entra admin is NOT an RBAC role assignment (set via `az postgres`), so it never appears above.
+  #   The sandbox MI must NEVER be it — assert directly. (Belt-and-braces: the sandbox job also carries no
+  #   database-url secret, so it has no connection string even if this ever regressed.)
+  local pg_name pg_admins
+  pg_name="$(printf '%s' "${tmpl}" | bicep_param postgresServerName 2>/dev/null || true)"
+  if [[ -n "${pg_name}" ]]; then
+    pg_admins="$(az postgres flexible-server ad-admin list -g "${RG}" -s "${pg_name}" --query "[].principalName" -o tsv 2>/dev/null </dev/null | tr '[:upper:]' '[:lower:]' || true)"
+    if printf '%s' "${pg_admins}" | grep -qiF "${sandbox_id_name,,}"; then
+      flunk "sandbox-rbac: the sandbox MI is a Postgres Entra ADMIN — it must have NO DB access at all"
+    fi
+  fi
+
+  [[ ${extra} -eq 0 && ${missing} -eq 0 ]] && pass "sandbox-rbac: sandbox MI has EXACTLY {AcrPull, sandbox blob container} live — no DB / Key Vault / prod-storage grant"
+}
+
 # ★ Concern A — BLOB CORS: if the template declares blob-service CORS rules, assert the LIVE blob service has
 # each declared allowed-origin. Expected origins are read FROM the template (the allowedOrigins param the
 # corsRules reference), so this stays correct as origins change. Live corsRules was `[]` before #270 — the
@@ -994,6 +1058,7 @@ verify() {
   # ★ Concern A: RBAC role assignments + blob CORS the TEMPLATE declares must be live (the memory-drop class:
   # #270's MI Storage Blob Delegator + blob CORS could silently not land while verify reported success).
   verify_rbac
+  verify_sandbox_least_privilege
   verify_cors
 
   # ★ BUG 2: EVERY job must be on the intended image — not just the runner job. A correct
