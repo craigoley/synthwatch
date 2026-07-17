@@ -794,7 +794,7 @@ reconcile_resources() {
 # An UNKNOWN principal/scope token FLUNKS (never silently skips) so a new assignment can't slip past
 # unasserted. Sets ok/flunk via the same check() plumbing as the rest of verify().
 verify_rbac() {
-  local tmpl sub_id p_api id_name storage_acct acr_name rows
+  local tmpl sub_id p_api id_name storage_acct acr_name rows sandbox_id_name sandbox_container
   tmpl="$(cat "${TEMPLATE}" 2>/dev/null || true)"
   if [[ -z "${tmpl}" ]]; then flunk "rbac: could not read the template ${TEMPLATE}"; return; fi
   sub_id="$(az account show --query id -o tsv 2>/dev/null || true)"
@@ -803,6 +803,8 @@ verify_rbac() {
   id_name="$(printf '%s' "${tmpl}" | bicep_param identityName)"
   storage_acct="$(printf '%s' "${tmpl}" | bicep_param storageAccountName)"
   acr_name="$(printf '%s' "${tmpl}" | bicep_param acrName)"
+  sandbox_id_name="$(printf '%s' "${tmpl}" | bicep_param sandboxIdentityName)"      # sandbox preview grants
+  sandbox_container="$(printf '%s' "${tmpl}" | bicep_param sandboxContainerName)"
   rows="$(printf '%s' "${tmpl}" | role_assignments_from_template)"
   if [[ -z "${rows}" ]]; then flunk "rbac: template declares NO role assignments (parser broke or bicep changed shape)"; return; fi
 
@@ -816,6 +818,7 @@ verify_rbac() {
     case "${principalTok}" in
       apiManagedIdentityPrincipalId) principalId="${p_api}" ;;
       identity.properties.principalId) principalId="$(az identity show -n "${id_name}" -g "${RG}" --query principalId -o tsv 2>/dev/null </dev/null || true)" ;;
+      sandboxIdentity.properties.principalId) principalId="$(az identity show -n "${sandbox_id_name}" -g "${RG}" --query principalId -o tsv 2>/dev/null </dev/null || true)" ;;  # sandbox preview MI
       *) flunk "rbac '${roleName}': UNKNOWN principal token '${principalTok}' — verify() needs a resolver (refusing to skip)"; continue ;;
     esac
     if [[ -z "${principalId}" ]]; then flunk "rbac '${roleName}': could not resolve principal '${principalTok}'"; continue; fi
@@ -827,6 +830,8 @@ verify_rbac() {
       centralusJob) scopeId="/subscriptions/${sub_id}/resourceGroups/${RG}/providers/Microsoft.App/jobs/${CENTRALUS_RUNNER_JOB}" ;;
       westus2Job)   scopeId="/subscriptions/${sub_id}/resourceGroups/${RG}/providers/Microsoft.App/jobs/${WESTUS2_RUNNER_JOB}" ;;
       reconcileJob) scopeId="/subscriptions/${sub_id}/resourceGroups/${RG}/providers/Microsoft.App/jobs/${RECONCILE_JOB}" ;;
+      sandboxJob)   scopeId="/subscriptions/${sub_id}/resourceGroups/${RG}/providers/Microsoft.App/jobs/synthwatch-sandbox" ;;  # sandbox preview job (literal name in bicep)
+      sandboxContainer) scopeId="/subscriptions/${sub_id}/resourceGroups/${RG}/providers/Microsoft.Storage/storageAccounts/${storage_acct}/blobServices/default/containers/${sandbox_container}" ;;  # sandbox blob container (sandboxBlobWriter + apiSandboxBlobReader)
       *) flunk "rbac '${roleName}': UNKNOWN scope token '${scopeTok}' — verify() needs a resolver (refusing to skip)"; continue ;;
     esac
     # Match (role, scope) over ALL of the principal's assignments, scope compared LOWERCASED — `az role
@@ -842,6 +847,70 @@ verify_rbac() {
       flunk "rbac: '${roleName}' MISSING live on ${scopeTok} for ${principalTok} (${principalId:0:8}…) — the bicep declares it; the deploy did NOT land it"
     fi
   done <<< "${rows}"
+}
+
+# ★ NEGATIVE least-privilege assertion for the SANDBOX MI (the #327 silent-failure class, inverted). The
+# sandbox runs UPLOADED, UNMERGED code (RCE) — so its blast radius is exactly its grants. verify_rbac() above
+# proves the DECLARED grants are LIVE (positive); this proves NOTHING ELSE is. An EXTRA live grant — a stale
+# assignment, a manual portal change, a bicep bug that reads green — would silently widen the box. So: list
+# ALL of the sandbox MI's live role assignments and FLUNK unless the set is EXACTLY {AcrPull on the ACR,
+# Storage Blob Data Contributor on the sandbox container}. Same silent-drift class as the #327 Cost-Reader GUID
+# that failed twice while reading green — asserted against the LIVE TENANT, not just the template.
+verify_sandbox_least_privilege() {
+  local tmpl sub_id sandbox_id_name sandbox_pid acr_name storage_acct sandbox_container
+  tmpl="$(cat "${TEMPLATE}" 2>/dev/null || true)"
+  if [[ -z "${tmpl}" ]]; then flunk "sandbox-rbac: could not read the template ${TEMPLATE}"; return; fi
+  sub_id="$(az account show --query id -o tsv 2>/dev/null || true)"
+  if [[ -z "${sub_id}" ]]; then flunk "sandbox-rbac: could not resolve the subscription id"; return; fi
+  sandbox_id_name="$(printf '%s' "${tmpl}" | bicep_param sandboxIdentityName)"
+  acr_name="$(printf '%s' "${tmpl}" | bicep_param acrName)"
+  storage_acct="$(printf '%s' "${tmpl}" | bicep_param storageAccountName)"
+  sandbox_container="$(printf '%s' "${tmpl}" | bicep_param sandboxContainerName)"
+  if [[ -z "${sandbox_id_name}" ]]; then flunk "sandbox-rbac: sandboxIdentityName not in template (bicep changed shape)"; return; fi
+  sandbox_pid="$(az identity show -n "${sandbox_id_name}" -g "${RG}" --query principalId -o tsv 2>/dev/null </dev/null || true)"
+  if [[ -z "${sandbox_pid}" ]]; then flunk "sandbox-rbac: could not resolve the sandbox MI principalId (identity '${sandbox_id_name}' not deployed?)"; return; fi
+
+  # The ONLY two grants allowed, as lowercased "roleName<TAB>scope" (Azure stores mixed casing).
+  local acr_scope container_scope allowed
+  acr_scope="/subscriptions/${sub_id}/resourcegroups/${RG}/providers/microsoft.containerregistry/registries/${acr_name}"
+  container_scope="/subscriptions/${sub_id}/resourcegroups/${RG}/providers/microsoft.storage/storageaccounts/${storage_acct}/blobservices/default/containers/${sandbox_container}"
+  allowed="$(printf 'acrpull\t%s\nstorage blob data contributor\t%s\n' "${acr_scope,,}" "${container_scope,,}")"
+
+  # ALL live assignments for the sandbox MI, lowercased "roleName<TAB>scope".
+  local live
+  live="$(az role assignment list --assignee "${sandbox_pid}" --all --query "[].[roleDefinitionName, scope]" -o tsv 2>/dev/null </dev/null | tr '[:upper:]' '[:lower:]' || true)"
+
+  # ★ NEGATIVE: any live grant NOT in the allowed set is a widened blast radius reading green → FLUNK. This is
+  #   what catches a Key Vault / prod-DB / prod-storage / broader-scope grant that the positive check can't.
+  local extra=0 row
+  while IFS= read -r row; do
+    [[ -z "${row}" ]] && continue
+    if ! contains_line "${row}" <<<"${allowed}"; then
+      flunk "sandbox-rbac: UNEXPECTED live grant on the sandbox MI → '${row}' — ONLY AcrPull + the sandbox blob container are allowed (RCE blast-radius widened)"
+      extra=1
+    fi
+  done <<< "${live}"
+
+  # POSITIVE: both expected grants must be present (else the sandbox can't pull its image / write its trace).
+  local missing=0
+  while IFS= read -r row; do
+    [[ -z "${row}" ]] && continue
+    contains_line "${row}" <<<"${live}" || { flunk "sandbox-rbac: MISSING expected grant '${row}'"; missing=1; }
+  done <<< "${allowed}"
+
+  # ★ Postgres Entra admin is NOT an RBAC role assignment (set via `az postgres`), so it never appears above.
+  #   The sandbox MI must NEVER be it — assert directly. (Belt-and-braces: the sandbox job also carries no
+  #   database-url secret, so it has no connection string even if this ever regressed.)
+  local pg_name pg_admins
+  pg_name="$(printf '%s' "${tmpl}" | bicep_param postgresServerName 2>/dev/null || true)"
+  if [[ -n "${pg_name}" ]]; then
+    pg_admins="$(az postgres flexible-server ad-admin list -g "${RG}" -s "${pg_name}" --query "[].principalName" -o tsv 2>/dev/null </dev/null | tr '[:upper:]' '[:lower:]' || true)"
+    if grep -qiF "${sandbox_id_name,,}" <<<"${pg_admins}"; then
+      flunk "sandbox-rbac: the sandbox MI is a Postgres Entra ADMIN — it must have NO DB access at all"
+    fi
+  fi
+
+  [[ ${extra} -eq 0 && ${missing} -eq 0 ]] && pass "sandbox-rbac: sandbox MI has EXACTLY {AcrPull, sandbox blob container} live — no DB / Key Vault / prod-storage grant"
 }
 
 # ★ Concern A — BLOB CORS: if the template declares blob-service CORS rules, assert the LIVE blob service has
@@ -994,6 +1063,7 @@ verify() {
   # ★ Concern A: RBAC role assignments + blob CORS the TEMPLATE declares must be live (the memory-drop class:
   # #270's MI Storage Blob Delegator + blob CORS could silently not land while verify reported success).
   verify_rbac
+  verify_sandbox_least_privilege
   verify_cors
 
   # ★ BUG 2: EVERY job must be on the intended image — not just the runner job. A correct
