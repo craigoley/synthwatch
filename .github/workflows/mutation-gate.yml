@@ -111,7 +111,7 @@ jobs:
           for f in $(ls ../db/migrations/*.sql | sort); do PGPASSWORD=pg psql -h 127.0.0.1 -p 5544 -U postgres -d synthwatch -c "SET check_function_bodies=false;" -f "$f" >/dev/null; done
       # Restore the incremental cache the nightly saved so a PR only re-runs its changed mutants.
       - name: Restore mutation incremental cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: runner/.stryker-incremental
           key: stryker-incremental-${{ matrix.module }}-${{ github.event.pull_request.base.sha }}
