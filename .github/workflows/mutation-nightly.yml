@@ -65,7 +65,7 @@ jobs:
       # ★ Non-blocking: a regression OPENS AN ISSUE rather than wedging anything.
       - name: Open an issue on regression
         if: failure()
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const module = '${{ matrix.module }}';
