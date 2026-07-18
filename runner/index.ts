@@ -1068,7 +1068,9 @@ async function executeBrowser(
     // ★ SHARED trace producer (browserFlow.runTracedFlow) — the SAME code the sandbox preview runs, so a
     //   preview's steps/trace/screenshot match a real check's BY CONSTRUCTION (reuse, not a parallel builder).
     //   buildFlow runs inside the traced region: a Git spec (via the #101 shim) or the baked-in flow_name; a
-    //   load failure is a normal 'error', same as the loader-threw path.
+    //   load failure is a normal 'error', same as the loader-threw path. The PASS-ONLY baseline screenshot +
+    //   deploy markers ride the `onPass` hook so they stay in their ORIGINAL position — inside the trace window,
+    //   after a pass, before the trace stops — i.e. the extraction reorders nothing for the live check path.
     const traced = await runTracedFlow(
       context,
       page,
@@ -1087,23 +1089,22 @@ async function executeBrowser(
         deadlineMs: MAX_FLOW_MS,
         deadlineMsg: `browser flow wall-clock budget (${MAX_FLOW_MS}ms) exhausted — per-action timeouts (${check.timeout_ms}ms) never bound the WHOLE flow`,
       },
+      async () => {
+        // RCA visual-diff baseline from the just-rendered page (cheap — already rendered). Non-fatal; runOne
+        // only stores it on a 'pass' verdict.
+        baselineScreenshot = await page.screenshot().catch(() => null);
+        // Deploy-markers browser path: feed the curated ladder BOTH the rendered DOM and the main-doc response
+        // headers (input parity with the http path). PASS-ONLY: a red run's DOM is an unreliable deploy
+        // fingerprint. Fully best-effort — noteDeployMarker is internally try/caught + page.content() guarded.
+        const domHtml = await page.content().catch(() => null);
+        await noteDeployMarker(check.target_url, getMainDocHeaders(), domHtml, check.id, 'browser');
+      },
     );
     status = traced.status;
     error = traced.error;
     failedStep = traced.failedStep;
     screenshot = traced.screenshot;
     tracePath = traced.tracePath;
-
-    if (status === 'pass') {
-      // RCA visual-diff baseline from the just-rendered page (cheap — already rendered). Non-fatal; runOne
-      // only stores it on a 'pass' verdict. A SEPARATE artifact, not part of the trace window.
-      baselineScreenshot = await page.screenshot().catch(() => null);
-      // Deploy-markers browser path: feed the curated ladder BOTH the rendered DOM and the main-doc response
-      // headers (input parity with the http path). PASS-ONLY: a red run's DOM is an unreliable deploy
-      // fingerprint. Fully best-effort — noteDeployMarker is internally try/caught + page.content() guarded.
-      const domHtml = await page.content().catch(() => null);
-      await noteDeployMarker(check.target_url, getMainDocHeaders(), domHtml, check.id, 'browser');
-    }
   } finally {
     // ★ Clear the per-run login credentials (0067) FIRST — before any teardown — so a resolved secret never
     // outlives the run in process.env, even if tracing-stop/metrics below throw. No-op when none were set.

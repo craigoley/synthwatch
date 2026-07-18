@@ -54,7 +54,10 @@ export interface RunTracedFlowOptions {
  * trace — writing trace.zip to a temp file when kept (always on failure; on pass only when keepTraceOnPass).
  *
  * `buildFlow` runs INSIDE the traced region, so a spec-load error is traced and classified exactly like the
- * real path. This does NOT close the context (the caller owns teardown) and writes NOTHING to a DB.
+ * real path. `onPass` (optional) runs on a PASS, still INSIDE the traced region and BEFORE the trace stops —
+ * this is where the real check captures its baseline screenshot + deploy markers, so extracting this producer
+ * REORDERS NOTHING (they stay in the same spot they were, in the trace window, on pass only). The sandbox
+ * passes no onPass. This does NOT close the context (the caller owns teardown) and writes NOTHING to a DB.
  */
 export async function runTracedFlow(
   context: BrowserContext,
@@ -62,6 +65,7 @@ export async function runTracedFlow(
   buildFlow: () => Promise<Flow>,
   rec: StepRecorder,
   opts: RunTracedFlowOptions,
+  onPass?: () => Promise<void>,
 ): Promise<TracedFlowResult> {
   let status: TracedFlowResult['status'];
   let error: string | null = null;
@@ -87,6 +91,10 @@ export async function runTracedFlow(
     // Error → classified 'error' below (not an ExpectationError).
     await withDeadline(flow(rec), opts.deadlineMs, opts.deadlineMsg);
     status = 'pass';
+    // Pass-only, still inside the trace window + before the trace stops — the real check's baseline screenshot +
+    // deploy markers live here (same position as before the extraction). A throw here is classified below,
+    // exactly as it would have been when this code was inline (in practice onPass is guarded and cannot throw).
+    if (onPass) await onPass();
   } catch (err) {
     failed = true;
     status = isExpectationError(err) ? 'fail' : 'error';
