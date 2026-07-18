@@ -9,7 +9,7 @@
 // env, no DB) is the authoritative boundary; the child-process allowlist here is defense-in-depth AND what
 // makes the "no secret leaks" acceptance test runnable off-Azure.
 import { spawn } from 'node:child_process';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, writeFile, rm, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -22,16 +22,40 @@ const CHILD_ENTRY = fileURLToPath(new URL('./sandboxChild.js', import.meta.url))
 /** Bounds (mirrored by the ACA replicaTimeout + the api-side per-user rate/concurrency caps). */
 export const SANDBOX_DEFAULT_TIMEOUT_MS = 120_000;
 
+/** One recorded step of the preview flow — the RecordedStep shape, sans runId (a preview has no run). */
+export interface PreviewStep {
+  index: number;
+  name: string;
+  status: string;
+  durationMs: number;
+  errorMessage: string | null;
+}
+
 export interface PreviewResult {
-  /** True iff the spec compiled, loaded, and reported within the timeout. */
+  /** True iff the spec compiled, loaded, and the flow reported 'pass' within the timeout. */
   ok: boolean;
-  /** The captured test names (a real preview also returns the trace — see sandboxChild's seam). */
+  /** The captured test names. */
   tests: string[];
   /** Everything the child wrote — INCLUDING the spec's own output. The isolation test asserts on this. */
   stdout: string;
   stderr: string;
   timedOut: boolean;
   exitCode: number | null;
+  // ── B2: the REAL trace, produced by the SAME browserFlow.runTracedFlow a real check uses ──
+  /** The flow verdict (undefined if the browser run never reported — e.g. compile/load failure). */
+  status?: 'pass' | 'fail' | 'error';
+  /** The flow error message (e.g. a selector-not-found), or null. */
+  error?: string | null;
+  /** The step that failed, or null. */
+  failedStep?: string | null;
+  /** Per-step name/status/timing (the run_steps shape). */
+  steps?: PreviewStep[];
+  /** trace_signals (extractTraceSignals output), or null if no trace was produced. */
+  traceSignals?: unknown | null;
+  /** The trace.zip bytes (read from the child's temp file), or null. The caller uploads them under the MI. */
+  trace?: Buffer | null;
+  /** The failure screenshot bytes, or null (pass runs have no failure screenshot). */
+  screenshot?: Buffer | null;
 }
 
 /**
@@ -104,18 +128,40 @@ function runChild(specFile: string, vars: SandboxRunVars): Promise<PreviewResult
     });
     child.on('close', (code) => {
       clearTimeout(timer);
-      let tests: string[] = [];
-      let reported = false;
-      // The child's JSON report is its LAST stdout line; the spec's own output precedes it.
-      const lastLine = stdout.trim().split('\n').pop() ?? '';
-      try {
-        const j = JSON.parse(lastLine) as { ok?: boolean; tests?: string[] };
-        reported = j.ok === true;
-        tests = j.tests ?? [];
-      } catch {
-        /* no valid report → ok stays false */
-      }
-      resolve({ ok: reported && !timedOut, tests, stdout, stderr, timedOut, exitCode: code });
+      // Read the child's report + its temp-file artifacts (before runSandboxPreview's finally rm's the dir).
+      void (async () => {
+        let tests: string[] = [];
+        let reported = false;
+        let status: PreviewResult['status'];
+        let error: string | null = null;
+        let failedStep: string | null = null;
+        let steps: PreviewStep[] = [];
+        let traceSignals: unknown | null = null;
+        let trace: Buffer | null = null;
+        let screenshot: Buffer | null = null;
+        // The child's JSON report is its LAST stdout line; the spec's own output precedes it.
+        const lastLine = stdout.trim().split('\n').pop() ?? '';
+        try {
+          const j = JSON.parse(lastLine) as {
+            ok?: boolean; tests?: string[]; status?: PreviewResult['status']; error?: string | null;
+            failedStep?: string | null; steps?: PreviewStep[]; traceSignals?: unknown | null;
+            tracePath?: string | null; screenshotPath?: string | null;
+          };
+          reported = j.ok === true;
+          tests = j.tests ?? [];
+          status = j.status;
+          error = j.error ?? null;
+          failedStep = j.failedStep ?? null;
+          steps = j.steps ?? [];
+          traceSignals = j.traceSignals ?? null;
+          // The child holds no blob creds — it wrote the trace/screenshot as temp files; the PARENT uploads.
+          if (j.tracePath) trace = await readFile(j.tracePath).catch(() => null);
+          if (j.screenshotPath) screenshot = await readFile(j.screenshotPath).catch(() => null);
+        } catch {
+          /* no valid report → ok stays false */
+        }
+        resolve({ ok: reported && !timedOut, tests, stdout, stderr, timedOut, exitCode: code, status, error, failedStep, steps, traceSignals, trace, screenshot });
+      })();
     });
   });
 }

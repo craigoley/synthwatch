@@ -95,6 +95,36 @@ test('★ a spec cannot locate or authenticate to the prod DB — DATABASE_URL/c
   });
 });
 
+// ── B2: the preview returns a REAL trace — a wrong selector is DIAGNOSABLE from the preview alone ────────
+// The whole point of B2: "my selector is wrong" must be answerable without a deploy. If the trace can't show
+// WHERE a selector failed (the step, its timing, the screenshot at failure), B2 isn't done.
+test('★ B2: a wrong-selector spec yields a trace showing the failing step, its timing, and a screenshot', async () => {
+  const wrong = `
+    import { test, expect, step } from '../../lib/flow';
+    test('wrong selector', async ({ page }) => {
+      await step('open the page', async () => { await page.goto('https://example.com', { waitUntil: 'domcontentloaded' }); });
+      await step('assert a bogus selector', async () => { await expect(page.locator('#nope-does-not-exist')).toBeVisible({ timeout: 3000 }); });
+    });
+  `;
+  const r = await runSandboxPreview(wrong, { targetUrl: 'https://example.com', timeoutMs: 60_000 });
+
+  assert.equal(r.status, 'fail', `expected a 'fail' verdict; stderr=${r.stderr}`);
+  assert.equal(r.failedStep, 'assert a bogus selector', 'the failing step must be named');
+
+  // Per-step status + timing — the "where did it fail" the SRE reads (the run_steps shape, same as a real check).
+  const steps = r.steps ?? [];
+  assert.equal(steps.length, 2, 'both steps recorded');
+  assert.equal(steps[0].status, 'pass');
+  assert.equal(steps[1].status, 'fail');
+  assert.ok(steps[1].durationMs >= 0, 'the failing step carries a timing');
+  assert.ok((steps[1].errorMessage ?? '').length > 0, 'the failing step carries an error message');
+
+  // The diagnosable artifacts: a failure screenshot + a trace.zip, plus trace_signals (same shape a real check produces).
+  assert.ok(r.screenshot && r.screenshot.byteLength > 0, 'a failure screenshot was captured');
+  assert.ok(r.trace && r.trace.byteLength > 0, 'a trace.zip was captured');
+  assert.ok(r.traceSignals, 'trace_signals extracted');
+});
+
 // ── BOUND: a runaway spec is hard-killed at the timeout (the DoS-on-your-own-bill guard) ────────────────
 test('★ a spec that never returns is hard-killed at the timeout', async () => {
   const runaway = `
