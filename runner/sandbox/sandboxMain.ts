@@ -2,11 +2,13 @@
 // It runs under the SANDBOX identity with a SECRET-FREE, allowlist env — NO CRED_ENC_KEY, NO prod DATABASE_URL,
 // NO DB grant — so this whole process is the low-privilege blast-radius box the design promises.
 //
-// Pass 1: the api passes the uploaded spec as base64 in the SW_SANDBOX_SPEC_B64 env (set on jobs/start), runs
-// the preview, and writes the JSON result to stdout. ★ SEAM (api wiring, next increment): read the spec FROM /
-// write the trace TO a dedicated `sandbox-artifacts` blob container — the sandbox identity's ONLY storage grant
-// (infra/main.bicep) — so the dashboard "Tests" area and the PR check can fetch the result. Never touches the DB.
+// The api passes the uploaded spec as base64 in the SW_SANDBOX_SPEC_B64 env (set on jobs/start), runs the
+// preview, writes the JSON result to stdout AND uploads it to the sandbox blob container as `<token>.json` (the
+// sandbox identity's ONLY storage grant — infra/main.bicep) so the api's GET /preview/{token} can fetch it.
+// Never touches the DB. ★ REMAINING SEAM (tier-1 real trace): sandboxChild still returns `trace:'seam'` — the
+// uploaded result carries the compiled/loaded test names + captured stdout, not yet a Playwright trace.
 import { runSandboxPreview } from './runSandboxPreview.js';
+import { uploadSandboxResult } from './sandboxUpload.js';
 
 async function main(): Promise<void> {
   const b64 = process.env.SW_SANDBOX_SPEC_B64;
@@ -17,8 +19,10 @@ async function main(): Promise<void> {
   }
   const spec = Buffer.from(b64, 'base64').toString('utf8');
   const result = await runSandboxPreview(spec, { targetUrl: target });
-  // SEAM: upload `result` to sandbox-artifacts/<token> for the api to poll. Pass-1: stdout.
-  process.stdout.write(JSON.stringify(result) + '\n');
+  const resultJson = JSON.stringify(result);
+  // stdout for the execution log; the blob for the api poll (best-effort — never fail the run on egress).
+  process.stdout.write(resultJson + '\n');
+  await uploadSandboxResult(process.env.SW_SANDBOX_RESULT_TOKEN, resultJson);
   process.exit(result.ok ? 0 : 1);
 }
 

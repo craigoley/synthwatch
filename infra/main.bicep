@@ -615,6 +615,9 @@ resource sandboxJob 'Microsoft.App/jobs@2024-03-01' = {
           }
           // ★ ALLOWLIST env — only non-secret vars. The spec + target are injected per-run by the api on
           //   jobs/start (SW_SANDBOX_SPEC_B64 / SW_SANDBOX_TARGET_URL); NOTHING sensitive is baked in.
+          //   SANDBOX_STORAGE_ACCOUNT + AZURE_CLIENT_ID let sandboxMain (the TRUSTED parent) upload the result
+          //   blob under the sandbox MI — both non-secret (an account name + the MI's own client-id GUID), and
+          //   the executed spec never sees them (the child-process buildSandboxEnv allowlist excludes them).
           env: [
             {
               name: 'SW_SANDBOX'
@@ -623,6 +626,14 @@ resource sandboxJob 'Microsoft.App/jobs@2024-03-01' = {
             {
               name: 'SANDBOX_CONTAINER'
               value: sandboxContainerName
+            }
+            {
+              name: 'SANDBOX_STORAGE_ACCOUNT'
+              value: storageAccountName
+            }
+            {
+              name: 'AZURE_CLIENT_ID'
+              value: sandboxIdentity.properties.clientId
             }
           ]
         }
