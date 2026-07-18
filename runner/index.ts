@@ -39,7 +39,8 @@ import {
   shutdownOtel,
 } from './otel.js';
 import { StepRecorder } from './stepRecorder.js';
-import { loadFlow, type Flow } from './checks/index.js';
+import { loadFlow } from './checks/index.js';
+import { runTracedFlow } from './browserFlow.js';
 import { getCompiledSpecFromPool, sha256 } from './specfetch/specCache.js';
 import { loadCompiledSpec } from './specfetch/compileSpec.js';
 import { specToFlow } from './specfetch/specShim.js';
@@ -57,8 +58,6 @@ import { extractTraceSignals } from './traceSignals.js';
 import { buildRedactedTraceZip } from './traceRedact.js';
 import { makeRedactor, IDENTITY_REDACTOR, tracePersistPlan, scrubError } from './redact.js';
 import { captureEgressIp } from './egress.js';
-import os from 'node:os';
-import path from 'node:path';
 import { unlink } from 'node:fs/promises';
 import {
   applyRunSideEffects,
@@ -72,9 +71,7 @@ import {
   EMPTY_METRICS,
   type RunMetrics,
 } from './metrics.js';
-import { isExpectationError } from './errors.js';
 import { DUE_PREDICATE_SQL } from './duePredicate.js';
-import { withDeadline } from './timeBudget.js';
 import { enforceProdGuard } from './prodGuard.js';
 import {
   INVOCATION_ID,
@@ -1045,37 +1042,16 @@ async function executeBrowser(
   // the pass branch below alongside page.content(). Best-effort — never throws, never affects the run.
   const getMainDocHeaders = captureMainDocHeaders(page);
 
-  // Start a Playwright trace for the whole run (recording always happened; the cost change is the
-  // SAVE). We keep it on FAILURE (per-run, rides the 90d purge) and on SUCCESS when captureSuccessTrace
-  // is set (the last-known-good baseline). sources:false avoids embedding the flow source;
-  // screenshots+snapshots are the debugging value. Non-fatal.
-  let tracingOn = false;
-  await context.tracing
-    .start({ screenshots: true, snapshots: true, sources: false })
-    .then(() => {
-      tracingOn = true;
-    })
-    .catch((err) => {
-      // Non-fatal (the run still proceeds), but it MUST be visible: a swallowed
-      // trace-start failure means every run this tick has no trace to debug from,
-      // silently and undiagnosably. Log it (same [trace] channel as the stop path).
-      console.warn(
-        `[trace] run ${runId} tracing.start failed (non-fatal; no trace will be captured):`,
-        err,
-      );
-    });
-
-  // Decide the verdict in the try/catch, capture metrics in the finally, then
-  // assemble the Outcome after — so the perf-budget comparison upstream gets the
-  // real metrics even though they're collected during teardown.
+  // Decide the verdict via the SHARED trace producer (runTracedFlow), capture metrics in the finally, then
+  // assemble the Outcome — so the perf-budget comparison upstream gets the real metrics even though they're
+  // collected during teardown.
   let status: TerminalStatus;
-  let error: string | null = null;
-  let failedStep: string | null = null;
-  let screenshot: Buffer | null = null;
+  let error: string | null;
+  let failedStep: string | null;
+  let screenshot: Buffer | null;
   let metrics: RunMetrics;
   let metricsCaptureFailed = false;
-  let tracePath: string | null = null;
-  let failed = false;
+  let tracePath: string | null;
   let baselineScreenshot: Buffer | null = null;
   // Per-monitor login credentials (0067): resolve the declared { role -> ENV_VAR } refs and PUBLISH them as
   // process.env[SW_CRED_<ROLE>] so the spec's credential(role) can read them. Set for the life of THIS run
@@ -1089,70 +1065,51 @@ async function executeBrowser(
     // gone, diagnostic kept) in run_steps — not blanket-replaced. Non-sensitive → identity (unchanged).
     const stepRedact = check.sensitive ? makeRedactor(check.redact_patterns, credValues) : IDENTITY_REDACTOR;
     const rec = new StepRecorder(runId, page, check.target_url, undefined, undefined, stepRedact);
-    try {
-      // Build the Flow: the fetched/compiled spec (run via the #101 shim) or the baked-in
-      // flow_name. Both satisfy Flow = (rec) => Promise<void>; a load failure here is a normal
-      // 'error' (caught below), same as the existing "loader threw" path.
-      let flow: Flow;
-      if (compiledJs !== null) {
-        const tests = await loadCompiledSpec(compiledJs);
-        if (tests.length === 0) throw new Error(`spec ${check.spec_path} defined no test()`);
-        flow = specToFlow(tests[0].fn, page);
-      } else {
-        flow = await loadFlow(check.flow_name as string);
-      }
-      // Whole-flow deadline (MAX_FLOW_MS): a budget breach rejects with a plain Error → the catch
-      // below classifies it 'error' (isExpectationError is false), with an honest message instead
-      // of a replicaTimeout kill. The context.close() in the finally aborts the abandoned flow's
-      // in-flight Playwright work; withDeadline marks its late rejection handled.
-      await withDeadline(
-        flow(rec),
-        MAX_FLOW_MS,
-        `browser flow wall-clock budget (${MAX_FLOW_MS}ms) exhausted — per-action timeouts (${check.timeout_ms}ms) never bound the WHOLE flow`,
-      );
-      status = 'pass';
-      // Capture the RCA visual-diff baseline from the just-rendered page (cheap —
-      // it's already rendered; we'd otherwise discard it). Non-fatal; runOne only
-      // stores it if the final verdict is 'pass' (not a perf-budget 'warn').
-      baselineScreenshot = await page.screenshot().catch(() => null);
-
-      // Deploy-markers browser path: feed the SAME curated ladder BOTH the rendered DOM and the main-doc
-      // response headers (input parity with the http path) so wegmans' sentry-release SHA (a body marker) and
-      // an etag-only host (a header marker) both land — per host, no per-target logic. PASS-ONLY: a red run's
-      // DOM is an unreliable deploy fingerprint (mirror the baseline-capture gating). Fully best-effort —
-      // noteDeployMarker is internally try/caught, and page.content() is guarded so it can never fail or slow a run.
-      const domHtml = await page.content().catch(() => null);
-      await noteDeployMarker(check.target_url, getMainDocHeaders(), domHtml, check.id, 'browser');
-    } catch (err) {
-      // A flow ExpectationError is a clean assertion miss ('fail'); any other
-      // throw (Playwright timeout, navigation crash, loader error) is 'error'.
-      failed = true;
-      status = isExpectationError(err) ? 'fail' : 'error';
-      error = err instanceof Error ? err.message : String(err);
-      failedStep = rec.failedStep;
-      screenshot = await page.screenshot().catch(() => null);
-    }
+    // ★ SHARED trace producer (browserFlow.runTracedFlow) — the SAME code the sandbox preview runs, so a
+    //   preview's steps/trace/screenshot match a real check's BY CONSTRUCTION (reuse, not a parallel builder).
+    //   buildFlow runs inside the traced region: a Git spec (via the #101 shim) or the baked-in flow_name; a
+    //   load failure is a normal 'error', same as the loader-threw path. The PASS-ONLY baseline screenshot +
+    //   deploy markers ride the `onPass` hook so they stay in their ORIGINAL position — inside the trace window,
+    //   after a pass, before the trace stops — i.e. the extraction reorders nothing for the live check path.
+    const traced = await runTracedFlow(
+      context,
+      page,
+      async () => {
+        if (compiledJs !== null) {
+          const tests = await loadCompiledSpec(compiledJs);
+          if (tests.length === 0) throw new Error(`spec ${check.spec_path} defined no test()`);
+          return specToFlow(tests[0].fn, page);
+        }
+        return loadFlow(check.flow_name as string);
+      },
+      rec,
+      {
+        traceId: runId,
+        keepTraceOnPass: captureSuccessTrace,
+        deadlineMs: MAX_FLOW_MS,
+        deadlineMsg: `browser flow wall-clock budget (${MAX_FLOW_MS}ms) exhausted — per-action timeouts (${check.timeout_ms}ms) never bound the WHOLE flow`,
+      },
+      async () => {
+        // RCA visual-diff baseline from the just-rendered page (cheap — already rendered). Non-fatal; runOne
+        // only stores it on a 'pass' verdict.
+        baselineScreenshot = await page.screenshot().catch(() => null);
+        // Deploy-markers browser path: feed the curated ladder BOTH the rendered DOM and the main-doc response
+        // headers (input parity with the http path). PASS-ONLY: a red run's DOM is an unreliable deploy
+        // fingerprint. Fully best-effort — noteDeployMarker is internally try/caught + page.content() guarded.
+        const domHtml = await page.content().catch(() => null);
+        await noteDeployMarker(check.target_url, getMainDocHeaders(), domHtml, check.id, 'browser');
+      },
+    );
+    status = traced.status;
+    error = traced.error;
+    failedStep = traced.failedStep;
+    screenshot = traced.screenshot;
+    tracePath = traced.tracePath;
   } finally {
     // ★ Clear the per-run login credentials (0067) FIRST — before any teardown — so a resolved secret never
     // outlives the run in process.env, even if tracing-stop/metrics below throw. No-op when none were set.
     clearLoginCredentials(credKeys);
-    // Stop tracing BEFORE closing the context. Write the trace.zip to a temp file (which runOne
-    // uploads — to the per-run key on failure, or the per-monitor baseline key on success) when we
-    // want to keep it: ALWAYS on failure, and on a pass only when captureSuccessTrace says the
-    // baseline is due a refresh. Otherwise stop() discards it (no serialize, no upload). Non-fatal.
-    if (tracingOn) {
-      try {
-        if (failed || captureSuccessTrace) {
-          tracePath = path.join(os.tmpdir(), `sw-trace-${runId}-${Date.now()}.zip`);
-          await context.tracing.stop({ path: tracePath });
-        } else {
-          await context.tracing.stop();
-        }
-      } catch (err) {
-        console.warn(`[trace] run ${runId} trace stop failed:`, err);
-        tracePath = null;
-      }
-    }
+    // (The Playwright trace is started + stopped inside runTracedFlow above; tracePath is already resolved.)
 
     // Persist one run_metrics row (any outcome) before tearing down the context. Fall back to an
     // all-null row if capture or the write itself throws — BUT ★ B1: record that capture FAILED. A

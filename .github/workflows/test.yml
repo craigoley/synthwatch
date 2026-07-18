@@ -67,6 +67,14 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # ★ The sandbox preview + its isolation ACCEPTANCE tests now launch a REAL Playwright browser (B2 —
+      # sandboxChild runs the flow to capture the trace). Install chromium (+ the headless shell chromium.launch
+      # uses) so those tests actually RUN in CI, not skip — the isolation proof MUST run with the browser present,
+      # and the wrong-selector prove-can-fail asserts the real trace. PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD is only set
+      # in the Dockerfile (image gets browsers from its base), not here.
+      - name: Install Playwright chromium
+        run: npx playwright install --with-deps chromium chromium-headless-shell
+
       # ★ FROM-SCRATCH REPLAY GUARD (the 0069/#284 class, shifted LEFT + made REQUIRED). db/schema.sql (the
       # converged end state) + every migration replayed on top must converge — the exact model a fresh DB, a
       # restore, and the synthwatch-api "Runner column parity" gate all use. A CREATE OR REPLACE FUNCTION that

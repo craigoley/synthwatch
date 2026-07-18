@@ -181,6 +181,10 @@ param artifactContainerName string = 'synthwatch-artifacts'
 @minValue(1)
 param artifactRetentionDays int = 90
 
+@description('Retention (days) for sandbox PREVIEW artifacts (synthwatch-sandbox/*: result JSON + trace.zip + screenshot). A preview is an ephemeral scratchpad — it only needs to outlive the poll + a short review. Default 1 (Blob lifecycle min granularity).')
+@minValue(1)
+param sandboxRetentionDays int = 1
+
 // AI root-cause analysis (RCA) — Azure OpenAI config. These are CONFIG, not secrets
 // (the runner authenticates to AOAI with the synthwatch-runner-id Managed Identity's
 // AAD token via its 'Cognitive Services OpenAI User' role — no API key). Declared
@@ -423,6 +427,31 @@ resource artifactRetention 'Microsoft.Storage/storageAccounts/managementPolicies
               baseBlob: {
                 delete: {
                   daysAfterModificationGreaterThan: artifactRetentionDays
+                }
+              }
+            }
+          }
+        }
+        {
+          // ★ B2: GC the sandbox PREVIEW artifacts. A preview is an EPHEMERAL scratchpad — result JSON + trace.zip
+          //   + screenshot only need to outlive the poll (+ a short review). Without this the container was
+          //   UNGOVERNED (no lifecycle covered it), so B2's trace/screenshot blobs would accumulate forever — the
+          //   storage version of the #269 self-DoS, alongside the per-preview size caps in sandboxMain.ts.
+          //   ONE policy named 'default' per account → this is a second RULE, not a second policy.
+          enabled: true
+          name: 'expire-sandbox-previews'
+          type: 'Lifecycle'
+          definition: {
+            filters: {
+              blobTypes: [ 'blockBlob' ]
+              prefixMatch: [
+                '${sandboxContainerName}/'
+              ]
+            }
+            actions: {
+              baseBlob: {
+                delete: {
+                  daysAfterModificationGreaterThan: sandboxRetentionDays
                 }
               }
             }
