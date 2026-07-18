@@ -140,7 +140,7 @@ jobs:
 
       - name: Checkout PR head (SHA-pinned; same-repo trusted only — see security note)
         if: steps.fails.outputs.go == 'true' && steps.g1.outputs.stop != 'true' && steps.fails.outputs.parity != 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
