@@ -151,9 +151,15 @@ async function periodFacts(
     [checkId, startIso, endIso],
   );
   const vit = await pool.query<{ lcp_p75: number | null }>(
+    // ★ latency_sample (0092): pass/warn + NON-sandbox — the SAME real-measured-sample predicate as the
+    // latency percentiles above, because a web-vital is a real measured value too. A sandbox test-send at an
+    // outlier LCP must NOT move the reported p75. KEEPS confirmations by design — a confirmation's vitals are
+    // a real measurement (the deliberate difference from countable_run; see the view comment). The pass/warn
+    // filter lives in the view now, so the inline `r.status IN (…)` is gone. The maintenance-window exclusion
+    // stays here (per-consumer, contextual).
     `SELECT round(percentile_cont(0.75) WITHIN GROUP (ORDER BY m.lcp_ms))::int AS lcp_p75
-       FROM run_metrics m JOIN runs r ON r.id = m.run_id
-      WHERE r.started_at >= $2 AND r.started_at < $3 AND r.status IN ('pass','warn')
+       FROM run_metrics m JOIN latency_sample r ON r.id = m.run_id
+      WHERE r.started_at >= $2 AND r.started_at < $3
         AND ($1::bigint IS NULL OR r.check_id = $1)
         AND NOT EXISTS (
           SELECT 1 FROM maintenance_windows mw
