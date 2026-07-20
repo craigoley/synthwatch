@@ -51,6 +51,47 @@ export function uploadSandboxResult(token: string | undefined, resultJson: strin
   return upload(token, `${token}.json`, Buffer.from(resultJson, 'utf8'), 'application/json');
 }
 
+/**
+ * ★ THE PAYLOAD CHANNEL READ (sandboxPayload.ts owns the contract; this is its Azure half).
+ * Download `{token}.payload` and DELETE it, returning the ciphertext (or null when absent).
+ *
+ * ★ DELETE-ON-READ IS AWAITED BEFORE RETURNING, and a FAILED delete FAILS THE READ (returns null → the run
+ * has no spec → it exits rather than executing). That is deliberate and is the opposite of this module's
+ * best-effort upload policy: an upload that fails costs a poll timeout, but ciphertext left resident in the
+ * SHARED container while uploaded code runs is exactly the concurrent-neighbour exposure the split-secret
+ * design exists to close. Better to lose the preview than to run a hostile spec beside a live ciphertext.
+ * (The neighbour still could not DECRYPT it — its key is in the other execution's ARM env and the sandbox MI
+ * has no ARM read grant — but we do not spend that margin just to salvage a run.)
+ *
+ * Unlike the uploads below, a missing account/container/token here returns null rather than being shrugged
+ * off: with no payload there is nothing to execute.
+ */
+export async function fetchAndDeleteSandboxPayload(token: string | undefined): Promise<string | null> {
+  const t = resolveTarget(token);
+  if (!t) return null;
+  const url = `https://${t.account}.blob.core.windows.net/${t.container}/${token}.payload`;
+  const client = new BlockBlobClient(url, t.credential);
+  let ciphertext: string;
+  try {
+    ciphertext = (await client.downloadToBuffer()).toString('utf8');
+  } catch (e) {
+    // 404 (never uploaded — e.g. the legacy env path) is indistinguishable here from a transient failure;
+    // both mean "no payload from this channel", and the caller falls back or exits. NEVER logs the body.
+    process.stderr.write(`sandboxUpload: no payload blob for this run — ${e instanceof Error ? e.message : String(e)}\n`);
+    return null;
+  }
+  try {
+    await client.delete();
+  } catch (e) {
+    // ★ FAIL THE READ. See above — we do not execute uploaded code beside a ciphertext we could not remove.
+    process.stderr.write(
+      `sandboxUpload: payload delete-on-read FAILED — refusing to execute — ${e instanceof Error ? e.message : String(e)}\n`,
+    );
+    return null;
+  }
+  return ciphertext;
+}
+
 /** A binary artifact (trace.zip / screenshot.png) → `{token}/{name}`. The caller size-caps before calling. */
 export function uploadSandboxArtifact(
   token: string | undefined,

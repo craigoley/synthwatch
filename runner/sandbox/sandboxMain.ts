@@ -2,7 +2,13 @@
 // It runs under the SANDBOX identity with a SECRET-FREE, allowlist env — NO CRED_ENC_KEY, NO prod DATABASE_URL,
 // NO DB grant — so this whole process is the low-privilege blast-radius box the design promises.
 //
-// The api passes the uploaded spec as base64 in SW_SANDBOX_SPEC_B64 (set on jobs/start). This runs the preview
+// ★ THE SPEC + CREDENTIALS ARRIVE VIA THE PAYLOAD BLOB, NOT THE ARM ENV (sandboxPayload.ts explains why in
+// full: ACA persists a jobs/start env override VERBATIM in job execution history, readable by any Reader on
+// the RG, retention unbounded-by-contract for triggerType:'Manual'). The env carries only the per-run AES
+// key, whose leak into that history is harmless without the ciphertext. The legacy SW_SANDBOX_SPEC_B64 path
+// is still honoured so this can deploy BEFORE the api switches channels; PR4 removes it.
+//
+// This runs the preview
 // (a REAL Playwright trace, produced by the SAME browserFlow.runTracedFlow a real check uses), then uploads to
 // the sandbox blob container (the sandbox identity's ONLY storage grant): the result JSON → `<token>.json`
 // (steps + trace_signals + status), the trace.zip → `<token>/trace.zip`, and any failure screenshot →
@@ -10,7 +16,8 @@
 // the container (the storage version of the #269 self-DoS); an over-cap artifact is dropped and the poll shows
 // it honestly-absent.
 import { runSandboxPreview } from './runSandboxPreview.js';
-import { uploadSandboxArtifact, uploadSandboxResult } from './sandboxUpload.js';
+import { isCredentialedRun, resolveSandboxPayload } from './sandboxPayload.js';
+import { fetchAndDeleteSandboxPayload, uploadSandboxArtifact, uploadSandboxResult } from './sandboxUpload.js';
 
 // ★ Artifact caps. A simple flow's trace.zip is well under 20 MB; a multi-nav/heavy-page runaway is bounded. A
 //   full-page PNG is ~0.5–2 MB, so 4 MB is generous. Over-cap → DROPPED (steps + signals still serve; the
@@ -21,15 +28,30 @@ const SCREENSHOT_CAP_BYTES = 4 * 1024 * 1024;
 const STDOUT_CAP_BYTES = 128 * 1024;
 
 async function main(): Promise<void> {
-  const b64 = process.env.SW_SANDBOX_SPEC_B64;
   const target = process.env.SW_SANDBOX_TARGET_URL ?? 'https://example.com';
-  if (!b64) {
-    process.stderr.write('sandboxMain: SW_SANDBOX_SPEC_B64 not set (the api sets it on jobs/start)\n');
-    process.exit(2);
-  }
-  const spec = Buffer.from(b64, 'base64').toString('utf8');
   const token = process.env.SW_SANDBOX_RESULT_TOKEN;
-  const result = await runSandboxPreview(spec, { targetUrl: target });
+
+  // ★ FETCH → DELETE → decrypt, all BEFORE a single line of uploaded code compiles or runs. The delete is
+  //   the FIRST thing that happens to the payload blob, so a hostile spec never executes while a
+  //   neighbouring run's ciphertext is still resident in the shared container.
+  let resolved;
+  try {
+    resolved = await resolveSandboxPayload(process.env, { fetchAndDeletePayload: fetchAndDeleteSandboxPayload });
+  } catch (e) {
+    // These messages are constructed to name the FIELD or the ENVELOPE, never the plaintext — see
+    // decodeSandboxPayload. Nothing here can echo a credential.
+    process.stderr.write(`sandboxMain: ${e instanceof Error ? e.message : String(e)}\n`);
+    process.exit(2);
+    return;
+  }
+  const { spec, credentials } = resolved.payload;
+  // Channel + credentialed-ness only — NEVER a value, and never the spec. `source` makes the PR4 cutover
+  // observable in the job log without exposing anything.
+  process.stderr.write(
+    `sandboxMain: spec via ${resolved.source}; credentials ${isCredentialedRun(credentials) ? 'PRESENT (run is sensitive)' : 'absent'}\n`,
+  );
+
+  const result = await runSandboxPreview(spec, { targetUrl: target, credentials });
 
   // Upload the binary artifacts FIRST (best-effort) so the result JSON's hasTrace/hasScreenshot reflect what
   // actually landed. The trusted PARENT holds the blob creds — the child never did.
