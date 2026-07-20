@@ -58,7 +58,7 @@ jobs:
       # Persist the refreshed incremental cache for tomorrow's PRs.
       - name: Save mutation incremental cache
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: runner/.stryker-incremental
           key: stryker-incremental-${{ matrix.module }}-${{ github.sha }}
