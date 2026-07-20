@@ -546,10 +546,12 @@ param sandboxContainerName string = 'synthwatch-sandbox'
 @description('Sandbox job hard wall-clock timeout (s) — the DoS-on-your-own-bill guard; mirrors runSandboxPreview\'s SANDBOX_DEFAULT_TIMEOUT_MS.')
 param sandboxReplicaTimeout int = 180
 
-// Storage Blob Data Contributor (built-in) — granted to the sandbox MI on its OWN container only (below).
+// Storage Blob Data Contributor (built-in) — granted on the sandbox container ONLY, to two DISTINCT
+// principals: the sandbox MI (writes its result/trace/screenshot, deletes the payload it read) and the API MI
+// (writes the {token}.payload ciphertext, sweeps orphans). Both container-scoped; neither is account-scoped.
+// ★ The API MI's assignment REPLACED a Storage Blob Data Reader one — see apiSandboxBlobWriter below. That
+// removes this file's last use of storageBlobDataReaderRoleId, so the var is gone with it.
 var storageBlobDataContributorRoleId = 'ba92f5b4-2d11-453d-a403-e96b0029c9fe'
-// Storage Blob Data Reader (built-in) — the API MI's read on the sandbox container (the GET poll), below.
-var storageBlobDataReaderRoleId = '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'
 
 resource sandboxIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: sandboxIdentityName
@@ -588,16 +590,33 @@ resource sandboxBlobWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' 
   }
 }
 
-// ★ Blob READ for the API MI, SCOPED TO THE SANDBOX CONTAINER ONLY — GET /api/preview/{token} polls the sandbox
-//   job's trace result here. Container-scoped, NOT account-scoped: an account-scoped read would let the API MI
-//   read the prod synthwatch-artifacts traces, which the poll never needs. READER (not Contributor): the API
-//   only reads the sandbox's output; it never writes this container. This is on the API MI, DISTINCT from the
-//   sandbox MI's grants — so it does NOT change verify_sandbox_least_privilege's exact-two set for the sandbox.
-resource apiSandboxBlobReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(sandboxContainer.id, apiManagedIdentityPrincipalId, storageBlobDataReaderRoleId)
+// ★ Blob READ + WRITE + DELETE for the API MI, SCOPED TO THE SANDBOX CONTAINER ONLY.
+//   Was READER. Promoted to CONTRIBUTOR because the API now owns the {token}.payload channel:
+//     • WRITE — POST /api/preview seals {spec, credentials} under a per-run AES key and uploads the ciphertext
+//       here. The spec and any user-typed credential can NO LONGER ride the ARM jobs/start env override: ACA
+//       persists that override VERBATIM on the execution resource (observed via `az containerapp job execution
+//       list`), readable by any Reader on this RG, and execution history is unbounded-by-contract for a
+//       triggerType:'Manual' job. Only the per-run key rides the env now — worthless without this blob.
+//       ★ NOTE the read/write asymmetry this creates with the SANDBOX MI, which holds Contributor on the same
+//       container: a hostile spec can delete or overwrite a CONCURRENT preview's payload. Confidentiality
+//       still holds (it cannot obtain the neighbour's key — that lives in the other execution's ARM env, and
+//       the sandbox MI has no ARM read grant), but the neighbour fails closed. A DoS, not a disclosure.
+//     • DELETE — the API sweeps an ORPHANED payload. The sandbox normally deletes on read; a preview that
+//       died between upload and read would otherwise leave ciphertext to the blob lifecycle rule, whose floor
+//       is ~1 DAY (daysAfterCreationGreaterThan is typed Integer — no fractional days — and a policy edit
+//       takes up to 24h to take effect) while its key sits in execution history permanently. The sweep runs on
+//       BOTH the poll and the create path — the create path is the one that matters, because the likeliest
+//       orphan is an abandoned tab, and nobody polls an abandoned tab. So the bound is "the next preview by
+//       any user", not a fixed interval, and NOT the 5 minutes an earlier draft of this comment claimed.
+//     • READ — unchanged: GET /api/preview/{token} still polls the sandbox job's trace result here.
+//   Container-scoped, NEVER account-scoped: the API MI must not gain write over the prod artifacts container.
+//   ★ This is the API MI, a DIFFERENT principal from the sandbox MI — so verify_sandbox_least_privilege's
+//   exact-two set (AcrPull + this container, for the SANDBOX identity) is untouched by this change.
+resource apiSandboxBlobWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(sandboxContainer.id, apiManagedIdentityPrincipalId, storageBlobDataContributorRoleId)
   scope: sandboxContainer
   properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', storageBlobDataReaderRoleId)
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', storageBlobDataContributorRoleId)
     principalId: apiManagedIdentityPrincipalId
     principalType: 'ServicePrincipal'
   }
