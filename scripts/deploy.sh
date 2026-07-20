@@ -857,7 +857,7 @@ verify_rbac() {
       westus2Job)   scopeId="/subscriptions/${sub_id}/resourceGroups/${RG}/providers/Microsoft.App/jobs/${WESTUS2_RUNNER_JOB}" ;;
       reconcileJob) scopeId="/subscriptions/${sub_id}/resourceGroups/${RG}/providers/Microsoft.App/jobs/${RECONCILE_JOB}" ;;
       sandboxJob)   scopeId="/subscriptions/${sub_id}/resourceGroups/${RG}/providers/Microsoft.App/jobs/synthwatch-sandbox" ;;  # sandbox preview job (literal name in bicep)
-      sandboxContainer) scopeId="/subscriptions/${sub_id}/resourceGroups/${RG}/providers/Microsoft.Storage/storageAccounts/${storage_acct}/blobServices/default/containers/${sandbox_container}" ;;  # sandbox blob container (sandboxBlobWriter + apiSandboxBlobReader)
+      sandboxContainer) scopeId="/subscriptions/${sub_id}/resourceGroups/${RG}/providers/Microsoft.Storage/storageAccounts/${storage_acct}/blobServices/default/containers/${sandbox_container}" ;;  # sandbox blob container (sandboxBlobWriter + apiSandboxBlobWriter)
       *) flunk "rbac '${roleName}': UNKNOWN scope token '${scopeTok}' — verify() needs a resolver (refusing to skip)"; continue ;;
     esac
     # Match (role, scope) over ALL of the principal's assignments, scope compared LOWERCASED — `az role
