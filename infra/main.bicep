@@ -597,11 +597,17 @@ resource sandboxBlobWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' 
 //       persists that override VERBATIM on the execution resource (observed via `az containerapp job execution
 //       list`), readable by any Reader on this RG, and execution history is unbounded-by-contract for a
 //       triggerType:'Manual' job. Only the per-run key rides the env now — worthless without this blob.
-//     • DELETE — the API sweeps an ORPHANED payload when it flips a stale row to 'timeout'. The sandbox
-//       normally deletes on read; a preview that died between upload and read would otherwise leave ciphertext
-//       to the blob lifecycle rule, whose floor is ~1 DAY (daysAfterCreationGreaterThan is typed Integer — no
-//       fractional days — and a policy edit takes up to 24h to take effect) while its key sits in execution
-//       history permanently. The sweep bounds that to the 5-minute stale window.
+//       ★ NOTE the read/write asymmetry this creates with the SANDBOX MI, which holds Contributor on the same
+//       container: a hostile spec can delete or overwrite a CONCURRENT preview's payload. Confidentiality
+//       still holds (it cannot obtain the neighbour's key — that lives in the other execution's ARM env, and
+//       the sandbox MI has no ARM read grant), but the neighbour fails closed. A DoS, not a disclosure.
+//     • DELETE — the API sweeps an ORPHANED payload. The sandbox normally deletes on read; a preview that
+//       died between upload and read would otherwise leave ciphertext to the blob lifecycle rule, whose floor
+//       is ~1 DAY (daysAfterCreationGreaterThan is typed Integer — no fractional days — and a policy edit
+//       takes up to 24h to take effect) while its key sits in execution history permanently. The sweep runs on
+//       BOTH the poll and the create path — the create path is the one that matters, because the likeliest
+//       orphan is an abandoned tab, and nobody polls an abandoned tab. So the bound is "the next preview by
+//       any user", not a fixed interval, and NOT the 5 minutes an earlier draft of this comment claimed.
 //     • READ — unchanged: GET /api/preview/{token} still polls the sandbox job's trace result here.
 //   Container-scoped, NEVER account-scoped: the API MI must not gain write over the prod artifacts container.
 //   ★ This is the API MI, a DIFFERENT principal from the sandbox MI — so verify_sandbox_least_privilege's
