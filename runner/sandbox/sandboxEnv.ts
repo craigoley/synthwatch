@@ -65,9 +65,17 @@ export function buildSandboxEnv(vars: SandboxRunVars, parentEnv: NodeJS.ProcessE
   //   uncredentialed preview's child env is byte-identical to what it was before this feature existed.
   //   Every value published here is ALSO registered with makeRedactor as a knownValue by runSandboxPreview,
   //   so anything that echoes it into stdout / the trace / an error is scrubbed on the way out.
-  if (vars.credentials?.username) env.SW_SANDBOX_CRED_USERNAME = vars.credentials.username;
-  if (vars.credentials?.password) env.SW_SANDBOX_CRED_PASSWORD = vars.credentials.password;
-  if (vars.credentials?.bypassToken) env.SW_SANDBOX_CRED_BYPASS_TOKEN = vars.credentials.bypassToken;
+  //   ★ STRING-typed test, not plain truthiness — it must agree with credentialValues()/isCredentialedRun(),
+  //     which decide whether the run is `sensitive` at all. When those two predicates disagreed, a
+  //     non-string credential could be published to the spec while the run was classified non-sensitive
+  //     (redaction off, screenshot kept). decodeSandboxPayload now coerces, and this is the second lock.
+  const cred = (v: string | undefined): string | undefined => (typeof v === 'string' && v.length > 0 ? v : undefined);
+  const username = cred(vars.credentials?.username);
+  const password = cred(vars.credentials?.password);
+  const bypassToken = cred(vars.credentials?.bypassToken);
+  if (username) env.SW_SANDBOX_CRED_USERNAME = username;
+  if (password) env.SW_SANDBOX_CRED_PASSWORD = password;
+  if (bypassToken) env.SW_SANDBOX_CRED_BYPASS_TOKEN = bypassToken;
   // ★ Marker asserting the DECISION, so a future edit that spreads {...process.env} here is a visible diff.
   env.SW_SANDBOX_ENV_IS_ALLOWLISTED = '1';
   return env;

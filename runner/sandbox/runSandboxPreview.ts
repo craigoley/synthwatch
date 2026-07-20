@@ -19,7 +19,7 @@ import { IDENTITY_REDACTOR, makeRedactor, scrubError, tracePersistPlan, type Red
 import { compileSpec } from '../specfetch/compileSpec.js';
 import { buildRedactedTraceZip } from '../traceRedact.js';
 import { buildSandboxEnv, type SandboxRunVars } from './sandboxEnv.js';
-import { credentialValues, isCredentialedRun } from './sandboxPayload.js';
+import { credentialValues, isCredentialedRun, type SandboxCredentials } from './sandboxPayload.js';
 
 const CHILD_ENTRY = fileURLToPath(new URL('./sandboxChild.js', import.meta.url));
 
@@ -32,17 +32,57 @@ const CHILD_ENTRY = fileURLToPath(new URL('./sandboxChild.js', import.meta.url))
  * no C# counterpart and is never persisted to the fleet, so scrubbing here breaks nothing — and NOT
  * scrubbing would leave a typed password sitting in a `?password=…` request URL inside the result JSON.
  *
- * Round-tripping through JSON scrubs every string in the tree (URLs, console text, headers) in one pass.
- * `<redacted>` contains no quote or backslash, so a replacement can never break JSON validity.
+ * ★ Walks the tree and scrubs each STRING LEAF. It must NOT scrub `JSON.stringify(signals)` instead: that
+ * serializes a value like `P@ss"w0rd\x` into its ESCAPED form (`P@ss\"w0rd\\x`), which the escaped-literal
+ * knownValues rule cannot match — so any credential containing a quote or backslash would survive the scrub
+ * while looking scrubbed. Per-leaf redaction sees the real value.
  */
 function redactTraceSignals(signals: unknown | null, redact: Redactor): unknown | null {
   if (signals === null || signals === undefined) return signals;
+  const walk = (v: unknown): unknown => {
+    if (typeof v === 'string') return redact(v);
+    if (Array.isArray(v)) return v.map(walk);
+    if (v && typeof v === 'object') {
+      // Keys can carry a credential too (an object keyed by header/param value), so scrub both sides.
+      return Object.fromEntries(Object.entries(v).map(([k, val]) => [redact(k), walk(val)]));
+    }
+    return v;
+  };
   try {
-    return JSON.parse(redact(JSON.stringify(signals)));
+    return walk(signals);
   } catch {
-    // Fail-closed: if the scrub-and-reparse fails we drop the signals entirely rather than ship them raw.
+    // Fail-closed: if the scrub fails we drop the signals entirely rather than ship them raw.
     return null;
   }
+}
+
+/**
+ * The credential values to register with makeRedactor, plus their ENCODED forms.
+ *
+ * ★ makeRedactor matches knownValues as escaped LITERALS — the exact byte sequence. But a browser does not
+ * echo a credential back verbatim: Chromium percent-encodes it in a recorded navigation URL, and a JSON body
+ * carries it backslash-escaped. So `p@ss w0rd` appears in trace.network as `p@ss%20w0rd` and the literal rule
+ * misses it entirely. The fleet path has always had this gap; it only becomes load-bearing here, where the
+ * value is an ARBITRARY user-typed password rather than something the platform chose.
+ *
+ * Registering the encoded variants alongside the raw value closes it for the shapes we can enumerate.
+ * ★ This is defense-in-depth, not a proof: an encoding we did not anticipate would still slip through, which
+ * is exactly why screenshots are SUPPRESSED rather than scrubbed for a credentialed run.
+ */
+function redactionValues(creds: SandboxCredentials | undefined): string[] {
+  const out = new Set<string>();
+  for (const v of credentialValues(creds)) {
+    out.add(v);
+    for (const enc of [encodeURIComponent, encodeURI, (s: string) => JSON.stringify(s).slice(1, -1)]) {
+      try {
+        const e = enc(v);
+        if (e && e !== v) out.add(e);
+      } catch {
+        /* a lone surrogate can throw in encodeURI* — the raw value is still registered */
+      }
+    }
+  }
+  return [...out];
 }
 
 /** Bounds (mirrored by the ACA replicaTimeout + the api-side per-user rate/concurrency caps). */
@@ -116,22 +156,26 @@ export async function runSandboxPreview(
   //   the credential is exchanged for is not the credential, and is just as reusable).
   //   An UNCREDENTIALED preview gets IDENTITY_REDACTOR — byte-for-byte today's behaviour.
   const sensitive = isCredentialedRun(vars.credentials) && !vars.__unsafeDisableSensitiveHandlingForTest;
-  const redact: Redactor = sensitive ? makeRedactor(null, credentialValues(vars.credentials)) : IDENTITY_REDACTOR;
+  const redact: Redactor = sensitive ? makeRedactor(null, redactionValues(vars.credentials)) : IDENTITY_REDACTOR;
 
   // ★ STATIC GATE: esbuild compiles ONLY through the single lib/flow alias — a spec importing arbitrary npm
   //   (a Postgres client, an exfil lib) fails to compile and never runs. Same admission rule as merge/runtime.
   //   The throw is scrubbed: an esbuild syntax error QUOTES THE OFFENDING SOURCE LINE, so a spec that inlines
   //   a credential would otherwise echo it straight back through the api's 4xx body.
-  let compiledJs: string;
+  // ★ The caught error is converted to a SCRUBBED message inside the catch, and the throw happens OUTSIDE
+  //   it. That is not a lint dodge — attaching the original as `cause` (what preserve-caught-error asks for)
+  //   would re-attach the very string this scrub exists to remove, and anything walking the cause chain (a
+  //   logger, the api's error serializer, `util.inspect`) would print it. Throwing outside the catch means
+  //   there is no caught error in scope to preserve, so the rule is satisfied honestly rather than silenced.
+  let compiledJs: string | undefined;
+  let compileError: string | null = null;
   try {
     compiledJs = await compileSpec(specSource);
   } catch (e) {
-    // ★ NO `cause` — DELIBERATE, and the one place preserve-caught-error must not be obeyed. The cause IS
-    //   the unredacted esbuild error (source line and all); attaching it would re-attach the very string
-    //   this line exists to scrub, and anything that walks the cause chain (a logger, an api serializer,
-    //   `util.inspect`) would print the credential. The scrubbed message keeps the diagnostic.
-    // eslint-disable-next-line preserve-caught-error
-    throw new Error(redact(e instanceof Error ? e.message : String(e)));
+    compileError = redact(e instanceof Error ? e.message : String(e));
+  }
+  if (compileError !== null || compiledJs === undefined) {
+    throw new Error(compileError ?? 'spec failed to compile');
   }
 
   const dir = await mkdtemp(join(tmpdir(), 'sw-sandbox-'));
@@ -235,9 +279,21 @@ function runChild(specFile: string, vars: SandboxRunVars, sensitive: boolean, re
           const plan = tracePersistPlan(sensitive, (status ?? 'error') as TerminalStatus);
 
           if (sensitive) {
-            // Scrub the text channels the fleet path scrubs: per-step error messages, the flow error, and
-            // (preview-only, see redactTraceSignals) trace_signals.
-            steps = steps.map((s) => ({ ...s, errorMessage: s.errorMessage === null ? null : redact(s.errorMessage) }));
+            // Scrub EVERY text field that reaches the result JSON — not just the obvious error channels.
+            // ★ tests[], failedStep and steps[].name are SPEC-AUTHORED strings. `test('login as ' + user)` /
+            //   `step('enter ' + pw)` is an entirely ordinary way to write a login flow, and those names are
+            //   uploaded verbatim inside {token}.json and rendered by the UI. Scrubbing only errorMessage
+            //   left that wide open.
+            // ★ failedStep is scrubbed BEFORE scrubError, because scrubError's fallback
+            //   (sensitiveErrorMessage) interpolates failedStep into the message — so an unscrubbed one would
+            //   re-inject the secret through the very path meant to blank a fully-secret error.
+            tests = tests.map(redact);
+            failedStep = failedStep === null ? null : redact(failedStep);
+            steps = steps.map((s) => ({
+              ...s,
+              name: redact(s.name),
+              errorMessage: s.errorMessage === null ? null : redact(s.errorMessage),
+            }));
             error = error === null ? null : scrubError(redact, (status ?? 'error') as TerminalStatus, failedStep, error);
             traceSignals = redactTraceSignals(traceSignals, redact);
           }
@@ -264,6 +320,19 @@ function runChild(specFile: string, vars: SandboxRunVars, sensitive: boolean, re
           if (j.screenshotPath && plan.failureScreenshot) screenshot = await readFile(j.screenshotPath).catch(() => null);
         } catch {
           /* no valid report → ok stays false */
+          // ★ FAIL CLOSED on a sensitive run. The redaction above happens INSIDE this try, and the fields
+          //   are assigned RAW before it runs — so a throw part-way through (a malformed signals tree, a
+          //   readFile error) would otherwise resolve the unscrubbed values. Drop every text channel that
+          //   may not have been scrubbed rather than ship a maybe-redacted one.
+          if (sensitive) {
+            tests = [];
+            failedStep = null;
+            steps = [];
+            traceSignals = null;
+            error = 'preview failed and its output could not be safely redacted — output withheld';
+            trace = null;
+            screenshot = null;
+          }
         }
         // ★ stdout/stderr LAST, on every path. The platform has never redacted stdout anywhere (the fleet
         //   path logs raw and always has), but here stdout carries the SPEC'S OWN output — a `console.log`

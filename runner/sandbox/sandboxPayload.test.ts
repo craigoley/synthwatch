@@ -11,6 +11,7 @@ import { randomBytes } from 'node:crypto';
 
 import { encryptCredValue, parseAes256Key } from '../crypto.js';
 import { runSandboxPreview } from './runSandboxPreview.js';
+import { buildSandboxEnv } from './sandboxEnv.js';
 import {
   credentialValues,
   decodeSandboxPayload,
@@ -148,4 +149,64 @@ test('★ the legacy SW_SANDBOX_SPEC_B64 path still resolves, and carries no cre
 
 test('★ no channel at all → a named failure, not a silent empty run', async () => {
   await assert.rejects(() => resolveSandboxPayload({} as NodeJS.ProcessEnv, recordingDeps([], null)), /no spec/);
+});
+
+// ── THE KEY ALONE DECLARES THE CHANNEL — a config bug must not downgrade to the leaky path ──────────────
+test('★ SW_SANDBOX_CRED_KEY without a RESULT_TOKEN FAILS CLOSED — it never falls back to the legacy env', async () => {
+  const log: string[] = [];
+  const env = {
+    SW_SANDBOX_CRED_KEY: KEY_B64, // the api declared the payload channel…
+    // …but omitted the token. Gating on `token && key` used to slide silently into the legacy branch here.
+    SW_SANDBOX_SPEC_B64: Buffer.from("import { test } from '../../lib/flow'; test('x', async () => {});").toString('base64'),
+  } as NodeJS.ProcessEnv;
+
+  await assert.rejects(
+    () => resolveSandboxPayload(env, recordingDeps(log, sealed({ spec: 'unused' }))),
+    /SW_SANDBOX_RESULT_TOKEN is missing/,
+    'a key without a token must abort — running the legacy spec would drop the credentials AND strand the ' +
+      'ciphertext undeleted while its key sits in ACA execution history',
+  );
+  // ★ And it must not have gone looking for a blob it cannot name.
+  assert.deepEqual(log, [], 'no fetch should be attempted without a token');
+});
+
+// ── TYPE CONFUSION: a non-string credential must not disable every protection while still being published ──
+test('★ a non-string credential value is dropped, not passed through as a truthy non-string', () => {
+  // The failure this pins: `{"password": 12345678}` used to survive decode as a number. credentialValues()
+  // filtered it out of knownValues (it tests typeof), so isCredentialedRun() said FALSE → IDENTITY_REDACTOR,
+  // raw trace, screenshot KEPT, stdout unscrubbed — while buildSandboxEnv's truthiness test still published
+  // it to the spec. Every protection off, secret still handed over.
+  const envelope = encryptCredValue(
+    JSON.stringify({ spec: 's', credentials: { username: 'u', password: 12345678, bypassToken: { a: 1 } } }),
+    KEY,
+  );
+  const decoded = decodeSandboxPayload(envelope, KEY);
+  assert.equal(decoded.credentials?.password, undefined, 'a numeric password must not survive decode');
+  assert.equal(decoded.credentials?.bypassToken, undefined, 'an object bypassToken must not survive decode');
+  assert.equal(decoded.credentials?.username, 'u', 'the legitimate string field still comes through');
+  // The two predicates that used to disagree now agree: only the string counts.
+  assert.deepEqual(credentialValues(decoded.credentials), ['u']);
+  assert.equal(isCredentialedRun(decoded.credentials), true);
+
+  // …and when EVERY field is a non-string, the run is not credentialed at all (nothing to publish).
+  const allBad = encryptCredValue(JSON.stringify({ spec: 's', credentials: { password: 42 } }), KEY);
+  const d2 = decodeSandboxPayload(allBad, KEY);
+  assert.deepEqual(credentialValues(d2.credentials), []);
+  assert.equal(isCredentialedRun(d2.credentials), false);
+});
+
+// ── buildSandboxEnv must apply the SAME string predicate (the second lock) ───────────────────────────────
+test('★ buildSandboxEnv publishes only STRING credentials — it cannot disagree with isCredentialedRun', () => {
+  const env = buildSandboxEnv(
+    {
+      targetUrl: 'https://example.com',
+      timeoutMs: 1000,
+      // Deliberately cast: models a decode path that let a non-string through.
+      credentials: { username: 'u', password: 99 as unknown as string, bypassToken: '' },
+    },
+    {} as NodeJS.ProcessEnv,
+  );
+  assert.equal(env.SW_SANDBOX_CRED_USERNAME, 'u');
+  assert.ok(!('SW_SANDBOX_CRED_PASSWORD' in env), 'a non-string password must never reach the spec');
+  assert.ok(!('SW_SANDBOX_CRED_BYPASS_TOKEN' in env), 'an empty token is not a credential');
 });

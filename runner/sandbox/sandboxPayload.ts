@@ -110,15 +110,26 @@ export function decodeSandboxPayload(ciphertext: string, key: Buffer): SandboxPa
   if (!p || typeof p.spec !== 'string' || p.spec.length === 0) {
     throw new Error('sandbox payload has no `spec` string (fail-closed)');
   }
-  const creds = p.credentials;
+  const creds = p.credentials as Record<string, unknown> | undefined | null;
   return {
     spec: p.spec,
     // Take ONLY the three known credential fields — an api that grew a fourth field cannot smuggle it into
     // the child env without this file changing too (and knownValues covering it).
+    // ★ AND ONLY AS STRINGS. Field-NAME filtering alone left a type-confusion fail-OPEN: a non-string value
+    //   (say `{"password": 12345678}`) was passed through, `credentialValues` filtered it out of knownValues
+    //   (it checks typeof), but buildSandboxEnv tested plain truthiness and still published it to the spec.
+    //   Net effect: sensitive=false ⇒ IDENTITY_REDACTOR, raw trace kept, SCREENSHOT KEPT, stdout unscrubbed —
+    //   every protection off while the secret was still handed to the uploaded code. Coercing to
+    //   string-or-undefined here makes the two predicates agree by construction.
     credentials: creds
-      ? { username: creds.username, password: creds.password, bypassToken: creds.bypassToken }
+      ? { username: asString(creds.username), password: asString(creds.password), bypassToken: asString(creds.bypassToken) }
       : undefined,
   };
+}
+
+/** A credential field is a string or it is absent — never a number/object/boolean (see decodeSandboxPayload). */
+function asString(v: unknown): string | undefined {
+  return typeof v === 'string' ? v : undefined;
 }
 
 /** The blob side of the channel, injected so the ordering contract below is testable without Azure. */
@@ -152,7 +163,19 @@ export async function resolveSandboxPayload(
   const token = env.SW_SANDBOX_RESULT_TOKEN;
   const keyRaw = env.SW_SANDBOX_CRED_KEY;
 
-  if (token && keyRaw) {
+  // ★ THE KEY ALONE DECLARES THE CHANNEL. Gating on `token && keyRaw` let a key-without-token config bug
+  //   fall silently through to the legacy env path: a DIFFERENT spec would run, the credentials would be
+  //   dropped, and — worst — the {token}.payload ciphertext would never be fetched or deleted, sitting for
+  //   the ~1-day lifecycle floor while its key sits in ACA execution history permanently. That is exactly
+  //   the both-halves-available window the split-secret design exists to deny, reached by a typo rather
+  //   than the documented crash case. If the key is set, the payload channel is the ONLY acceptable answer.
+  if (keyRaw) {
+    if (!token) {
+      throw new Error(
+        'sandboxPayload: SW_SANDBOX_CRED_KEY is set (payload channel declared) but SW_SANDBOX_RESULT_TOKEN is ' +
+          'missing — cannot locate the payload blob; refusing to execute (fail-closed)',
+      );
+    }
     // ★ SW_SANDBOX_CRED_KEY being set is the api DECLARING the payload channel. From here the legacy env is
     //   no longer an acceptable answer: falling back would (a) silently run a DIFFERENT spec than the one
     //   the user submitted, dropping their credentials, and (b) — if the fetch returned null because

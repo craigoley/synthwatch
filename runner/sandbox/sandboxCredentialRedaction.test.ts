@@ -16,8 +16,16 @@ import yauzl from 'yauzl';
 
 import { runSandboxPreview, type PreviewResult } from './runSandboxPreview.js';
 
-/** A distinctive, high-entropy value that cannot occur naturally anywhere in a trace. */
-const SENTINEL = `SENTINEL_PW_${randomBytes(12).toString('hex')}`;
+/**
+ * Distinctive, high-entropy values that cannot occur naturally anywhere in a trace.
+ *
+ * ★ THE PASSWORD DELIBERATELY CONTAINS A SPACE, A QUOTE, A BACKSLASH AND A PERCENT. An earlier version used
+ * a bare hex sentinel — URL-safe and JSON-safe by construction — and that shape is exactly why this suite
+ * passed while three real leaks were live: a value needing percent-encoding survives the escaped-literal
+ * knownValues rule in a recorded URL, and a value needing JSON-escaping survives a scrub applied to
+ * serialized JSON. A sentinel that can't hit those paths can't catch them.
+ */
+const SENTINEL = `SENTINEL_PW_${randomBytes(12).toString('hex')} "q\\z%z`;
 const SENTINEL_USER = `SENTINEL_USER_${randomBytes(8).toString('hex')}`;
 
 /**
@@ -35,16 +43,21 @@ const LEAKY_LOGIN_SPEC = `
   const user = process.env.SW_SANDBOX_CRED_USERNAME;
   const pw = process.env.SW_SANDBOX_CRED_PASSWORD;
   console.log('LEAK_MARKER_STDOUT ' + user + ' / ' + pw);
-  test('login', async ({ page }) => {
+  // ★ The credential is in the TEST NAME and the STEP NAMES, not only in errors/output. Interpolating an
+  //   identity into a name is how people actually write login flows, and those names are uploaded verbatim
+  //   inside {token}.json and rendered by the UI — a channel an errorMessage-only scrub misses entirely.
+  test('login as ' + user, async ({ page }) => {
     await step('open a login form', async () => {
       await page.setContent('<form><input id="u" name="username"><input id="p" name="password" type="password"></form>');
       await page.fill('#u', user);
       await page.fill('#p', pw);
     });
     await step('submit the credential over the wire', async () => {
+      // Chromium percent-encodes this on the way into trace.network — so the recorded URL never contains the
+      // raw bytes, and a redactor registering only the raw literal will not match it.
       await page.goto('https://example.com/?q=' + pw, { waitUntil: 'domcontentloaded' }).catch(() => {});
     });
-    await step('fail the way a bad login fails', async () => {
+    await step('enter password ' + pw, async () => {
       throw new Error('login rejected for user ' + user + ' with password ' + pw);
     });
   });
@@ -76,17 +89,37 @@ function expandZip(buf: Buffer): Promise<string[]> {
   });
 }
 
+/**
+ * Collect every STRING LEAF of a value, raw.
+ *
+ * ★ NOT `JSON.stringify(value)`. Serializing escapes the leaves — a password containing `"` or `\` becomes
+ * `\"` / `\\` in the blob and a raw-sentinel `includes()` never matches it. An earlier version of this
+ * harness scanned stringified blobs and would have reported CLEAN on a leak it was staring at, which is the
+ * same defect it exists to catch (see redactTraceSignals). Walk and compare the real strings.
+ */
+function stringLeaves(v: unknown, out: string[] = []): string[] {
+  if (typeof v === 'string') out.push(v);
+  else if (Array.isArray(v)) for (const x of v) stringLeaves(x, out);
+  else if (v && typeof v === 'object') for (const [k, val] of Object.entries(v)) { out.push(k); stringLeaves(val, out); }
+  return out;
+}
+
 /** Every place a credential could surface, named — so a failure says WHICH surface leaked. */
 async function surfaces(r: PreviewResult): Promise<Array<[string, string]>> {
+  const leaves = (label: string, v: unknown): Array<[string, string]> =>
+    stringLeaves(v).map((s, i) => [`${label}[${i}]`, s] as [string, string]);
   const s: Array<[string, string]> = [
     ['stdout', r.stdout],
     ['stderr', r.stderr],
     ['error', r.error ?? ''],
     ['failedStep', r.failedStep ?? ''],
-    ['steps[].errorMessage', JSON.stringify(r.steps ?? [])],
-    ['traceSignals', JSON.stringify(r.traceSignals ?? null)],
-    // The api uploads this whole object as {token}.json and the UI renders it — scan it as one blob too.
-    ['result JSON', JSON.stringify({ ...r, trace: undefined, screenshot: undefined })],
+    // ★ Named separately so a leak is attributed precisely — these are the spec-authored strings that were
+    //   shipping raw when only errorMessage was scrubbed.
+    ...leaves('tests', r.tests ?? []),
+    ...leaves('steps', r.steps ?? []),
+    ...leaves('traceSignals', r.traceSignals ?? null),
+    // The api uploads this whole object as {token}.json and the UI renders it — walk it too.
+    ...leaves('result', { ...r, trace: undefined, screenshot: undefined }),
   ];
   // ★ A byte-scan of a PNG is a BACKSTOP, not the control. A credential rendered into a screenshot is
   //   PIXELS, not the ASCII string — no string search can find it, which is precisely why the real
@@ -96,10 +129,22 @@ async function surfaces(r: PreviewResult): Promise<Array<[string, string]>> {
   return s;
 }
 
-/** THROWS naming the leaking surface if the sentinel survives anywhere. The mutant run asserts this throws. */
+/**
+ * THROWS naming the leaking surface if the sentinel survives anywhere. The mutant run asserts this throws.
+ * ★ Checks the ENCODED forms too: Chromium percent-encodes a credential into a recorded URL, so scanning
+ * only for the raw bytes would call a percent-encoded leak clean.
+ */
 async function assertSentinelAbsent(r: PreviewResult): Promise<void> {
+  const forms: Array<[string, string]> = [];
+  for (const [label, value] of [['password', SENTINEL], ['username', SENTINEL_USER]] as const) {
+    forms.push([label, value]);
+    for (const [how, enc] of [['url-encoded', encodeURIComponent], ['uri-encoded', encodeURI]] as const) {
+      const e = enc(value);
+      if (e !== value) forms.push([`${label} (${how})`, e]);
+    }
+  }
   for (const [name, text] of await surfaces(r)) {
-    for (const [label, value] of [['password', SENTINEL], ['username', SENTINEL_USER]] as const) {
+    for (const [label, value] of forms) {
       assert.ok(!text.includes(value), `LEAK: the ${label} survived in ${name}`);
     }
   }
