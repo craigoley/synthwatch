@@ -1,0 +1,67 @@
+name: Auto-merge janitor
+
+# ──────────────────────────────────────────────────────────────────────────────────────────
+# RECOVERS a trusted-author PR whose native auto-merge GitHub DISABLED for a transient reason.
+#
+# The primary `automerge` job (claude-review.yml) enables auto-merge on `pull_request`
+# [opened, synchronize, reopened, ready_for_review] — i.e. ONCE, tied to a PR event. But GitHub can
+# DISABLE an already-enabled auto-merge on its own (observed 2026-07-18: #340/#341 lost auto-merge at
+# 14:37:24 during a burst of three sibling Dependabot PRs merging to main — a mergeability-recompute
+# churn). When that happens WITHOUT a new commit (no `synchronize`), nothing re-runs the automerge job,
+# so the PR sits green-but-open indefinitely (both sat 2 days until merged by hand).
+#
+# This sweep closes that gap: on a schedule, RE-ENABLE native auto-merge on every open, non-draft,
+# trusted-author PR that currently has auto-merge OFF. It is SAFE — `--auto` never merges a red PR
+# (GitHub completes it only when branch protection is satisfied), so a still-failing PR simply waits;
+# a green one merges. Idempotent (skips PRs that already have auto-merge enabled).
+# ──────────────────────────────────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    - cron: '*/30 * * * *' # every 30 min — a stuck trusted PR recovers within one window
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: automerge-janitor
+  cancel-in-progress: true
+
+jobs:
+  reenable:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # native auto-merge completes via GITHUB_TOKEN + branch-protection
+      pull-requests: write # enable auto-merge
+    steps:
+      - name: Re-enable auto-merge on trusted, non-draft, auto-merge-off PRs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # SAME trusted set as the primary automerge job (claude-review.yml). A here-string membership test
+          # (not `grep -q` on a pipe) — SIGPIPE-safe per CLAUDE.md's #155/#279/#283 deploy.sh lesson.
+          TRUSTED='craigoley cao825 craigoleyagent dependabot[bot]'
+
+          # Open PRs to main, not draft, whose auto-merge is NOT already enabled (autoMergeRequest == null).
+          gh pr list --repo "$REPO" --state open --base main \
+            --json number,author,isDraft,autoMergeRequest \
+            --jq '.[] | select(.isDraft == false) | select(.autoMergeRequest == null) | [.number, .author.login] | @tsv' \
+            > /tmp/prs.tsv || { echo "gh pr list failed"; exit 1; }
+
+          if [ ! -s /tmp/prs.tsv ]; then echo "No open PR needs auto-merge re-enabled."; exit 0; fi
+
+          while IFS=$'\t' read -r NUM LOGIN; do
+            [ -n "$NUM" ] || continue
+            if [[ " $TRUSTED " != *" $LOGIN "* ]]; then
+              echo "PR #$NUM by '$LOGIN' — not a trusted author, skipping."
+              continue
+            fi
+            echo "PR #$NUM by '$LOGIN' has auto-merge OFF — re-enabling squash auto-merge (waits for green)."
+            # `|| true`: a PR that can't take auto-merge right now (e.g. a real conflict → DIRTY) must not fail
+            # the sweep for the others; the next window retries once Dependabot rebases it.
+            gh pr merge "$NUM" --repo "$REPO" --auto --squash --delete-branch \
+              || echo "  (could not enable auto-merge on #$NUM — likely conflicting; will retry next window)"
+          done < /tmp/prs.tsv
