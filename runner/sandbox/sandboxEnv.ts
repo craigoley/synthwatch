@@ -11,7 +11,9 @@
 //      sandboxIsolation.test.ts): set a fake CRED_ENC_KEY in the parent, prove the child's dump omits it.
 //
 // ★ ALLOWLIST, never denylist. A denylist ("strip these secrets") fails open the day a new secret is added.
-// The child env is EMPTY except the handful of non-secret vars a Playwright spec genuinely needs to run.
+// The child env is EMPTY except the handful of non-secret vars a Playwright spec genuinely needs to run,
+// plus the user's OWN per-run credentials when they typed some (see SandboxRunVars.credentials).
+import type { SandboxCredentials } from './sandboxPayload.js';
 
 /** The ONLY env vars the sandbox child inherits — every one is non-secret and load-bearing for execution. */
 const SANDBOX_ENV_ALLOWLIST = [
@@ -30,6 +32,18 @@ export interface SandboxRunVars {
   targetUrl: string;
   /** Hard per-run wall-clock budget (ms) — mirrored by the ACA replicaTimeout; belt-and-braces here. */
   timeoutMs: number;
+  /**
+   * ★ The user's OWN credentials, typed in the Tests UI for THIS run, arriving via the payload blob
+   * (sandboxPayload.ts) — NEVER via the ARM env, which ACA persists in execution history. Published to the
+   * child so the spec can drive a real login.
+   *
+   * ★ THIS DOES NOT WEAKEN THE ALLOWLIST PROPERTY. The property is "the executed spec cannot reach the
+   * FLEET's secrets" — no CRED_ENC_KEY, so no decrypting other monitors' stored logins; no DATABASE_URL;
+   * no ACS/AOAI key; no platform VERCEL_BYPASS_TOKEN. Handing the spec the one credential the user just
+   * typed, for the run they just asked for, is the feature. PROD_SECRET_ENV_NAMES is unchanged and
+   * sandboxIsolation.test.ts still proves every name on it is absent.
+   */
+  credentials?: SandboxCredentials;
 }
 
 /**
@@ -47,6 +61,13 @@ export function buildSandboxEnv(vars: SandboxRunVars, parentEnv: NodeJS.ProcessE
   env.SW_SANDBOX = '1';
   env.SW_SANDBOX_TARGET_URL = vars.targetUrl;
   env.SW_SANDBOX_TIMEOUT_MS = String(vars.timeoutMs);
+  // ★ The user's own per-run credentials (see SandboxRunVars.credentials). Set ONLY when non-empty, so an
+  //   uncredentialed preview's child env is byte-identical to what it was before this feature existed.
+  //   Every value published here is ALSO registered with makeRedactor as a knownValue by runSandboxPreview,
+  //   so anything that echoes it into stdout / the trace / an error is scrubbed on the way out.
+  if (vars.credentials?.username) env.SW_SANDBOX_CRED_USERNAME = vars.credentials.username;
+  if (vars.credentials?.password) env.SW_SANDBOX_CRED_PASSWORD = vars.credentials.password;
+  if (vars.credentials?.bypassToken) env.SW_SANDBOX_CRED_BYPASS_TOKEN = vars.credentials.bypassToken;
   // ★ Marker asserting the DECISION, so a future edit that spreads {...process.env} here is a visible diff.
   env.SW_SANDBOX_ENV_IS_ALLOWLISTED = '1';
   return env;

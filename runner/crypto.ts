@@ -24,20 +24,30 @@ const KEY_LEN = 32; // AES-256
  * The key itself is NEVER logged / returned in an error (the message names the env var, never its value).
  */
 export function loadCredEncKey(env: NodeJS.ProcessEnv = process.env): Buffer {
-  const raw = env.CRED_ENC_KEY;
+  return parseAes256Key(env.CRED_ENC_KEY, 'CRED_ENC_KEY');
+}
+
+/**
+ * Parse + validate a base64 AES-256 key from `raw`, naming the source in every error via `varName`.
+ * Extracted from loadCredEncKey so the SANDBOX PAYLOAD key (SW_SANDBOX_CRED_KEY — a per-run, ephemeral
+ * key that is NOT CRED_ENC_KEY and NEVER unlocks stored monitor credentials) goes through the SAME strict
+ * validation rather than a second, laxer parser. FAIL-CLOSED: absent, non-canonical base64, or the wrong
+ * decoded length throws — the caller must NOT proceed. The key value is NEVER included in an error message.
+ */
+export function parseAes256Key(raw: string | undefined, varName: string): Buffer {
   if (!raw || raw.length === 0) {
-    throw new Error('CRED_ENC_KEY is not set — cannot encrypt/decrypt credential values (fail-closed)');
+    throw new Error(`${varName} is not set — cannot encrypt/decrypt credential values (fail-closed)`);
   }
   // STRICT base64 validation BEFORE decode. Node's Buffer.from(…, 'base64') is lenient (silently drops
   // invalid chars / stops at bad padding), so a malformed key that happens to decode to 32 bytes would be
   // ACCEPTED here but REJECTED by .NET's strict Convert.FromBase64String — a cross-repo divergence. Reject
   // anything that isn't canonical base64 (length %4, valid alphabet, ≤2 '=' pad) so both sides agree.
   if (raw.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(raw)) {
-    throw new Error('CRED_ENC_KEY is not valid base64 (fail-closed)');
+    throw new Error(`${varName} is not valid base64 (fail-closed)`);
   }
   const key = Buffer.from(raw, 'base64');
   if (key.length !== KEY_LEN) {
-    throw new Error(`CRED_ENC_KEY must decode to ${KEY_LEN} bytes (AES-256); got ${key.length} (fail-closed)`);
+    throw new Error(`${varName} must decode to ${KEY_LEN} bytes (AES-256); got ${key.length} (fail-closed)`);
   }
   return key;
 }
