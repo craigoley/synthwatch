@@ -227,8 +227,10 @@ test('★★ META: with the protections disabled the SAME assertions RED — the
   //     passes. This keeps the image surface honest in the ON test above.
   assert.ok(
     mutant.screenshot && mutant.screenshot.byteLength > 0,
-    '★ THE SUPPRESSION CHECK IS VACUOUS: even unprotected, this flow captured no screenshot — so asserting ' +
-      'null on the protected run proves nothing about suppression.',
+    '★ THE IMAGE SURFACE IS VACUOUS: even with the protections DISABLED this flow captured no screenshot. ' +
+      'The pixel scan then runs over zero bytes on BOTH runs, so "the sentinel is absent from the ' +
+      'screenshot" proves nothing — and the mutant in (a) is scanning one fewer surface than the ' +
+      'protected run, so the comparison is no longer like-for-like. Make the flow FAIL so it captures one.',
   );
 });
 
