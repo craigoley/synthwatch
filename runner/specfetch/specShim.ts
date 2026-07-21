@@ -35,18 +35,123 @@ import { ExpectationError } from '../errors.js';
 export interface CapturedTest {
   name: string;
   fn: (args: { page: Page }) => Promise<void>;
-}
-const captured: CapturedTest[] = [];
-
-export function test(name: string, fn: (args: { page: Page }) => Promise<void>): void {
-  captured.push({ name, fn });
+  /** Set on EVERY returned test when a `test.only` was present and the set was narrowed to it. The
+   *  caller MUST surface this: silently running a subset would misrepresent what a real check does. */
+  onlyFiltered?: boolean;
 }
 
-/** Return and CLEAR the captured tests (call right after importing a compiled spec). */
+interface Entry extends CapturedTest {
+  only: boolean;
+  /** beforeEach/afterEach in scope at declaration time, captured by value (Playwright scopes hooks
+   *  to their describe block, and a later hook must not retro-apply to an earlier test). */
+  before: Hook[];
+  after: Hook[];
+}
+type Hook = () => Promise<void> | void;
+
+const captured: Entry[] = [];
+
+// ── Declaration-time scope. describe() pushes a frame, runs its body SYNCHRONOUSLY (so inner test()
+//    calls land while the frame is live), then pops. Hooks and the name prefix are per-frame, so
+//    nesting composes without a second registry. ──────────────────────────────────────────────────
+interface Frame { prefix: string; before: Hook[]; after: Hook[]; }
+const stack: Frame[] = [{ prefix: '', before: [], after: [] }];
+const top = (): Frame => stack[stack.length - 1];
+const scopedHooks = (pick: (f: Frame) => Hook[]): Hook[] => stack.flatMap(pick);
+
+function register(name: string, fn: (args: { page: Page }) => Promise<void>, only: boolean): void {
+  const before = scopedHooks((f) => f.before);
+  const after = scopedHooks((f) => f.after);
+  const qualified = top().prefix ? `${top().prefix} › ${name}` : name;
+  captured.push({
+    name: qualified,
+    only,
+    before,
+    after,
+    // Hooks run around the body HERE, so downstream (specToFlow, the step recorder, the runner) sees
+    // one plain test fn and needs no knowledge of hooks — the single execution path is preserved.
+    fn: async (args) => {
+      for (const h of before) await h();
+      try {
+        await fn(args);
+      } finally {
+        for (const h of after) await h();
+      }
+    },
+  });
+}
+
+/** `test(name, fn)` — the base form, unchanged. */
+function testFn(name: string, fn: (args: { page: Page }) => Promise<void>): void {
+  register(name, fn, false);
+}
+
+/** The Playwright surface a pasted spec most commonly uses. All of it feeds the ONE registry above. */
+const MEMBERS: Record<string, unknown> = {
+  /** `test.describe(name, body)` — body runs immediately; inner tests inherit the name prefix + hooks. */
+  describe: (name: string, body: () => void): void => {
+    stack.push({ prefix: top().prefix ? `${top().prefix} › ${name}` : name, before: [], after: [] });
+    try {
+      body();
+    } finally {
+      stack.pop();
+    }
+  },
+  beforeEach: (fn: Hook): void => void top().before.push(fn),
+  afterEach: (fn: Hook): void => void top().after.push(fn),
+  /** ★ `test.only` RUNS A SUBSET — and the result says so (see onlyFiltered). In a preview "just this
+   *  one" is genuinely useful while iterating, so it is honoured rather than rejected; but a preview
+   *  that quietly ran 1 of 6 while the real check runs all 6 would misrepresent production, so the
+   *  narrowing is reported, never silent. */
+  only: (name: string, fn: (args: { page: Page }) => Promise<void>): void => register(name, fn, true),
+  /** `test.skip(name, fn)` — declared and not run. Playwright's other skip forms (bare/conditional)
+   *  are not supported and fall through to the unsupported-API throw below. */
+  skip: (name: string, _fn?: (args: { page: Page }) => Promise<void>): void => {
+    void name;
+    void _fn;
+  },
+};
+
+const SUPPORTED = ['test()', 'test.describe', 'test.beforeEach', 'test.afterEach', 'test.only', 'test.skip'];
+
+/**
+ * ★ UNSUPPORTED APIs FAIL BY NAME. Before this, `test.describe` was simply absent, so a pasted spec died
+ * with a bare "test.describe is not a function" — and, worse, that throw produced no structured output at
+ * all, so the operator saw a generic failure. Anything not in MEMBERS now throws a message that NAMES the
+ * API it tried and lists what IS available, which is the difference between "fix your spec" and "guess".
+ */
+export const test = new Proxy(testFn, {
+  get(target, prop, receiver) {
+    if (typeof prop === 'symbol' || prop in target) return Reflect.get(target, prop, receiver);
+    if (prop in MEMBERS) return MEMBERS[prop as string];
+    return () => {
+      throw new Error(
+        `test.${String(prop)}() is not supported by the SynthWatch spec shim. Supported: ${SUPPORTED.join(', ')}. ` +
+          `A preview runs through the same instrumented shim a real monitor uses, so unsupported Playwright ` +
+          `runner APIs are refused rather than silently ignored.`,
+      );
+    };
+  },
+}) as typeof testFn & {
+  describe: (name: string, body: () => void) => void;
+  beforeEach: (fn: Hook) => void;
+  afterEach: (fn: Hook) => void;
+  only: (name: string, fn: (args: { page: Page }) => Promise<void>) => void;
+  skip: (name: string, fn?: (args: { page: Page }) => Promise<void>) => void;
+};
+
+/** Return and CLEAR the captured tests (call right after importing a compiled spec).
+ *  ★ If ANY test.only was declared, the set is narrowed to those and every returned test carries
+ *  onlyFiltered — the caller surfaces it so a subset run is never mistaken for a full one. */
 export function drainCapturedTests(): CapturedTest[] {
-  const out = captured.slice();
+  const all = captured.slice();
   captured.length = 0;
-  return out;
+  stack.length = 0;
+  stack.push({ prefix: '', before: [], after: [] });
+
+  const only = all.filter((e) => e.only);
+  const chosen = only.length > 0 ? only : all;
+  return chosen.map(({ name, fn }) => (only.length > 0 ? { name, fn, onlyFiltered: true } : { name, fn }));
 }
 
 // ---------------------------------------------------------------------------

@@ -287,3 +287,76 @@ nodeTest('a TYPE-ONLY @playwright/test reference is erased and needs no resoluti
   );
   assert.doesNotMatch(js, /@playwright\/test/, 'the type-only reference must be fully erased');
 });
+
+// ──────────────────────────────────────────────────────────────────────────────────────────────────
+// ★ The Playwright surface a PASTED spec actually uses — all feeding the ONE registry.
+// ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+const PW = (body: string): string => `import { test, expect } from '@playwright/test';\n${body}`;
+
+nodeTest('★ test.describe registers its inner tests, prefixed, and nests', async () => {
+  const { compileAndLoad } = await import('./compileSpec.js');
+  // Before this, test.describe was simply absent — a pasted spec died with "test.describe is not a
+  // function" AND produced no structured output at all (the throw escaped to stderr).
+  const one = await compileAndLoad(PW(`test.describe('suite', () => { test('inner', async ({page}) => {}); });`));
+  assert.deepEqual(one.map((t) => t.name), ['suite › inner']);
+
+  const deep = await compileAndLoad(
+    PW(`test.describe('outer', () => { test.describe('inner', () => { test('deep', async ({page}) => {}); }); });`));
+  assert.deepEqual(deep.map((t) => t.name), ['outer › inner › deep'], 'nesting composes via the frame stack');
+});
+
+nodeTest('★ beforeEach/afterEach wrap the body in order, on the SINGLE execution path', async () => {
+  const { compileAndLoad } = await import('./compileSpec.js');
+  const order: string[] = [];
+  (globalThis as unknown as { __ord: string[] }).__ord = order;
+  const tests = await compileAndLoad(PW(
+    `test.beforeEach(async () => { (globalThis as any).__ord.push('before'); });\n` +
+    `test.afterEach(async () => { (globalThis as any).__ord.push('after'); });\n` +
+    `test('hooked', async ({page}) => { (globalThis as any).__ord.push('body'); });`));
+  await tests[0].fn({} as never);
+  // Hooks are folded into the captured fn, so specToFlow / the recorder / the runner still see ONE
+  // plain test function and need no knowledge of hooks.
+  assert.deepEqual(order, ['before', 'body', 'after']);
+});
+
+nodeTest('★ test.only NARROWS the run — and every returned test is flagged so the caller must say so', async () => {
+  const { compileAndLoad } = await import('./compileSpec.js');
+  const tests = await compileAndLoad(PW(
+    `test('not me', async ({page}) => {});\ntest.only('just me', async ({page}) => {});`));
+  assert.deepEqual(tests.map((t) => t.name), ['just me'], 'only the .only test runs');
+  // ★ The flag is the load-bearing half: a preview that quietly ran 1 of 6 while the real check runs
+  //   all 6 would misrepresent production. Running a subset is fine; running it SILENTLY is not.
+  assert.ok(tests.every((t) => t.onlyFiltered), 'every returned test must carry onlyFiltered');
+
+  const none = await compileAndLoad(PW(`test('plain', async ({page}) => {});`));
+  assert.ok(!none.some((t) => t.onlyFiltered), 'no .only ⇒ no flag (so the flag means something)');
+});
+
+nodeTest('★ an UNSUPPORTED test.* API throws a message NAMING it and listing what is supported', async () => {
+  const { compileAndLoad } = await import('./compileSpec.js');
+  await assert.rejects(
+    () => compileAndLoad(PW(`test.step('nope', async () => {});`)),
+    (e: Error) => {
+      assert.match(e.message, /test\.step\(\) is not supported/, 'names the API the author actually used');
+      assert.match(e.message, /Supported: test\(\), test\.describe/, 'points at what IS available');
+      return true;
+    },
+    'an unsupported API must fail BY NAME — "is not a function" told the author nothing',
+  );
+});
+
+nodeTest('REGRESSION: both import forms still register on the single registry', async () => {
+  const { compileAndLoad } = await import('./compileSpec.js');
+  const flow = await compileAndLoad(`import { test } from '../../lib/flow';\ntest('a', async ({page}) => {});`);
+  const pw = await compileAndLoad(PW(`test('b', async ({page}) => {});`));
+  assert.deepEqual([flow.length, pw.length], [1, 1]);
+});
+
+nodeTest('CLEAN-ZERO is preserved: a test() inside an uncalled function registers nothing', async () => {
+  const { compileAndLoad } = await import('./compileSpec.js');
+  // This is the shape that produced the observed live failure. It must stay a CLEAN zero (not a throw),
+  // because the operator's fix is "move test() to the top level" — a different action from an API error.
+  const tests = await compileAndLoad(PW(`function r(){ test('never', async ({page}) => {}); } void r;`));
+  assert.equal(tests.length, 0);
+});
