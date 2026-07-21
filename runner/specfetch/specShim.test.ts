@@ -230,3 +230,60 @@ nodeTest('step() outside als.run throws a harness error', async () => {
   const { step: shimStep } = await import('./specShim.js');
   await assert.rejects(() => shimStep('x', async () => {}), /outside a recorder context/);
 });
+
+// ──────────────────────────────────────────────────────────────────────────────────────────────────
+// ★ `@playwright/test` — the import form the Tests area actually receives.
+// ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+/** A PASTED PLAYWRIGHT SPEC — the form an operator writes by hand, not the platform's lib/flow form.
+ *  ★ This is the fixture that reproduces the bug. A real synthwatch-monitors spec does NOT: all 18 of them
+ *  import '../../lib/flow', which the alias has always handled, so they compiled fine throughout. The
+ *  failure was only ever reachable through this shape, which is exactly why it survived to production —
+ *  every earlier sandbox success (decoded from ACA execution history) used the lib/flow form. */
+const PASTED_PLAYWRIGHT_SPEC = `
+import { test, expect, type Page } from '@playwright/test';
+
+nodeTest('pasted playwright spec runs', async ({ page }: { page: Page }) => {
+  await page.goto('https://example.com');
+  expect(await page.title()).toBeTruthy();
+});
+`;
+
+nodeTest('★ a spec importing @playwright/test COMPILES (it could not before — the Tests area was unusable)', async () => {
+  // Pre-fix this threw: `Could not resolve "@playwright/test"` at monitor.spec.ts:1:40 — resolveDir is the
+  // OS temp dir, which has no node_modules, and `external: ['playwright']` is a DIFFERENT package name.
+  const { compileSpec } = await import('./compileSpec.js');
+  const js = await compileSpec(PASTED_PLAYWRIGHT_SPEC, 'monitor.spec.ts');
+  assert.ok(js.length > 0, 'compileSpec must produce output for a pasted Playwright spec');
+});
+
+nodeTest('★ …and it resolves to the SHIM, not to real Playwright — instrumentation must not be bypassed', async () => {
+  const { compileSpec } = await import('./compileSpec.js');
+  const js = await compileSpec(PASTED_PLAYWRIGHT_SPEC, 'monitor.spec.ts');
+
+  // ★ THE LOAD-BEARING ASSERTION. Marking @playwright/test `external` would also have made the compile
+  //   error go away — and produced a preview that runs the REAL Playwright runner: no step recording, no
+  //   captured-test registry, different semantics from production. A preview that compiles differently
+  //   than production is a preview that lies. It must point at the same placeholder lib/flow does.
+  assert.match(js, /__SW_SPEC_SHIM__/, 'the import must be rewritten to the shim placeholder');
+  assert.doesNotMatch(js, /from\s*["']@playwright\/test["']/, 'no residual runtime import of @playwright/test');
+});
+
+nodeTest('the lib/flow form is UNCHANGED by the new alias (real monitor specs keep compiling)', async () => {
+  // Regression guard: all 18 synthwatch-monitors specs use this form. Adding a second onResolve must not
+  // disturb it.
+  const { compileSpec } = await import('./compileSpec.js');
+  const js = await compileSpec(`import { test, step } from '../../lib/flow';\ntest('x', async () => { await step('s', async () => {}); });`);
+  assert.match(js, /__SW_SPEC_SHIM__/);
+});
+
+nodeTest('a TYPE-ONLY @playwright/test reference is erased and needs no resolution (why prod never broke)', async () => {
+  // meals2go-cheese-pizza-cart.spec.ts:255 does exactly this. The ts loader erases type positions, so it
+  // never became a runtime import — which is why the production check path was unaffected all along.
+  const { compileSpec } = await import('./compileSpec.js');
+  const js = await compileSpec(
+    `import { test } from '../../lib/flow';\n` +
+      `test('t', async () => { const f = (req: import('@playwright/test').Request) => req; void f; });`,
+  );
+  assert.doesNotMatch(js, /@playwright\/test/, 'the type-only reference must be fully erased');
+});

@@ -33,6 +33,31 @@ const SHIM_URL = new URL('./specShim.js', import.meta.url).href;
 const LIB_FLOW_RE = /(^|\/)lib\/flow$/;
 
 /**
+ * ★ `@playwright/test` resolves to the SAME shim as lib/flow.
+ *
+ * WHY THIS EXISTS. Every spec in synthwatch-monitors imports `'../../lib/flow'`, so the alias above was
+ * the only form that had ever been compiled — by EITHER path. The Tests area, though, invites an operator
+ * to paste an ORDINARY Playwright spec, and those open with
+ * `import { test, expect, type Page } from '@playwright/test'`. Nothing handled that name: `external:
+ * ['playwright']` below is a DIFFERENT package, and `resolveDir` is the OS temp dir (no node_modules), so
+ * esbuild failed with `Could not resolve "@playwright/test"` and the preview never ran. That was not a
+ * sandbox-vs-production divergence — both paths call THIS function — it was a form this compiler had never
+ * supported. (The one monitor that mentions the package does so in a type position,
+ * `import('@playwright/test').Request`, which the ts loader ERASES — hence prod was never affected.)
+ *
+ * ★ ALIASED TO THE SHIM, NOT MARKED EXTERNAL. Making it external would let the child load the real
+ * Playwright test runner, which bypasses the shim entirely: no step recording, no captured-test registry,
+ * none of the platform's instrumentation. The preview would then execute under different semantics than
+ * production — a preview that lies. Routing it to the shim means a pasted spec gets the SAME instrumented
+ * `test`/`expect` a real monitor gets.
+ *
+ * ★ CAVEAT worth knowing: the shim implements `SUPPORTED_MATCHERS`, not all of Playwright's. A pasted spec
+ * using an exotic matcher compiles and then fails at RUNTIME with the shim's own message. That is the
+ * honest failure — better than silently running uninstrumented.
+ */
+const PLAYWRIGHT_TEST_RE = /^@playwright\/test$/;
+
+/**
  * Compile a fetched spec's TypeScript source to a JS ESM module string. The lib/flow import is
  * rewritten to a machine-independent placeholder (resolved to the real shim at load time), so
  * the output is safe to cache + share across machines.
@@ -53,6 +78,9 @@ export async function compileSpec(source: string, sourcefile = 'monitor.spec.ts'
         // from "__SW_SPEC_SHIM__"; loadCompiledSpec swaps it for the local shim at load time.
         setup(b) {
           b.onResolve({ filter: LIB_FLOW_RE }, () => ({ path: SHIM_PLACEHOLDER, external: true }));
+          // Same target, same placeholder — one shim, so a pasted Playwright spec and a real monitor spec
+          // run under identical instrumentation. See PLAYWRIGHT_TEST_RE for why this is not `external`.
+          b.onResolve({ filter: PLAYWRIGHT_TEST_RE }, () => ({ path: SHIM_PLACEHOLDER, external: true }));
         },
       },
     ],
