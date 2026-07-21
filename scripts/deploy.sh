@@ -1000,6 +1000,23 @@ verify() {
   str_eq "${EXPECTED_API_VERSION}" "${v}" && ok=1 || ok=0
   check "${ok}" "${NARRATIVE_JOB} AZURE_OPENAI_API_VERSION='${v}' (expect ${EXPECTED_API_VERSION})"
 
+  # ★ AZURE COST ENV on the ROLLUP job — the env the Azure Cost Management pull needs.
+  # THE DEFECT THIS CATCHES: bicep declared AZURE_SUBSCRIPTION_ID/AZURE_RESOURCE_GROUP on the three RUNNER
+  # jobs, but rollupMain.ts is the ONLY caller of refreshAzureCost — so the one job that needs them did not
+  # have them. fetchAzureCost hit its first guard, logged "[azure-cost] skipped — … not set", and returned
+  # null; refreshAzureCost then `return false`s WITHOUT writing, so the execution still reported Succeeded.
+  # azure_cost was never written (n_tup_ins = 0) and /reports/cost served azure: null for days while
+  # totalProjectedMonthly — computed independently — stayed healthy and masked it.
+  # ★ A "declared on one job, consumed by another" gap is invisible to every other check here: the image is
+  # right, the marker is right, the resources are right. Only asserting it ON THE CONSUMER catches it.
+  for cost_var in AZURE_SUBSCRIPTION_ID AZURE_RESOURCE_GROUP; do
+    v="$(job_env_value "${ROLLUP_JOB}" "${cost_var}")"
+    # Non-empty is the assertion: the VALUES are subscription()/resourceGroup() expressions resolved by ARM,
+    # so pinning literals here would just re-encode the template. Absence is the failure mode seen in prod.
+    [[ -n "${v}" ]] && ok=1 || ok=0
+    check "${ok}" "${ROLLUP_JOB} ${cost_var}='${v}' (must be NON-EMPTY — the Azure cost pull silently no-ops without it)"
+  done
+
   # ACS secretRef present on the runner job (the recurring email-wipe defect).
   v="$(job_env_secretref "${RUNNER_JOB}" ACS_EMAIL_CONNECTION_STRING)"
   str_eq "${ACS_SECRET_REF}" "${v}" && ok=1 || ok=0

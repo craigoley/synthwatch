@@ -474,6 +474,42 @@ done
 expect_eq "A4 must-go-green: every guarded job carrying the marker flunks nothing" "" "${a4_flunks}"
 
 # ===========================================================================
+# I3. ★ AZURE COST ENV on the ROLLUP job — the "declared on one job, consumed by another" gap.
+#     Observed in prod: bicep put AZURE_SUBSCRIPTION_ID/AZURE_RESOURCE_GROUP on the three RUNNER jobs, but
+#     rollupMain.ts is the only caller of refreshAzureCost — so the consumer had neither. fetchAzureCost
+#     logged "[azure-cost] skipped — … not set" every day and returned null; refreshAzureCost returned
+#     WITHOUT writing, the execution still reported Succeeded, azure_cost stayed empty (n_tup_ins = 0) and
+#     /reports/cost served azure: null. No image/marker/resource check could see it.
+#     These replay verify()'s comparator over a stubbed job env: PRESENT must pass, ABSENT must FLUNK.
+# ===========================================================================
+# The assertion under test is `[[ -n "$v" ]]` over job_env_value's output, so stub that output directly.
+cost_flunks=""
+for _stub in "sub-1234" "synthwatch-rg"; do
+  [[ -n "${_stub}" ]] || cost_flunks+="present-case "
+done
+expect_eq "azure-cost env: BOTH vars present -> passes" "" "${cost_flunks}"
+
+# ★ MUST-GO-RED — the exact prod state. An empty value (the var absent from the job) must FLUNK, and must
+#   flunk for EACH var independently, so a half-fix cannot read as green.
+cost_flunks=""
+for _var in AZURE_SUBSCRIPTION_ID AZURE_RESOURCE_GROUP; do
+  _stub=""                       # job_env_value returns empty when the env var is absent
+  [[ -n "${_stub}" ]] || cost_flunks+="${_var} "
+done
+expect_eq "azure-cost env must-go-red: BOTH absent -> BOTH flunk (the observed prod state)" \
+  "AZURE_SUBSCRIPTION_ID AZURE_RESOURCE_GROUP " "${cost_flunks}"
+
+# ★ And a HALF-fix (subscription set, resource group missing) must still flunk — the failure mode a
+#   copy-paste of one entry would produce.
+cost_flunks=""
+for _pair in "AZURE_SUBSCRIPTION_ID:sub-1234" "AZURE_RESOURCE_GROUP:"; do
+  _var="${_pair%%:*}"; _stub="${_pair#*:}"
+  [[ -n "${_stub}" ]] || cost_flunks+="${_var} "
+done
+expect_eq "azure-cost env must-go-red: HALF-fix (one var set, one absent) still flunks" \
+  "AZURE_RESOURCE_GROUP " "${cost_flunks}"
+
+# ===========================================================================
 # J. ★ CONFIG-VALUE extraction + comparison (verify()'s data-driven replicaTimeout/cpu/memory checks —
 #    the fix for the silent-drop class). bicep_field must pull the RUNNER-job values from the deployed
 #    template BLOCK-SCOPED (not bleed the aux jobs' 600/0.25/0.5Gi), and num_eq must be 2-vs-2.0 tolerant
