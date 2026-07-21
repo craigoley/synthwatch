@@ -145,6 +145,11 @@ jobs:
               || echo "::notice::synthwatch-reconcile-job not present yet — skipping (deploy its bicep to create it)."
             az containerapp job update -n synthwatch-retention-job -g synthwatch-rg --image "$IMAGE" \
               || echo "::notice::synthwatch-retention-job not present yet — skipping (deploy its bicep to create it)."
+            # ★ The SANDBOX preview job runs the runner image too and was never rolled here — it sat on
+            #   whatever the last full bicep deployment set (observed: five merges stale). It runs UPLOADED,
+            #   UNMERGED code by design, so a stale image is RCE-by-design against old runner logic.
+            az containerapp job update -n synthwatch-sandbox -g synthwatch-rg --image "$IMAGE" \
+              || echo "::notice::synthwatch-sandbox not present yet — skipping (deploy its bicep to create it)."
 
       - name: Write deployment summary
         run: |

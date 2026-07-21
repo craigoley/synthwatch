@@ -19,8 +19,16 @@ readonly NARRATIVE_JOB='synthwatch-narrative-job'
 readonly ROLLUP_JOB='synthwatch-rollup-job'
 readonly RECONCILE_JOB='synthwatch-reconcile-job'
 readonly RETENTION_JOB='synthwatch-retention-job'
+# ★ The SANDBOX preview job. It runs `image: runnerImage` like every job above (infra/main.bicep), but was
+#   never in this array — so CD never rolled it and verify() never compared it, and it silently sat on the
+#   image from whatever full bicep deployment last touched it. Observed 2026-07-21: sandbox on #345 while
+#   the runner job was on #349, five merges apart, with every deploy in between reporting success.
+#   ★ This one matters more than the others, not less: the sandbox EXECUTES UPLOADED, UNMERGED CODE by
+#   design, so a stale image means RCE-by-design running against old runner logic — including old
+#   redaction and old artifact policy.
+readonly SANDBOX_JOB='synthwatch-sandbox'
 readonly RUNNER_IMAGE_JOBS=(
-  "${RUNNER_JOB}" "${CENTRALUS_RUNNER_JOB}" "${WESTUS2_RUNNER_JOB}" "${NARRATIVE_JOB}" "${ROLLUP_JOB}" "${RECONCILE_JOB}" "${RETENTION_JOB}"
+  "${RUNNER_JOB}" "${CENTRALUS_RUNNER_JOB}" "${WESTUS2_RUNNER_JOB}" "${NARRATIVE_JOB}" "${ROLLUP_JOB}" "${RECONCILE_JOB}" "${RETENTION_JOB}" "${SANDBOX_JOB}"
 )
 
 # ---------------------------------------------------------------------------
