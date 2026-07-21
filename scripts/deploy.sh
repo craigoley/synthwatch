@@ -1009,7 +1009,12 @@ verify() {
   # totalProjectedMonthly — computed independently — stayed healthy and masked it.
   # ★ A "declared on one job, consumed by another" gap is invisible to every other check here: the image is
   # right, the marker is right, the resources are right. Only asserting it ON THE CONSUMER catches it.
-  for cost_var in AZURE_SUBSCRIPTION_ID AZURE_RESOURCE_GROUP; do
+  # ★ ALL THREE, not the two we happened to know about. #359 asserted SUBSCRIPTION_ID + RESOURCE_GROUP and
+  #   went GREEN on the 2026-07-21 20:31 deploy — while the pull still failed, because AZURE_CLIENT_ID was
+  #   missing and azureCost.ts's BARE `new DefaultAzureCredential()` reads it IMPLICITLY VIA THE SDK. It never
+  #   appears as a process.env reference in that file, so a grep-derived list cannot find it. An assertion
+  #   covering a SUBSET of a requirement is worse than none: it certifies the exact state that was broken.
+  for cost_var in AZURE_SUBSCRIPTION_ID AZURE_RESOURCE_GROUP AZURE_CLIENT_ID; do
     v="$(job_env_value "${ROLLUP_JOB}" "${cost_var}")"
     # Non-empty is the assertion: the VALUES are subscription()/resourceGroup() expressions resolved by ARM,
     # so pinning literals here would just re-encode the template. Absence is the failure mode seen in prod.

@@ -1530,6 +1530,19 @@ resource rollupJob 'Microsoft.App/jobs@2024-03-01' = {
               value: subscription().subscriptionId
             }
             {
+              // ★ WHICH user-assigned identity the SDK should use. The runner MI is USER-ASSIGNED-ONLY, and a
+              //   BARE `new DefaultAzureCredential()` cannot resolve which identity to use in that case — it
+              //   fails with "ChainedTokenCredential authentication failed / Unable to load the proper Managed
+              //   Identity" (the same #90 lesson pinned on the runner + narrative jobs, and the exact error the
+              //   cost pull hit on 2026-07-21 after #359 supplied the other two vars).
+              // ★ azureCost.ts:66 constructs the credential BARE, so this var is read IMPLICITLY BY THE SDK and
+              //   never appears as a process.env reference in that file. #359's grep-based sweep therefore could
+              //   not see it and reported the job complete — this is the third of the THREE vars the pull needs.
+              // DERIVED from the MI resource (not a hardcoded GUID, can't drift) — mirrors line 922.
+              name: 'AZURE_CLIENT_ID'
+              value: identity.properties.clientId
+            }
+            {
               name: 'AZURE_RESOURCE_GROUP'
               value: resourceGroup().name
             }
