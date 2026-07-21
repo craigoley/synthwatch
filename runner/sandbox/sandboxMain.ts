@@ -17,15 +17,15 @@
 // it honestly-absent.
 import { runSandboxPreview } from './runSandboxPreview.js';
 import { isCredentialedRun, resolveSandboxPayload } from './sandboxPayload.js';
+import { buildResultPayload } from './sandboxResult.js';
 import { fetchAndDeleteSandboxPayload, uploadSandboxArtifact, uploadSandboxResult } from './sandboxUpload.js';
 
 // ★ Artifact caps. A simple flow's trace.zip is well under 20 MB; a multi-nav/heavy-page runaway is bounded. A
 //   full-page PNG is ~0.5–2 MB, so 4 MB is generous. Over-cap → DROPPED (steps + signals still serve; the
 //   missing artifact renders honestly-absent). stdout in the result JSON is bounded so a stdout-spamming spec
-//   can't bloat `<token>.json`.
+//   can't bloat `<token>.json` (that cap moved to sandboxResult.ts with the builder that applies it).
 const TRACE_CAP_BYTES = 20 * 1024 * 1024;
 const SCREENSHOT_CAP_BYTES = 4 * 1024 * 1024;
-const STDOUT_CAP_BYTES = 128 * 1024;
 
 async function main(): Promise<void> {
   const target = process.env.SW_SANDBOX_TARGET_URL ?? 'https://example.com';
@@ -79,23 +79,7 @@ async function main(): Promise<void> {
 
   // The result JSON (→ `<token>.json` + echoed to stdout) — JSON-SAFE: no Buffers, hasTrace/hasScreenshot flags
   // instead. Steps + trace_signals are small and travel inside it.
-  const stdoutCapped =
-    result.stdout.length > STDOUT_CAP_BYTES ? `${result.stdout.slice(0, STDOUT_CAP_BYTES)}\n…(truncated)` : result.stdout;
-  const payload = {
-    ok: result.ok,
-    tests: result.tests,
-    status: result.status ?? null,
-    error: result.error ?? null,
-    failedStep: result.failedStep ?? null,
-    steps: result.steps ?? [],
-    traceSignals: result.traceSignals ?? null,
-    stdout: stdoutCapped,
-    stderr: result.stderr,
-    timedOut: result.timedOut,
-    exitCode: result.exitCode,
-    hasTrace,
-    hasScreenshot,
-  };
+  const payload = buildResultPayload(result, { hasTrace, hasScreenshot });
   const resultJson = JSON.stringify(payload);
   process.stdout.write(resultJson + '\n');
   await uploadSandboxResult(token, resultJson);
