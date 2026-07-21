@@ -66,8 +66,11 @@ function redactTraceSignals(signals: unknown | null, redact: Redactor): unknown 
  * value is an ARBITRARY user-typed password rather than something the platform chose.
  *
  * Registering the encoded variants alongside the raw value closes it for the shapes we can enumerate.
- * ★ This is defense-in-depth, not a proof: an encoding we did not anticipate would still slip through, which
- * is exactly why screenshots are SUPPRESSED rather than scrubbed for a credentialed run.
+ * ★ This is defense-in-depth, not a proof: an encoding we did not anticipate would still slip through. That
+ * residual risk is accepted for the TEXT channels; it is not bounded by withholding the screenshot, which a
+ * credentialed preview KEEPS (redact.ts previewPersistPlan → failureScreenshot: true, unconditional). The
+ * Tests area is editor/admin-only and the operator typed the credential, so showing it back is not a
+ * disclosure — and a password field renders MASKED, so it does not appear in the image anyway.
  */
 function redactionValues(creds: SandboxCredentials | undefined): string[] {
   const out = new Set<string>();
@@ -141,10 +144,11 @@ export async function runSandboxPreview(
     redactCredentials?: boolean;
     /**
      * ★ TEST-ONLY, and the ONLY way the redaction suite can prove it is not vacuous. Drops a credentialed
-     * run back to the NON-SENSITIVE treatment — IDENTITY_REDACTOR *and* no artifact suppression — so the
-     * meta-test can assert the sentinel suite REDS with the protections off. It disables the WHOLE
-     * sensitive treatment, not just the redactor, because otherwise the screenshot-suppression assertion
-     * would have no mutant to fail against and would be the vacuous check in an anti-vacuity suite.
+     * run back to the NON-SENSITIVE treatment — IDENTITY_REDACTOR and the RAW trace zip — so the meta-test
+     * can assert the sentinel suite REDS with the protections off. It disables the whole sensitive
+     * treatment rather than only the redactor so the mutant differs on every channel the suite scans.
+     * ★ It no longer has anything to do with the screenshot: previewPersistPlan keeps that on BOTH paths,
+     * so the image is a constant here, not a protection this flag toggles.
      * Never pass this in prod. (Same accepted pattern as crypto.ts's `ivOverride`.)
      */
     __unsafeDisableSensitiveHandlingForTest?: boolean;
@@ -283,13 +287,15 @@ function runChild(specFile: string, vars: SandboxRunVars, sensitive: boolean, re
           steps = j.steps ?? [];
           traceSignals = j.traceSignals ?? null;
 
-          // ── B10 policy for a preview, via the SAME tracePersistPlan the fleet path uses ──────────────
-          // SENSITIVE  → the plan's verdict verbatim: a REDACTED/REDUCED zip (text entries scrubbed, ALL
-          //              images dropped by classifyEntry — a screencast frame of a logged-in page cannot be
-          //              text-scrubbed) and NO screenshot at all.
-          // ★ NO page.screenshot({ mask }) — masking blacks out only the selectors you NAMED, so a
-          //   credential rendered somewhere unpredicted (an error toast, the autofill dropdown, a
-          //   "signed in as…" header) survives. Suppression is the only bound we can actually state.
+          // ── B10 policy for a preview, via previewPersistPlan — NOT the fleet's tracePersistPlan ───────
+          // SENSITIVE  → a REDACTED/REDUCED zip: text entries scrubbed, images KEPT (buildRedactedTraceZip's
+          //              keepImages, the preview-only divergence).
+          // SCREENSHOT → KEPT on both paths. previewPersistPlan returns failureScreenshot: true
+          //              unconditionally, so credentials do not change screenshot retention.
+          // ★ The retention rule is about FAILURE, not sensitivity: sandboxChild writes screenshot.png only
+          //   `if (traced.screenshot)`, which runTracedFlow sets on a failing run — so a PASSING preview has
+          //   no screenshot and never did (see PreviewResult.screenshot's docstring above).
+          // ★ Text redaction is UNCHANGED and still credential-gated — only the image claim moved.
           const plan = previewPersistPlan(sensitive);
 
           if (sensitive) {
@@ -330,8 +336,9 @@ function runChild(specFile: string, vars: SandboxRunVars, sensitive: boolean, re
               trace = await readFile(j.tracePath).catch(() => null);
             }
           }
-          // Sensitive ⇒ plan.failureScreenshot is false ⇒ the bytes are never even read; the temp dir is
-          // rm'd by runSandboxPreview's finally, so the PNG never crosses this process boundary.
+          // plan.failureScreenshot is true for every preview, so this reduces to "read it if the child
+          // produced one" — i.e. on a FAILING run. On a pass there is no screenshotPath to read. The temp
+          // dir is rm'd by runSandboxPreview's finally either way.
           if (j.screenshotPath && plan.failureScreenshot) screenshot = await readFile(j.screenshotPath).catch(() => null);
         } catch {
           /* no valid report → ok stays false */
