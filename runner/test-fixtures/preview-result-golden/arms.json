@@ -1,0 +1,471 @@
+{
+  "_comment": "Golden for buildResultPayload (runner/sandbox/sandboxResult.ts) — the 13-field result payload the sandbox job writes to <token>.json and the api serves VERBATIM as PreviewStatusDto.Trace (an opaque string). The api has no hasScreenshot field, so the dashboard's captured-fixture harness cannot anchor this shape; the anchor lives here, at the producer. ★ SCOPE AND LIMIT: unlike trace-signals-golden — whose input is a CAPTURED artifact — this golden's inputs are chosen and its outputs recorded. It REDS ON DRIFT (a field added, removed, renamed, or re-derived) but does NOT prove the inputs resemble what runSandboxPreview really emits. Mitigation: each arm's `result` was captured from a REAL runSandboxPreview run against live chromium and then value-normalised for determinism (see `provenance` per arm and README.md) — the shape and field population are real, the timings/paths are scrubbed. What it still cannot catch: a change in what runSandboxPreview PRODUCES that buildResultPayload faithfully passes through.",
+  "arms": [
+    {
+      "name": "pass — no screenshot was captured, so nothing to upload",
+      "provenance": "REAL runSandboxPreview run (passing spec, live chromium via browserFlow.runTracedFlow); values normalised for determinism, shape untouched",
+      "result": {
+        "ok": true,
+        "tests": [
+          "golden pass"
+        ],
+        "stdout": "<normalised: the child echoes the same payload, with machine-specific temp paths>",
+        "stderr": "",
+        "timedOut": false,
+        "exitCode": 0,
+        "status": "pass",
+        "error": null,
+        "failedStep": null,
+        "steps": [
+          {
+            "index": 0,
+            "name": "open",
+            "status": "pass",
+            "durationMs": 0,
+            "errorMessage": null
+          }
+        ],
+        "traceSignals": {
+          "targetHost": "example.com",
+          "network": {
+            "totalRequests": 1,
+            "wireKb": 0,
+            "thirdPartyCount": 0,
+            "failed": [],
+            "slowest": [
+              {
+                "url": "https://example.com/",
+                "status": 200,
+                "resourceType": "document",
+                "timeMs": 0,
+                "waitMs": 0,
+                "size": 559,
+                "wire": 473,
+                "encoding": "br",
+                "thirdParty": false
+              }
+            ],
+            "largest": [
+              {
+                "url": "https://example.com/",
+                "status": 200,
+                "resourceType": "document",
+                "timeMs": 0,
+                "waitMs": 0,
+                "size": 559,
+                "wire": 473,
+                "encoding": "br",
+                "thirdParty": false
+              }
+            ],
+            "uncompressed": [],
+            "topThirdParties": [],
+            "mutations": []
+          },
+          "console": {
+            "messages": [],
+            "droppedInfoLog": 0,
+            "droppedExtensionNoise": 0,
+            "droppedError": 0,
+            "droppedThirdParty": 0,
+            "droppedFirstParty": 0
+          }
+        }
+      },
+      "artifacts": {
+        "hasTrace": true,
+        "hasScreenshot": false
+      },
+      "expected": {
+        "ok": true,
+        "tests": [
+          "golden pass"
+        ],
+        "status": "pass",
+        "error": null,
+        "failedStep": null,
+        "steps": [
+          {
+            "index": 0,
+            "name": "open",
+            "status": "pass",
+            "durationMs": 0,
+            "errorMessage": null
+          }
+        ],
+        "traceSignals": {
+          "targetHost": "example.com",
+          "network": {
+            "totalRequests": 1,
+            "wireKb": 0,
+            "thirdPartyCount": 0,
+            "failed": [],
+            "slowest": [
+              {
+                "url": "https://example.com/",
+                "status": 200,
+                "resourceType": "document",
+                "timeMs": 0,
+                "waitMs": 0,
+                "size": 559,
+                "wire": 473,
+                "encoding": "br",
+                "thirdParty": false
+              }
+            ],
+            "largest": [
+              {
+                "url": "https://example.com/",
+                "status": 200,
+                "resourceType": "document",
+                "timeMs": 0,
+                "waitMs": 0,
+                "size": 559,
+                "wire": 473,
+                "encoding": "br",
+                "thirdParty": false
+              }
+            ],
+            "uncompressed": [],
+            "topThirdParties": [],
+            "mutations": []
+          },
+          "console": {
+            "messages": [],
+            "droppedInfoLog": 0,
+            "droppedExtensionNoise": 0,
+            "droppedError": 0,
+            "droppedThirdParty": 0,
+            "droppedFirstParty": 0
+          }
+        },
+        "stdout": "<normalised: the child echoes the same payload, with machine-specific temp paths>",
+        "stderr": "",
+        "timedOut": false,
+        "exitCode": 0,
+        "hasTrace": true,
+        "hasScreenshot": false
+      }
+    },
+    {
+      "name": "fail, under cap — screenshot captured and uploaded",
+      "provenance": "REAL runSandboxPreview run (failing spec; the run produced a 16577-byte PNG, well under SCREENSHOT_CAP_BYTES=4MiB); values normalised, shape untouched",
+      "result": {
+        "ok": false,
+        "tests": [
+          "golden fail"
+        ],
+        "stdout": "<normalised: the child echoes the same payload, with machine-specific temp paths>",
+        "stderr": "",
+        "timedOut": false,
+        "exitCode": 0,
+        "status": "fail",
+        "error": "expected element to be visible within 15000ms",
+        "failedStep": "assert a selector that is not there",
+        "steps": [
+          {
+            "index": 0,
+            "name": "open",
+            "status": "pass",
+            "durationMs": 0,
+            "errorMessage": null
+          },
+          {
+            "index": 1,
+            "name": "assert a selector that is not there",
+            "status": "fail",
+            "durationMs": 0,
+            "errorMessage": "expected element to be visible within 15000ms"
+          }
+        ],
+        "traceSignals": {
+          "targetHost": "example.com",
+          "network": {
+            "totalRequests": 1,
+            "wireKb": 0,
+            "thirdPartyCount": 0,
+            "failed": [],
+            "slowest": [
+              {
+                "url": "https://example.com/",
+                "status": 200,
+                "resourceType": "document",
+                "timeMs": 0,
+                "waitMs": 0,
+                "size": 559,
+                "wire": 472,
+                "encoding": "br",
+                "thirdParty": false
+              }
+            ],
+            "largest": [
+              {
+                "url": "https://example.com/",
+                "status": 200,
+                "resourceType": "document",
+                "timeMs": 0,
+                "waitMs": 0,
+                "size": 559,
+                "wire": 472,
+                "encoding": "br",
+                "thirdParty": false
+              }
+            ],
+            "uncompressed": [],
+            "topThirdParties": [],
+            "mutations": []
+          },
+          "console": {
+            "messages": [],
+            "droppedInfoLog": 0,
+            "droppedExtensionNoise": 0,
+            "droppedError": 0,
+            "droppedThirdParty": 0,
+            "droppedFirstParty": 0
+          }
+        }
+      },
+      "artifacts": {
+        "hasTrace": true,
+        "hasScreenshot": true
+      },
+      "expected": {
+        "ok": false,
+        "tests": [
+          "golden fail"
+        ],
+        "status": "fail",
+        "error": "expected element to be visible within 15000ms",
+        "failedStep": "assert a selector that is not there",
+        "steps": [
+          {
+            "index": 0,
+            "name": "open",
+            "status": "pass",
+            "durationMs": 0,
+            "errorMessage": null
+          },
+          {
+            "index": 1,
+            "name": "assert a selector that is not there",
+            "status": "fail",
+            "durationMs": 0,
+            "errorMessage": "expected element to be visible within 15000ms"
+          }
+        ],
+        "traceSignals": {
+          "targetHost": "example.com",
+          "network": {
+            "totalRequests": 1,
+            "wireKb": 0,
+            "thirdPartyCount": 0,
+            "failed": [],
+            "slowest": [
+              {
+                "url": "https://example.com/",
+                "status": 200,
+                "resourceType": "document",
+                "timeMs": 0,
+                "waitMs": 0,
+                "size": 559,
+                "wire": 472,
+                "encoding": "br",
+                "thirdParty": false
+              }
+            ],
+            "largest": [
+              {
+                "url": "https://example.com/",
+                "status": 200,
+                "resourceType": "document",
+                "timeMs": 0,
+                "waitMs": 0,
+                "size": 559,
+                "wire": 472,
+                "encoding": "br",
+                "thirdParty": false
+              }
+            ],
+            "uncompressed": [],
+            "topThirdParties": [],
+            "mutations": []
+          },
+          "console": {
+            "messages": [],
+            "droppedInfoLog": 0,
+            "droppedExtensionNoise": 0,
+            "droppedError": 0,
+            "droppedThirdParty": 0,
+            "droppedFirstParty": 0
+          }
+        },
+        "stdout": "<normalised: the child echoes the same payload, with machine-specific temp paths>",
+        "stderr": "",
+        "timedOut": false,
+        "exitCode": 0,
+        "hasTrace": true,
+        "hasScreenshot": true
+      }
+    },
+    {
+      "name": "fail, OVER cap — screenshot captured but DROPPED, so the flag is false",
+      "provenance": "the SAME real failing PreviewResult as the arm above — only the artifacts argument differs, which is exactly how the over-cap path presents: sandboxMain skips the upload and the flag stays false. No hand-shaped result object.",
+      "result": {
+        "ok": false,
+        "tests": [
+          "golden fail"
+        ],
+        "stdout": "<normalised: the child echoes the same payload, with machine-specific temp paths>",
+        "stderr": "",
+        "timedOut": false,
+        "exitCode": 0,
+        "status": "fail",
+        "error": "expected element to be visible within 15000ms",
+        "failedStep": "assert a selector that is not there",
+        "steps": [
+          {
+            "index": 0,
+            "name": "open",
+            "status": "pass",
+            "durationMs": 0,
+            "errorMessage": null
+          },
+          {
+            "index": 1,
+            "name": "assert a selector that is not there",
+            "status": "fail",
+            "durationMs": 0,
+            "errorMessage": "expected element to be visible within 15000ms"
+          }
+        ],
+        "traceSignals": {
+          "targetHost": "example.com",
+          "network": {
+            "totalRequests": 1,
+            "wireKb": 0,
+            "thirdPartyCount": 0,
+            "failed": [],
+            "slowest": [
+              {
+                "url": "https://example.com/",
+                "status": 200,
+                "resourceType": "document",
+                "timeMs": 0,
+                "waitMs": 0,
+                "size": 559,
+                "wire": 472,
+                "encoding": "br",
+                "thirdParty": false
+              }
+            ],
+            "largest": [
+              {
+                "url": "https://example.com/",
+                "status": 200,
+                "resourceType": "document",
+                "timeMs": 0,
+                "waitMs": 0,
+                "size": 559,
+                "wire": 472,
+                "encoding": "br",
+                "thirdParty": false
+              }
+            ],
+            "uncompressed": [],
+            "topThirdParties": [],
+            "mutations": []
+          },
+          "console": {
+            "messages": [],
+            "droppedInfoLog": 0,
+            "droppedExtensionNoise": 0,
+            "droppedError": 0,
+            "droppedThirdParty": 0,
+            "droppedFirstParty": 0
+          }
+        }
+      },
+      "artifacts": {
+        "hasTrace": true,
+        "hasScreenshot": false
+      },
+      "expected": {
+        "ok": false,
+        "tests": [
+          "golden fail"
+        ],
+        "status": "fail",
+        "error": "expected element to be visible within 15000ms",
+        "failedStep": "assert a selector that is not there",
+        "steps": [
+          {
+            "index": 0,
+            "name": "open",
+            "status": "pass",
+            "durationMs": 0,
+            "errorMessage": null
+          },
+          {
+            "index": 1,
+            "name": "assert a selector that is not there",
+            "status": "fail",
+            "durationMs": 0,
+            "errorMessage": "expected element to be visible within 15000ms"
+          }
+        ],
+        "traceSignals": {
+          "targetHost": "example.com",
+          "network": {
+            "totalRequests": 1,
+            "wireKb": 0,
+            "thirdPartyCount": 0,
+            "failed": [],
+            "slowest": [
+              {
+                "url": "https://example.com/",
+                "status": 200,
+                "resourceType": "document",
+                "timeMs": 0,
+                "waitMs": 0,
+                "size": 559,
+                "wire": 472,
+                "encoding": "br",
+                "thirdParty": false
+              }
+            ],
+            "largest": [
+              {
+                "url": "https://example.com/",
+                "status": 200,
+                "resourceType": "document",
+                "timeMs": 0,
+                "waitMs": 0,
+                "size": 559,
+                "wire": 472,
+                "encoding": "br",
+                "thirdParty": false
+              }
+            ],
+            "uncompressed": [],
+            "topThirdParties": [],
+            "mutations": []
+          },
+          "console": {
+            "messages": [],
+            "droppedInfoLog": 0,
+            "droppedExtensionNoise": 0,
+            "droppedError": 0,
+            "droppedThirdParty": 0,
+            "droppedFirstParty": 0
+          }
+        },
+        "stdout": "<normalised: the child echoes the same payload, with machine-specific temp paths>",
+        "stderr": "",
+        "timedOut": false,
+        "exitCode": 0,
+        "hasTrace": true,
+        "hasScreenshot": false
+      }
+    }
+  ]
+}
