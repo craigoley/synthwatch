@@ -59,10 +59,38 @@ async function main(): Promise<void> {
 
   // ★ THE RCE MOMENT — arbitrary uploaded code executes on this import (runs the spec's top-level test() calls
   //   to register them). Contained by: this process's allowlist env (no secrets), no DB reachability, nil RBAC.
-  const tests = await loadCompiledSpec(compiledJs);
-  if (tests.length === 0) {
-    emit({ ok: false, tests: [], status: 'error', error: 'spec defined no test()', failedStep: null, steps: [], traceSignals: null, tracePath: null, screenshotPath: null });
+  // ★ THE TWO FAILURES ARE DIFFERENT AND NEED OPPOSITE FIXES — say which.
+  //   Before this, a THROW here escaped to main().catch → stderr + exit 1 with NO JSON, so the parent
+  //   reported a generic failure and the operator never saw `test.describe is not a function`. Both cases
+  //   now emit STRUCTURED output, and the messages are distinguishable:
+  //     • THROW      → the spec failed WHILE LOADING; the author used an unsupported API. Name the error.
+  //     • CLEAN-ZERO → the spec loaded fine but no test() ran at import time; the author must move the
+  //                    call to the top level. (Observed live: a spec that loaded and registered nothing.)
+  let tests: Awaited<ReturnType<typeof loadCompiledSpec>>;
+  try {
+    tests = await loadCompiledSpec(compiledJs);
+  } catch (e) {
+    const detail = e instanceof Error ? e.message : String(e);
+    emit({
+      ok: false, tests: [], status: 'error',
+      error: `The spec failed while loading: ${detail}`,
+      failedStep: null, steps: [], traceSignals: null, tracePath: null, screenshotPath: null,
+    });
     return;
+  }
+  if (tests.length === 0) {
+    emit({
+      ok: false, tests: [], status: 'error',
+      error: 'The spec loaded, but no test() ran at import time. Move test() to the top level ' +
+        '(a test() inside a function or block that never executes is never registered).',
+      failedStep: null, steps: [], traceSignals: null, tracePath: null, screenshotPath: null,
+    });
+    return;
+  }
+  // ★ A test.only narrowed the run. Report it — a preview that quietly ran 1 of 6 while the real check
+  //   runs all 6 would misrepresent production.
+  if (tests.some((t) => t.onlyFiltered)) {
+    process.stderr.write(`sandboxChild: test.only present — running ${tests.length} of the declared tests ONLY\n`);
   }
 
   // In-memory step sinks — the SAME StepRecorder a real check uses, but steps accumulate in an array (no DB).
