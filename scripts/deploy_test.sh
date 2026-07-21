@@ -509,6 +509,49 @@ done
 expect_eq "azure-cost env must-go-red: HALF-fix (one var set, one absent) still flunks" \
   "AZURE_RESOURCE_GROUP " "${cost_flunks}"
 
+# ★ THE THIRD VAR. #359 asserted two of the three the pull needs and went GREEN on a deploy after which the
+#   pull STILL failed — AZURE_CLIENT_ID was absent, and azureCost.ts's bare DefaultAzureCredential reads it
+#   implicitly via the SDK (never a process.env reference in that file, so no grep could derive it).
+#   The set under test is now all three; these pin that.
+COST_VARS=(AZURE_SUBSCRIPTION_ID AZURE_RESOURCE_GROUP AZURE_CLIENT_ID)
+expect_eq "azure-cost env: the asserted set is ALL THREE the pull needs" "3" "${#COST_VARS[@]}"
+
+# ★ STRUCTURAL — the cases below stub the comparator, so on their own they would NOT notice deploy.sh's
+#   loop being narrowed back to a subset. That is exactly how #359 shipped an assertion that certified a
+#   broken deploy. So read the SHIPPED loop out of deploy.sh and require all three, the same way section I
+#   reads the job list out of deploy.yml rather than trusting a copy.
+shipped_cost_vars="$(grep -oE 'for cost_var in [A-Z_ ]+;' "${ROOT}/scripts/deploy.sh" | head -1 \
+  | sed -E 's/for cost_var in //; s/;$//' | tr ' ' '\n' | grep -E '^AZURE_' | sort | tr '\n' ' ')"
+expect_eq "azure-cost env: deploy.sh's SHIPPED loop asserts all three (not a subset)" \
+  "AZURE_CLIENT_ID AZURE_RESOURCE_GROUP AZURE_SUBSCRIPTION_ID " "${shipped_cost_vars}"
+
+# all three present -> nothing flunks
+cost_flunks=""
+for _v in "sub-1234" "synthwatch-rg" "9015212f-3e39-4d70-9fa9-1d97f9662deb"; do
+  [[ -n "${_v}" ]] || cost_flunks+="x "
+done
+expect_eq "azure-cost env: all three present -> passes" "" "${cost_flunks}"
+
+# ★ MUST-GO-RED, and this is THE EXACT PROD STATE an hour ago: the two #359 added are present, the third
+#   is absent. A subset assertion certified this as healthy.
+cost_flunks=""
+for _pair in "AZURE_SUBSCRIPTION_ID:sub-1234" "AZURE_RESOURCE_GROUP:synthwatch-rg" "AZURE_CLIENT_ID:"; do
+  _var="${_pair%%:*}"; _stub="${_pair#*:}"
+  [[ -n "${_stub}" ]] || cost_flunks+="${_var} "
+done
+expect_eq "azure-cost env must-go-red: the POST-#359 prod state (2 present, CLIENT_ID absent) flunks" \
+  "AZURE_CLIENT_ID " "${cost_flunks}"
+
+# ★ …and each of the other two independently, so no single var can regress unnoticed.
+for _missing in AZURE_SUBSCRIPTION_ID AZURE_RESOURCE_GROUP AZURE_CLIENT_ID; do
+  cost_flunks=""
+  for _var in "${COST_VARS[@]}"; do
+    _stub="set"; [[ "${_var}" == "${_missing}" ]] && _stub=""
+    [[ -n "${_stub}" ]] || cost_flunks+="${_var} "
+  done
+  expect_eq "azure-cost env must-go-red: ${_missing} alone absent -> flunks" "${_missing} " "${cost_flunks}"
+done
+
 # ===========================================================================
 # J. ★ CONFIG-VALUE extraction + comparison (verify()'s data-driven replicaTimeout/cpu/memory checks —
 #    the fix for the silent-drop class). bicep_field must pull the RUNNER-job values from the deployed
