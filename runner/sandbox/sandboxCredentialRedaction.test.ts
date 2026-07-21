@@ -122,8 +122,13 @@ async function surfaces(r: PreviewResult): Promise<Array<[string, string]>> {
     ...leaves('result', { ...r, trace: undefined, screenshot: undefined }),
   ];
   // ★ A byte-scan of a PNG is a BACKSTOP, not the control. A credential rendered into a screenshot is
-  //   PIXELS, not the ASCII string — no string search can find it, which is precisely why the real
-  //   protection is structural SUPPRESSION (asserted separately below) rather than scrubbing.
+  //   PIXELS, not the ASCII string, so no string search can find it.
+  // ★ WHAT THIS TEST ACTUALLY PROTECTS is the TEXT channels — trace text, stdout, error, trace_signals —
+  //   which ARE credential-gated and ARE scrubbed. It does NOT protect the image, and there is no longer
+  //   any screenshot suppression to fall back on: redact.ts previewPersistPlan returns
+  //   failureScreenshot: true unconditionally, so a credentialed preview KEEPS its screenshot (#348).
+  //   The bound on the image is different in kind — the Tests area is editor/admin-only, the operator
+  //   typed the credential, and <input type="password"> renders MASKED — not a structural withholding.
   if (r.screenshot) s.push(['screenshot bytes', r.screenshot.toString('binary')]);
   if (r.trace) for (const entry of await expandZip(r.trace)) s.push([`trace.zip:${entry.split('\n')[0]}`, entry]);
   return s;
@@ -240,7 +245,9 @@ test('★ an uncredentialed preview is unchanged — raw trace AND the failure s
 
   assert.equal(r.status, 'fail');
   // ★ Today's behaviour, preserved: the RAW trace and the failure screenshot both survive. The sensitive
-  //   path's suppressions must not bleed into the uncredentialed path.
+  //   path's REDACTION must not bleed into the uncredentialed path — that is the only thing the
+  //   credentialed path does differently now. (It is not "suppressions": previewPersistPlan keeps the
+  //   screenshot on BOTH paths, so the screenshot assertion below is a shared invariant, not a contrast.)
   assert.ok(r.trace && r.trace.byteLength > 0, 'an uncredentialed preview still keeps its trace');
   assert.ok(r.screenshot && r.screenshot.byteLength > 0, 'an uncredentialed preview still keeps its screenshot');
   // IDENTITY_REDACTOR ⇒ nothing was rewritten.
