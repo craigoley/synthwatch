@@ -1109,7 +1109,15 @@ verify() {
   done
   mism="$(printf '%s' "${map}" | image_mismatches "${RUNNER_IMG}" "${MIGRATE_IMG}")"
   if [[ -z "${mism}" ]]; then
-    pass "all jobs on image ${SHA:0:12} (runner+migrate+narrative+rollup+reconcile+centralus)"
+    # ★ DERIVED, never retyped. The old literal "(runner+migrate+narrative+rollup+reconcile+centralus)"
+    #   was false TWICE: it claimed "all jobs" while the sandbox was not even in the loop, and its own list
+    #   had drifted from its own array (no westus2, no retention). A hand-maintained summary of a machine-
+    #   maintained list is a lie waiting to happen — so build it from the array that was actually checked.
+    #   Names are shortened for readability only ('synthwatch-' stripped, '-job' stripped).
+    local checked
+    checked="$(printf '%s\n' "${RUNNER_IMAGE_JOBS[@]}" "${MIGRATE_JOB}" \
+      | sed -e 's/^synthwatch-//' -e 's/-job//' | paste -sd'+' -)"
+    pass "all ${#RUNNER_IMAGE_JOBS[@]}+1 jobs on image ${SHA:0:12} (${checked})"
   else
     while IFS= read -r j; do
       [[ -z "${j}" ]] && continue
