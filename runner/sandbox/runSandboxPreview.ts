@@ -15,7 +15,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import type { TerminalStatus } from '../db.js';
-import { IDENTITY_REDACTOR, makeRedactor, scrubError, tracePersistPlan, type Redactor } from '../redact.js';
+import { IDENTITY_REDACTOR, makeRedactor, previewPersistPlan, scrubError, type Redactor } from '../redact.js';
 import { compileSpec } from '../specfetch/compileSpec.js';
 import { buildRedactedTraceZip } from '../traceRedact.js';
 import { buildSandboxEnv, type SandboxRunVars } from './sandboxEnv.js';
@@ -133,6 +133,13 @@ export async function runSandboxPreview(
   specSource: string,
   vars: Partial<SandboxRunVars> & { targetUrl: string } & {
     /**
+     * Per-run "Redact credentials from output" toggle. DEFAULT ON (absent ⇒ ON; only a literal `false`
+     * disables). ★ Deliberately NOT part of SandboxRunVars: those fields are what buildSandboxEnv publishes
+     * to the CHILD, and the child must never learn whether redaction is on — it just runs the spec. The
+     * decision is the PARENT's, applied to output on the way back.
+     */
+    redactCredentials?: boolean;
+    /**
      * ★ TEST-ONLY, and the ONLY way the redaction suite can prove it is not vacuous. Drops a credentialed
      * run back to the NON-SENSITIVE treatment — IDENTITY_REDACTOR *and* no artifact suppression — so the
      * meta-test can assert the sentinel suite REDS with the protections off. It disables the WHOLE
@@ -155,7 +162,14 @@ export async function runSandboxPreview(
   //   token-shape denylist, which is what catches the SESSION material the login produces (the cookie/JWT
   //   the credential is exchanged for is not the credential, and is just as reusable).
   //   An UNCREDENTIALED preview gets IDENTITY_REDACTOR — byte-for-byte today's behaviour.
-  const sensitive = isCredentialedRun(vars.credentials) && !vars.__unsafeDisableSensitiveHandlingForTest;
+  // ★ The toggle is expressed HERE, by dropping `sensitive`, rather than by a second flag threaded through
+  //   every downstream branch. redactCredentials=false ⇒ sensitive=false ⇒ IDENTITY_REDACTOR and the raw
+  //   trace — i.e. OFF reuses the already-proven non-sensitive path instead of adding a third mode nobody
+  //   tests. Screenshots are kept either way now (previewPersistPlan), so the toggle governs SCRUBBING only.
+  //   Default ON: only a literal `false` from the payload disables (decodeSandboxPayload enforces that).
+  const redactCredentials = vars.redactCredentials !== false;
+  const sensitive =
+    isCredentialedRun(vars.credentials) && redactCredentials && !vars.__unsafeDisableSensitiveHandlingForTest;
   const redact: Redactor = sensitive ? makeRedactor(null, redactionValues(vars.credentials)) : IDENTITY_REDACTOR;
 
   // ★ STATIC GATE: esbuild compiles ONLY through the single lib/flow alias — a spec importing arbitrary npm
@@ -276,7 +290,7 @@ function runChild(specFile: string, vars: SandboxRunVars, sensitive: boolean, re
           // ★ NO page.screenshot({ mask }) — masking blacks out only the selectors you NAMED, so a
           //   credential rendered somewhere unpredicted (an error toast, the autofill dropdown, a
           //   "signed in as…" header) survives. Suppression is the only bound we can actually state.
-          const plan = tracePersistPlan(sensitive, (status ?? 'error') as TerminalStatus);
+          const plan = previewPersistPlan(sensitive);
 
           if (sensitive) {
             // Scrub EVERY text field that reaches the result JSON — not just the obvious error channels.
@@ -304,7 +318,8 @@ function runChild(specFile: string, vars: SandboxRunVars, sensitive: boolean, re
               // buildRedactedTraceZip is FAIL-CLOSED: false ⇒ destPath removed ⇒ we ship NO trace. A raw
               // byte can never reach the blob because scrubbing broke.
               const redactedPath = `${j.tracePath}.redacted.zip`;
-              const built = await buildRedactedTraceZip(j.tracePath, redactedPath, redact);
+              // ★ keepImages: the preview divergence. Text still scrubbed; the picture survives.
+              const built = await buildRedactedTraceZip(j.tracePath, redactedPath, redact, { keepImages: true });
               trace = built ? await readFile(redactedPath).catch(() => null) : null;
             } else {
               // ★ NON-SENSITIVE: today's preview behaviour, UNCHANGED — the RAW zip on pass AND fail. This

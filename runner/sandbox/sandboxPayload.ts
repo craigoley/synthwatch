@@ -66,6 +66,13 @@ export interface SandboxCredentials {
 export interface SandboxPayload {
   spec: string;
   credentials?: SandboxCredentials;
+  /**
+   * Per-run "Redact credentials from output" toggle (Tests UI, editor/admin only). DEFAULT ON.
+   * ON  → the credentialed run is `sensitive`: makeRedactor scrubs trace text, stdout, error, trace_signals.
+   * OFF → IDENTITY_REDACTOR, nothing scrubbed — the operator asked to see raw output for a credential they
+   *       typed themselves. Absent ⇒ ON (see decodeSandboxPayload: only a literal `false` disables).
+   */
+  redactCredentials?: boolean;
 }
 
 /** Where a resolved payload came from — `legacy-env` is the pre-cutover path PR4 removes. */
@@ -124,6 +131,13 @@ export function decodeSandboxPayload(ciphertext: string, key: Buffer): SandboxPa
     credentials: creds
       ? { username: asString(creds.username), password: asString(creds.password), bypassToken: asString(creds.bypassToken) }
       : undefined,
+    // ★ FAIL-SAFE, and deliberately `=== false` rather than a truthiness test or a cast. Redaction is the
+    //   protective state, so ONLY the literal boolean `false` turns it off: absent, null, `"false"` (a
+    //   string — an api that stringified the field), `0`, or any other shape all resolve to ON. This is the
+    //   same type-confusion class the credential fields above are coerced against, and here it fails the
+    //   safe way round — a malformed payload over-redacts (an operator sees <redacted> and re-runs), it
+    //   never silently under-redacts. The api mirror must send a real JSON boolean.
+    redactCredentials: p.redactCredentials !== false,
   };
 }
 

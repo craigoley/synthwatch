@@ -654,7 +654,8 @@ CREATE TABLE sandbox_preview (
     requested_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     completed_at  TIMESTAMPTZ,
     exit_code     INTEGER,
-    error         TEXT
+    error         TEXT,
+    redact_credentials boolean NOT NULL DEFAULT true  -- 0094: per-run Tests-UI redaction toggle (audit)
 );
 CREATE INDEX sandbox_preview_actor_idx ON sandbox_preview (actor_email, requested_at DESC);
 CREATE INDEX sandbox_preview_running_idx ON sandbox_preview (requested_at) WHERE status = 'running';

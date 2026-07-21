@@ -210,3 +210,27 @@ test('★ buildSandboxEnv publishes only STRING credentials — it cannot disagr
   assert.ok(!('SW_SANDBOX_CRED_PASSWORD' in env), 'a non-string password must never reach the spec');
   assert.ok(!('SW_SANDBOX_CRED_BYPASS_TOKEN' in env), 'an empty token is not a credential');
 });
+
+// ── ★ redactCredentials: fail-SAFE normalisation (only a literal `false` disables) ──────────────────────
+test('★ decodeSandboxPayload: redactCredentials defaults ON and only a literal false disables', () => {
+  const key = randomBytes(32);
+  const enc = (o: unknown): string => encryptCredValue(JSON.stringify(o), key);
+
+  // Absent ⇒ ON. An api that has not shipped the field yet must not silently disable redaction.
+  assert.equal(decodeSandboxPayload(enc({ spec: 'x' }), key).redactCredentials, true, 'absent ⇒ ON');
+  assert.equal(decodeSandboxPayload(enc({ spec: 'x', redactCredentials: true }), key).redactCredentials, true);
+
+  // The ONE disabling value.
+  assert.equal(decodeSandboxPayload(enc({ spec: 'x', redactCredentials: false }), key).redactCredentials, false);
+
+  // ★ FAIL-SAFE on every malformed shape — this is the type-confusion class that already bit the credential
+  //   fields (a stringified "false", a 0, a null). Redaction is the protective state, so anything that is
+  //   not the literal boolean false must resolve to ON. Under-redacting on a typo is unacceptable;
+  //   over-redacting is merely annoying.
+  for (const bad of ['false', 'FALSE', 0, null, '', [], {}] as const) {
+    assert.equal(
+      decodeSandboxPayload(enc({ spec: 'x', redactCredentials: bad }), key).redactCredentials, true,
+      `redactCredentials: ${JSON.stringify(bad)} must fail SAFE (⇒ ON)`,
+    );
+  }
+});

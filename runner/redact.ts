@@ -109,6 +109,45 @@ export function tracePersistPlan(sensitive: boolean, status: TerminalStatus): Tr
   return { failureTraceMode: down ? 'raw' : 'none', successBaseline: up, failureScreenshot: down, baselineScreenshot: status === 'pass' };
 }
 
+/**
+ * ★ THE PREVIEW PLAN — a SEPARATE function from tracePersistPlan on purpose. Do not merge them.
+ *
+ * A SANDBOX PREVIEW keeps its screenshot and its trace images even when credentialed; a FLEET monitor
+ * with `sensitive=true` keeps neither. That divergence is deliberate and the two audiences are not
+ * comparable:
+ *
+ *   • A preview is run from the Tests area, which is EDITOR/ADMIN ONLY, by a person who TYPED the
+ *     credential seconds earlier and is watching the result. Showing them their own password back is not
+ *     a disclosure. And `<input type="password">` renders MASKED, so the typed value does not appear
+ *     visually in the first place — suppression cost the PRIMARY DIAGNOSTIC (the screenshot is usually
+ *     the fastest way to see why an authenticated flow broke) on exactly the monitors with the worst
+ *     authoring friction, and bought very little.
+ *   • A FLEET sensitive monitor is UNATTENDED and scheduled. Its logged-in pages carry member name,
+ *     address and order history — PII that is NOT masked the way a password field is, that nobody asked
+ *     to see, and that would land in 90d-retained artifacts. tracePersistPlan stays exactly as it is.
+ *
+ * So: same `sensitive` input, different verdict, because the threat models differ. Anyone tempted to
+ * collapse these into one function should re-read the two bullets above first.
+ *
+ * ★ Text scrubbing is NOT relaxed here — only IMAGE/artifact retention. A credentialed preview with the
+ *   redaction toggle ON still runs every text channel through the redactor; this plan only stops us
+ *   throwing away the picture. The toggle's OFF state is expressed by the CALLER passing sensitive=false
+ *   (which is what selects IDENTITY_REDACTOR), not by anything in here.
+ */
+export function previewPersistPlan(sensitive: boolean): TracePersistPlan {
+  // A preview never writes the permanent, purge-EXEMPT success baseline or the RCA visual-diff baseline —
+  // those are fleet-monitor slots keyed to a check row, and a preview has no check row.
+  return {
+    // sensitive ⇒ the redacted/reduced zip (text scrubbed, images now KEPT — see buildRedactedTraceZip's
+    // keepImages). Non-sensitive (incl. redaction toggled OFF) ⇒ today's preview behaviour: the RAW zip on
+    // pass AND fail, because a preview is a one-shot the user is watching and the trace IS the point.
+    failureTraceMode: sensitive ? 'redacted' : 'raw',
+    successBaseline: false,
+    failureScreenshot: true, // ★ the change: was false for credentialed previews
+    baselineScreenshot: false,
+  };
+}
+
 /** Generic error_message for a sensitive monitor — the fallback when scrubbing leaves nothing readable.
  *  Keeps only the safe status + static step name. */
 export function sensitiveErrorMessage(status: TerminalStatus, failedStep: string | null): string {

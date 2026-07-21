@@ -313,3 +313,77 @@ test('buildRedactedTraceZip: a huge DROPPED entry is streamed past, not loaded �
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ──────────────────────────────────────────────────────────────────────────────────────────────────
+// ★ keepImages — the PREVIEW-ONLY divergence, and the guard that it can never become the FLEET's.
+// ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+test('★ FLEET DEFAULT IS FROZEN: no opts ⇒ image entries still DROPPED (regression guard for keepImages)', async () => {
+  // ★ THIS IS THE POINT OF THE PARAMETER TEST. `keepImages` exists so a credentialed PREVIEW can keep its
+  //   screencast frames. A fleet sensitive monitor must NEVER get them: its logged-in pages carry member
+  //   name / address / order history — PII that is not masked the way <input type="password"> is, that
+  //   nobody asked to see, and that would land in 90d-retained artifacts. If someone flips the default, or
+  //   threads the preview's `true` into the fleet call in runner/index.ts, THIS test reds.
+  const dir = tmpDir();
+  try {
+    const src = writeFixtureZip(dir);
+    const dest = join(dir, 'fleet.redacted.zip');
+    assert.equal(await buildRedactedTraceZip(src, dest, redactor), true);
+    const names = new AdmZip(dest).getEntries().map((e) => e.entryName).sort();
+    assert.deepEqual(names, ['resources/aaa111.json', 'trace.network', 'trace.trace'],
+      'FLEET: jpeg + font dropped — unchanged by the keepImages parameter existing');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('★ FLEET DEFAULT IS FROZEN: an explicitly non-true keepImages is still the fleet path', async () => {
+  // Only a literal `true` opts in. A stray `undefined`/`false`/omitted-object must not widen the fleet.
+  const dir = tmpDir();
+  try {
+    const src = writeFixtureZip(dir);
+    for (const [label, opts] of [
+      ['{}', {}],
+      ['{keepImages: false}', { keepImages: false }],
+      ['{keepImages: undefined}', { keepImages: undefined }],
+    ] as const) {
+      const dest = join(dir, `fleet-${label.replace(/\W/g, '')}.zip`);
+      assert.equal(await buildRedactedTraceZip(src, dest, redactor, opts), true);
+      const names = new AdmZip(dest).getEntries().map((e) => e.entryName).sort();
+      assert.deepEqual(names, ['resources/aaa111.json', 'trace.network', 'trace.trace'], `${label} ⇒ fleet default`);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('★ PREVIEW: keepImages keeps the screencast jpeg VERBATIM — and still scrubs every text entry', async () => {
+  const dir = tmpDir();
+  try {
+    const src = writeFixtureZip(dir);
+    const dest = join(dir, 'preview.redacted.zip');
+    assert.equal(await buildRedactedTraceZip(src, dest, redactor, { keepImages: true }), true);
+
+    const out = new AdmZip(dest);
+    const names = out.getEntries().map((e) => e.entryName).sort();
+    assert.deepEqual(names, ['resources/aaa111.json', 'resources/frame01.jpeg', 'trace.network', 'trace.trace'],
+      'jpeg KEPT for the preview; the font (not an image) is STILL dropped — allowlist, not "not text"');
+
+    // The jpeg survives byte-identical: an image cannot be text-scrubbed, and mangling it would defeat
+    // the point of keeping it.
+    const jpeg = out.getEntries().find((e) => e.entryName === 'resources/frame01.jpeg');
+    assert.deepEqual(jpeg?.getData(), Buffer.from([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3]), 'jpeg passed through verbatim');
+
+    // ★ AND THE TEXT IS STILL SCRUBBED. keepImages relaxes IMAGE retention only — it must not weaken the
+    //   text scrub by one byte, or "optional images" would have silently become "optional redaction".
+    for (const e of out.getEntries()) {
+      if (e.entryName.endsWith('.jpeg')) continue; // binary; scanned for secrets below via the text path only
+      const text = e.getData().toString('utf8');
+      for (const s of ALL_SECRETS) {
+        assert.ok(!text.includes(s), `secret survived in ${e.entryName} with keepImages on`);
+      }
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
