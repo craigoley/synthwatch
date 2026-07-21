@@ -429,6 +429,51 @@ runner_image_set="$(printf '%s\n' "${RUNNER_IMAGE_JOBS[@]}" | sort -u | tr '\n' 
 expect_eq "deploy.yml rolls EXACTLY RUNNER_IMAGE_JOBS (no CD/deploy.sh drift)" "${runner_image_set}" "${cd_rolled}"
 
 # ===========================================================================
+# I2. ★ A4 GUARD SCOPE — GUARDED_ENTRYPOINT_JOBS vs RUNNER_IMAGE_JOBS.
+#     #351 added synthwatch-sandbox to RUNNER_IMAGE_JOBS (it runs the runner IMAGE, so it must be rolled
+#     and image-verified) — but it does NOT run a guarded entrypoint: it is DB-less by construction, so
+#     prodGuard's DATABASE_URL trigger can never fire, and sandboxMain.ts never imports prodGuard. Before
+#     the split, the A4 marker check ran over the image set and FAILED on every deploy while asserting
+#     something false ("the job REFUSES TO START without it" — it demonstrably starts).
+#     These pin the narrowing so nobody re-merges the two arrays, and so the exemption stays deliberate.
+# ===========================================================================
+guarded_set="$(printf '%s\n' "${GUARDED_ENTRYPOINT_JOBS[@]}" | sort -u | tr '\n' ' ')"
+image_set="$(printf '%s\n' "${RUNNER_IMAGE_JOBS[@]}" | sort -u | tr '\n' ' ')"
+
+# (a) the sandbox is image-rolled but NOT guarded — the whole point of the split.
+case " ${image_set} " in *" ${SANDBOX_JOB} "*) ok=1 ;; *) ok=0 ;; esac
+expect_eq "A4 scope: sandbox IS in RUNNER_IMAGE_JOBS (it must still be rolled + image-verified)" "1" "${ok}"
+case " ${guarded_set} " in *" ${SANDBOX_JOB} "*) ok=0 ;; *) ok=1 ;; esac
+expect_eq "A4 scope: sandbox is NOT in GUARDED_ENTRYPOINT_JOBS (DB-less; prodGuard trigger unreachable)" "1" "${ok}"
+
+# (b) subset invariant: every guarded job also runs our image. A guarded job missing from the image set
+#     would never be rolled — the #351 class of bug, in the other direction.
+missing_from_image=""
+for _j in "${GUARDED_ENTRYPOINT_JOBS[@]}"; do
+  case " ${image_set} " in *" ${_j} "*) : ;; *) missing_from_image+="${_j} " ;; esac
+done
+expect_eq "A4 scope: GUARDED_ENTRYPOINT_JOBS is a SUBSET of RUNNER_IMAGE_JOBS" "" "${missing_from_image}"
+
+# (c) ★ MUST-GO-RED — the exclusion NARROWED the check, it did not DISABLE it. Replay the A4 comparator
+#     over the guarded set with one genuinely-guarded job missing the marker: it must still flunk, and
+#     name that job. Without this, "the A4 check is green" would prove nothing after the rescope.
+a4_flunks=""
+for _j in "${GUARDED_ENTRYPOINT_JOBS[@]}"; do
+  # simulate: every guarded job has the marker EXCEPT the reconcile job
+  if [ "${_j}" = "${RECONCILE_JOB}" ]; then _v=""; else _v="1"; fi
+  str_eq "1" "${_v}" || a4_flunks+="${_j} "
+done
+expect_eq "A4 must-go-red: a GUARDED job missing the marker still FLUNKS (check narrowed, not disabled)" \
+  "${RECONCILE_JOB} " "${a4_flunks}"
+
+# (d) …and the same comparator over an all-present set flunks NOTHING (so (c) is not trivially true).
+a4_flunks=""
+for _j in "${GUARDED_ENTRYPOINT_JOBS[@]}"; do
+  str_eq "1" "1" || a4_flunks+="${_j} "
+done
+expect_eq "A4 must-go-green: every guarded job carrying the marker flunks nothing" "" "${a4_flunks}"
+
+# ===========================================================================
 # J. ★ CONFIG-VALUE extraction + comparison (verify()'s data-driven replicaTimeout/cpu/memory checks —
 #    the fix for the silent-drop class). bicep_field must pull the RUNNER-job values from the deployed
 #    template BLOCK-SCOPED (not bleed the aux jobs' 600/0.25/0.5Gi), and num_eq must be 2-vs-2.0 tolerant
