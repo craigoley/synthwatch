@@ -45,13 +45,20 @@ async function main(): Promise<void> {
     return;
   }
   const { spec, credentials } = resolved.payload;
-  // Channel + credentialed-ness only — NEVER a value, and never the spec. `source` makes the PR4 cutover
-  // observable in the job log without exposing anything.
+  // ★ Default ON. decodeSandboxPayload already normalises this to a real boolean (only a literal `false`
+  //   disables), and the legacy env channel carries no credentials at all — so `?? true` here is the
+  //   belt-and-braces default for a payload shape that predates the field.
+  const redactCredentials = resolved.payload.redactCredentials ?? true;
+
+  // Channel + credentialed-ness + the toggle — NEVER a value, and never the spec. An OFF run is the one we
+  // most want a trail for, and this line is the job-log half of that trail (the DB half is the api's
+  // sandbox_preview.redact_credentials column). `source` makes the PR4 cutover observable too.
   process.stderr.write(
-    `sandboxMain: spec via ${resolved.source}; credentials ${isCredentialedRun(credentials) ? 'PRESENT (run is sensitive)' : 'absent'}\n`,
+    `sandboxMain: spec via ${resolved.source}; credentials ${isCredentialedRun(credentials) ? 'PRESENT' : 'absent'}; ` +
+      `redaction ${redactCredentials ? 'ON' : 'OFF (operator opted out)'}\n`,
   );
 
-  const result = await runSandboxPreview(spec, { targetUrl: target, credentials });
+  const result = await runSandboxPreview(spec, { targetUrl: target, credentials, redactCredentials });
 
   // Upload the binary artifacts FIRST (best-effort) so the result JSON's hasTrace/hasScreenshot reflect what
   // actually landed. The trusted PARENT holds the blob creds — the child never did.

@@ -5,6 +5,7 @@ import {
   makeRedactor,
   IDENTITY_REDACTOR,
   tracePersistPlan,
+  previewPersistPlan,
   sensitiveErrorMessage,
   scrubError,
 } from './redact.js';
@@ -170,4 +171,46 @@ test('scrubError falls back to the generic placeholder ONLY when scrubbing leave
 
 test('scrubError on a NON-sensitive identity redactor is a no-op pass-through', () => {
   assert.equal(scrubError(IDENTITY_REDACTOR, 'error', null, 'plain diagnostic'), 'plain diagnostic');
+});
+
+// ──────────────────────────────────────────────────────────────────────────────────────────────────
+// ★ previewPersistPlan — the PREVIEW path. Separate function, separate verdict, deliberately.
+// ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+test('★ previewPersistPlan: a credentialed preview KEEPS its screenshot (the change)', () => {
+  // Rationale (see the function's comment): the Tests area is editor/admin only, the operator TYPED the
+  // credential seconds earlier, and <input type="password"> renders MASKED — so suppression cost the
+  // primary diagnostic on the hardest-to-author monitors and bought very little.
+  assert.deepEqual(previewPersistPlan(true), {
+    failureTraceMode: 'redacted', // text still scrubbed
+    successBaseline: false, // a preview has no check row → no permanent baseline slot
+    failureScreenshot: true, // ★ was false
+    baselineScreenshot: false,
+  });
+});
+
+test('previewPersistPlan: redaction OFF (sensitive=false) ⇒ raw trace, screenshot still kept', () => {
+  assert.deepEqual(previewPersistPlan(false), {
+    failureTraceMode: 'raw',
+    successBaseline: false,
+    failureScreenshot: true,
+    baselineScreenshot: false,
+  });
+});
+
+test('★★ FLEET UNCHANGED: a sensitive FLEET check still suppresses its screenshot — preview must not leak in', () => {
+  // ★ THE REGRESSION GUARD FOR THE WHOLE FEATURE. previewPersistPlan and tracePersistPlan take the SAME
+  //   `sensitive` input and MUST disagree: a preview is watched by the editor/admin who typed the
+  //   credential; a fleet monitor is UNATTENDED and its logged-in pages carry member name / address /
+  //   order history — PII a password field's masking says nothing about. If anyone "unifies" these two
+  //   functions, or edits tracePersistPlan to match the preview, this test reds.
+  for (const status of ['fail', 'error', 'pass', 'warn'] as const) {
+    assert.equal(tracePersistPlan(true, status).failureScreenshot, false,
+      `FLEET sensitive + ${status} → screenshot STILL suppressed`);
+    assert.equal(tracePersistPlan(true, status).successBaseline, false,
+      `FLEET sensitive + ${status} → no purge-exempt baseline`);
+  }
+  // …and the two really are different functions, not aliases.
+  assert.notDeepEqual(tracePersistPlan(true, 'fail'), previewPersistPlan(true),
+    'fleet and preview plans must NOT be the same verdict');
 });

@@ -150,11 +150,12 @@ async function assertSentinelAbsent(r: PreviewResult): Promise<void> {
   }
 }
 
-function runLeakySpec(opts: { disableProtections?: boolean } = {}): Promise<PreviewResult> {
+function runLeakySpec(opts: { disableProtections?: boolean; redactCredentials?: boolean } = {}): Promise<PreviewResult> {
   return runSandboxPreview(LEAKY_LOGIN_SPEC, {
     targetUrl: 'https://example.com',
     timeoutMs: 90_000,
     credentials: { username: SENTINEL_USER, password: SENTINEL },
+    redactCredentials: opts.redactCredentials,
     __unsafeDisableSensitiveHandlingForTest: opts.disableProtections,
   });
 }
@@ -179,14 +180,24 @@ test('★ a credentialed preview leaks the sentinel to NO surface (trace, screen
   assert.ok((r.error ?? '').includes('login rejected'), 'the readable diagnostic must survive scrubbing');
 });
 
-// ── SCREENSHOT SUPPRESSION (tracePersistPlan sensitive=true) ─────────────────────────────────────────────
-test('★ a credentialed preview persists NO screenshot — suppression, not masking', async () => {
+// ── SCREENSHOT RETENTION (previewPersistPlan — the preview path, NOT the fleet's) ───────────────────────
+test('★ a credentialed preview KEEPS its screenshot — and the sentinel is NOT in the pixels', async () => {
   const r = await runLeakySpec();
   assert.ok(r.status === 'error' || r.status === 'fail', 'the flow must be DOWN — that is when a screenshot is captured');
-  // ★ page.screenshot({ mask }) is deliberately NOT used: masking blacks out only the selectors you NAMED,
-  //   so a credential rendered somewhere unpredicted (an error toast, the autofill dropdown, a "signed in
-  //   as…" header) survives. A failed flow normally yields a screenshot; a sensitive one must yield none.
-  assert.equal(r.screenshot ?? null, null, 'a credentialed run must persist no screenshot at all');
+
+  // ★ CHANGED (was: assert no screenshot at all). A preview is run from the editor/admin-only Tests area by
+  //   the person who TYPED the credential, and `<input type="password">` renders MASKED — so the typed value
+  //   does not appear visually. Suppression cost the PRIMARY diagnostic on exactly the monitors with the
+  //   worst authoring friction and bought little. previewPersistPlan keeps it; tracePersistPlan (the FLEET)
+  //   still suppresses, because an unattended monitor's logged-in page carries member name / address /
+  //   order history — PII a masked password field says nothing about. See redact.test.ts's FLEET UNCHANGED.
+  assert.ok(r.screenshot && r.screenshot.byteLength > 0, 'a credentialed preview must now KEEP its screenshot');
+  assert.deepEqual([...r.screenshot!.subarray(0, 4)], [0x89, 0x50, 0x4e, 0x47], 'and it must be a real PNG');
+
+  // ★ The screenshot is now a REAL surface in the sentinel scan below rather than a vacuous null. This is
+  //   the assertion that would catch a password field that did NOT mask (a text input mislabelled, a custom
+  //   control) — the rationale for keeping the image is falsifiable, not assumed.
+  await assertSentinelAbsent(r);
 });
 
 // ── ★★ THE META-TEST: prove the suite above CAN fail ─────────────────────────────────────────────────────
@@ -205,10 +216,10 @@ test('★★ META: with the protections disabled the SAME assertions RED — the
       'trusting the green test above.',
   );
 
-  // (b) The SUPPRESSION assertion must also have something to fail against. Without this, "a credentialed
-  //     run has no screenshot" could pass simply because no screenshot was ever captured — a vacuous check
-  //     inside the anti-vacuity test. The mutant proves the capture really does happen, so the null in the
-  //     protected run is caused by tracePersistPlan and nothing else.
+  // (b) ★ REPURPOSED. Both runs now KEEP a screenshot (previewPersistPlan), so there is no longer a null to
+  //     explain. What still needs proving is that a screenshot is captured AT ALL — otherwise the protected
+  //     run's "sentinel absent from the pixels" assertion would be vacuous: scanning zero bytes always
+  //     passes. This keeps the image surface honest in the ON test above.
   assert.ok(
     mutant.screenshot && mutant.screenshot.byteLength > 0,
     '★ THE SUPPRESSION CHECK IS VACUOUS: even unprotected, this flow captured no screenshot — so asserting ' +
@@ -235,4 +246,41 @@ test('★ an uncredentialed preview is unchanged — raw trace AND the failure s
   // IDENTITY_REDACTOR ⇒ nothing was rewritten.
   assert.ok(!r.stdout.includes('<redacted>'), 'an uncredentialed preview redacts nothing');
   assert.ok((r.error ?? '').length > 0, 'the raw error survives verbatim');
+});
+
+// ──────────────────────────────────────────────────────────────────────────────────────────────────
+// ★ THE TOGGLE — "Redact credentials from output". DEFAULT ON; OFF is an explicit, audited opt-out.
+// ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+test('★ toggle DEFAULT is ON: omitting redactCredentials redacts exactly as before', async () => {
+  // The default must not depend on the api remembering to send the field. Absent ⇒ ON.
+  await assertSentinelAbsent(await runLeakySpec({ redactCredentials: undefined }));
+});
+
+test('★ toggle OFF: the sentinel IS present — that is the POINT, and it must be provably so', async () => {
+  // ★ This is an INVERTED assertion and it is deliberate. The operator asked for raw output for a
+  //   credential they typed themselves; if OFF still scrubbed, the toggle would be decorative. Proving OFF
+  //   really is raw is also what makes the ON test above non-vacuous — the same spec, same surfaces, one
+  //   flag apart.
+  const off = await runLeakySpec({ redactCredentials: false });
+
+  await assert.rejects(
+    async () => assertSentinelAbsent(off),
+    /LEAK: the (password|username) survived in /,
+    '★ toggle OFF did not produce raw output — the toggle is not wired, or something still scrubs.',
+  );
+
+  // And the marker of redaction must be ABSENT: OFF is "nothing scrubbed", not "scrubbed differently".
+  assert.ok(!off.stdout.includes('<redacted>'), 'OFF must not emit the redaction marker anywhere in stdout');
+
+  // The screenshot is kept on this path too — the toggle governs SCRUBBING, not artifact retention.
+  assert.ok(off.screenshot && off.screenshot.byteLength > 0, 'OFF keeps the screenshot as well');
+});
+
+test('★ toggle OFF is the ONLY thing that changes: a literal false disables, anything else does not', async () => {
+  // Mirrors decodeSandboxPayload's `!== false` normalisation — the fail-SAFE direction. A malformed value
+  // must over-redact (operator sees <redacted>, re-runs), never silently under-redact.
+  for (const value of [undefined, true] as const) {
+    await assertSentinelAbsent(await runLeakySpec({ redactCredentials: value }));
+  }
 });

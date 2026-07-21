@@ -110,7 +110,45 @@ export function scrubTraceText(text: string, redact: Redactor): string {
  * fail-closed contract — ANY error removes destPath and resolves false so the caller uploads nothing.
  * Now async (streaming); the caller awaits it. Runs on the failure path only, while the zip is in hand.
  */
-export function buildRedactedTraceZip(srcPath: string, destPath: string, redact: Redactor): Promise<boolean> {
+/**
+ * ★ IMAGE RETENTION — a PARAMETER, not a fork, and the FLEET BEHAVIOUR IS THE DEFAULT.
+ *
+ * `keepImages` defaults to FALSE, which is byte-for-byte today's fleet policy: image entries (screencast
+ * jpegs, network body images) are dropped, because a rendered logged-in page cannot be text-scrubbed and a
+ * sensitive fleet monitor's pages carry member name / address / order history. Only the SANDBOX PREVIEW
+ * path passes true — see previewPersistPlan for why that audience is different.
+ *
+ * ★ WHY A PARAMETER RATHER THAN A PREVIEW-LOCAL COPY OF THIS BUILDER. Forking ~40 lines of streaming-zip
+ *   logic would be the N-implementations bug this codebase keeps paying for (countable_run,
+ *   latency_sample, reconcilePlan, runTracedFlow) — except the drift would be IN REDACTION. A second
+ *   builder would not stay in step with STRUCTURAL, scrubTraceText, or the fail-closed contract, and the
+ *   copy that fell behind would be the one shipping unscrubbed bytes. One builder, one scrubber, one
+ *   fail-closed path; the only thing that varies is whether images survive.
+ *
+ * ★ The fleet default is PINNED BY TEST (traceRedact.test.ts, "fleet default drops image entries") so this
+ *   parameter can never quietly become the fleet's behaviour.
+ */
+export function buildRedactedTraceZip(
+  srcPath: string,
+  destPath: string,
+  redact: Redactor,
+  opts: { keepImages?: boolean } = {},
+): Promise<boolean> {
+  const keepImages = opts.keepImages === true; // explicit opt-in only; anything else = fleet default
+  return buildRedactedTraceZipInner(srcPath, destPath, redact, keepImages);
+}
+
+/** Image entries a preview may keep verbatim. Screencast frames are `resources/page@<hash>-<ts>.jpeg`;
+ *  network body images land in `resources/<sha1>.<ext>`. Deliberately an ALLOWLIST — an unknown binary
+ *  extension still drops, so `keepImages` widens the kept set by images ONLY, never by "not text". */
+const IMAGE_ENTRY = /\.(jpe?g|png|webp|gif|avif)$/i;
+
+function buildRedactedTraceZipInner(
+  srcPath: string,
+  destPath: string,
+  redact: Redactor,
+  keepImages: boolean,
+): Promise<boolean> {
   return new Promise<boolean>((resolve) => {
     let settled = false;
     const fail = (zip?: yauzl.ZipFile): void => {
@@ -145,7 +183,16 @@ export function buildRedactedTraceZip(srcPath: string, destPath: string, redact:
         const name = entry.fileName;
         // Directory or drop-by-default (jpegs/fonts/binaries/unknown): skip WITHOUT opening a read
         // stream — the entry's data is never decompressed into memory. Advance to the next entry.
-        if (/\/$/.test(name) || classifyEntry(name) === 'drop') {
+        if (/\/$/.test(name)) {
+          zip.readEntry();
+          return;
+        }
+        // ★ classifyEntry is UNTOUCHED and still the fleet's drop-by-default policy. keepImages does not
+        //   change the classification — it only rescues entries the classifier already dropped that are
+        //   images, and copies their bytes through VERBATIM (an image cannot be text-scrubbed; the whole
+        //   point is that the preview operator gets to look at it).
+        const isImage = keepImages && IMAGE_ENTRY.test(name);
+        if (classifyEntry(name) === 'drop' && !isImage) {
           zip.readEntry();
           return;
         }
@@ -157,10 +204,15 @@ export function buildRedactedTraceZip(srcPath: string, destPath: string, redact:
           rs.on('end', () => {
             if (settled) return;
             try {
-              // Whole-entry scrub (one text entry in hand at a time) — identical to the old per-entry
-              // scrub, so a secret can never straddle a chunk boundary and slip through.
-              const scrubbed = scrubTraceText(Buffer.concat(chunks).toString('utf8'), redact);
-              out.addBuffer(Buffer.from(scrubbed, 'utf8'), name);
+              const raw = Buffer.concat(chunks);
+              if (isImage) {
+                // Verbatim — an image has no text to scrub. Reached ONLY on the preview path (keepImages).
+                out.addBuffer(raw, name);
+              } else {
+                // Whole-entry scrub (one text entry in hand at a time) — identical to the old per-entry
+                // scrub, so a secret can never straddle a chunk boundary and slip through.
+                out.addBuffer(Buffer.from(scrubTraceText(raw.toString('utf8'), redact), 'utf8'), name);
+              }
               if (/\.trace$/i.test(name)) sawTrace = true;
             } catch {
               return fail(zip);
