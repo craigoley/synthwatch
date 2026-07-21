@@ -32,6 +32,36 @@ readonly RUNNER_IMAGE_JOBS=(
 )
 
 # ---------------------------------------------------------------------------
+# GUARDED_ENTRYPOINT_JOBS — the jobs whose entrypoint enforces the A4 PROD-GUARD (runner/prodGuard.ts),
+# i.e. those that must carry SYNTHWATCH_DEPLOYED=1 or REFUSE TO START.
+#
+# ★ WHY THIS IS A SEPARATE ARRAY FROM RUNNER_IMAGE_JOBS. Until #351 the two sets were identical, and
+#   deploy.sh's A4 check leaned on that with the comment "RUNNER_IMAGE_JOBS is exactly the set that runs a
+#   guarded entrypoint". #351 FALSIFIED that invariant by adding synthwatch-sandbox: it runs the runner
+#   IMAGE (so it must be rolled + image-verified) but NOT a guarded ENTRYPOINT. Keeping one array made the
+#   A4 check fail on every deploy — a red that becomes normal is the "trains you to ignore it" failure, and
+#   the check was asserting something demonstrably false. Two sets, because there are genuinely two
+#   questions: "does this job run our image?" and "does this job enforce the prod-guard?".
+#
+# ★ WHY THE SANDBOX IS EXEMPT — the guard's trigger CANNOT be true there:
+#     • prodGuard refuses only when DATABASE_URL points at prod-class Postgres AND no deployed signal is
+#       present. The sandbox is DB-LESS BY CONSTRUCTION — its allowlist env (sandboxEnv.ts) carries no
+#       DATABASE_URL and no CRED_ENC_KEY, and its identity holds no DB role. Condition 1 is unreachable.
+#     • It runs sandboxMain.ts, which is not one of the guarded entrypoints (index.ts main() + the five aux
+#       mains). It does not import prodGuard at all.
+#     • Empirically it STARTS (execution fo2hh1e ran and produced output) without the marker — which
+#       directly contradicts the check's own "the job REFUSES TO START without it" text.
+#   Adding SYNTHWATCH_DEPLOYED=1 to its bicep would have gone green by cargo-culting a marker nothing in
+#   that job reads, leaving the assertion false. Narrowing the check is the honest fix.
+#
+# ★ INVARIANT, pinned by deploy_test.sh: GUARDED_ENTRYPOINT_JOBS ⊆ RUNNER_IMAGE_JOBS, and the sandbox is
+#   in the image set but NOT the guarded set. A new job that DOES enforce the guard belongs in BOTH.
+# ---------------------------------------------------------------------------
+readonly GUARDED_ENTRYPOINT_JOBS=(
+  "${RUNNER_JOB}" "${CENTRALUS_RUNNER_JOB}" "${WESTUS2_RUNNER_JOB}" "${NARRATIVE_JOB}" "${ROLLUP_JOB}" "${RECONCILE_JOB}" "${RETENTION_JOB}"
+)
+
+# ---------------------------------------------------------------------------
 # classify_paths — decide whether a set of changed files (newline-separated on stdin, as
 # `git diff --name-only` produces) means the newest-image≠HEAD mismatch is EXPECTED or
 # AMBIGUOUS.

@@ -1024,12 +1024,19 @@ verify() {
   # 2026-07-06 outage: a full bicep-apply ran, verify() printed "all checks passed", yet every
   # runner job was REFUSING TO START — the marker never landed on the RUNNING jobs and verify()
   # checked every env var EXCEPT the one the prod-guard (runner/prodGuard.ts) actually gates on.
-  # A deploy must not report success while the guard would refuse. RUNNER_IMAGE_JOBS is exactly
-  # the set that runs a guarded entrypoint (index.ts + the aux *Main.ts: narrative/rollup/
-  # reconcile/retention); the migrate job runs the migrate image, has no guard, and is deliberately
-  # excluded. The marker now also ships baked into the runner image (runner Dockerfile) — this
-  # assertion is the deploy-time proof it is genuinely present on each running job.
-  for j in "${RUNNER_IMAGE_JOBS[@]}"; do
+  # A deploy must not report success while the guard would refuse.
+  # ★ SCOPE: GUARDED_ENTRYPOINT_JOBS — NOT RUNNER_IMAGE_JOBS. Those two were identical until #351, and
+  #   the old comment here asserted "RUNNER_IMAGE_JOBS is exactly the set that runs a guarded entrypoint".
+  #   #351 FALSIFIED that by adding synthwatch-sandbox, which runs the runner IMAGE but not a guarded
+  #   ENTRYPOINT — so this check went red on every deploy while asserting something demonstrably false
+  #   (the sandbox starts fine without the marker; it is DB-less, so the guard's DATABASE_URL trigger can
+  #   never fire, and sandboxMain.ts does not import prodGuard). A stated invariant that is false is the
+  #   doc-vs-code drift class, so the ARRAY now carries the distinction rather than a comment claiming it.
+  #   See deploy-lib.sh GUARDED_ENTRYPOINT_JOBS for the full exemption rationale.
+  #   The migrate job runs the migrate image, has no guard, and is likewise excluded.
+  # The marker also ships baked into the runner image (runner Dockerfile) — this assertion is the
+  # deploy-time proof it is genuinely present on each RUNNING job.
+  for j in "${GUARDED_ENTRYPOINT_JOBS[@]}"; do
     v="$(job_env_value "${j}" SYNTHWATCH_DEPLOYED)"
     str_eq "1" "${v}" && ok=1 || ok=0
     check "${ok}" "${j} SYNTHWATCH_DEPLOYED='${v}' (expect 1 — A4 prod-guard; the job REFUSES TO START without it)"
