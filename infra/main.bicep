@@ -1516,6 +1516,24 @@ resource rollupJob 'Microsoft.App/jobs@2024-03-01' = {
               secretRef: 'database-url'
             }
             {
+              // ★ ARM coordinates for the Azure Cost Management pull (azureCost.ts fetchAzureCost, cached into
+              //   azure_cost by 0090 and served by the api's /reports/cost). Mirrors the runner jobs' entries
+              //   VERBATIM — same names, same source expressions.
+              // ★ WHY THIS JOB: rollupMain.ts is the ONLY caller of refreshAzureCost. Until this landed the two
+              //   vars were declared on the three RUNNER jobs but not here, so the one job that needs them could
+              //   not see them — fetchAzureCost hit its first guard and logged "[azure-cost] skipped —
+              //   AZURE_SUBSCRIPTION_ID / AZURE_RESOURCE_GROUP not set" daily while the execution still reported
+              //   Succeeded, and azure_cost was never written (observed: n_tup_ins = 0). This job already runs as
+              //   the SAME user-assigned identity as the runner jobs, which is the principal holding Cost
+              //   Management Reader on this RG — so the env is the whole fix; no RBAC change is required.
+              name: 'AZURE_SUBSCRIPTION_ID'
+              value: subscription().subscriptionId
+            }
+            {
+              name: 'AZURE_RESOURCE_GROUP'
+              value: resourceGroup().name
+            }
+            {
               // Universal deployed marker — see the primary job's SYNTHWATCH_DEPLOYED comment.
               name: 'SYNTHWATCH_DEPLOYED'
               value: '1'
