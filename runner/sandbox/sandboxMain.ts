@@ -17,7 +17,7 @@
 // it honestly-absent.
 import { runSandboxPreview } from './runSandboxPreview.js';
 import { isCredentialedRun, resolveSandboxPayload } from './sandboxPayload.js';
-import { buildResultPayload } from './sandboxResult.js';
+import { buildResultPayload, type ScreenshotCause } from './sandboxResult.js';
 import { fetchAndDeleteSandboxPayload, uploadSandboxArtifact, uploadSandboxResult } from './sandboxUpload.js';
 
 // ★ Artifact caps. A simple flow's trace.zip is well under 20 MB; a multi-nav/heavy-page runaway is bounded. A
@@ -64,6 +64,11 @@ async function main(): Promise<void> {
   // actually landed. The trusted PARENT holds the blob creds — the child never did.
   let hasTrace = false;
   let hasScreenshot = false;
+  // ★ The CAPTURE cause, derived HERE (where the cap decision is made), not in buildResultPayload — deriving it
+  //   in the pure builder would collapse the not_captured vs over_cap arms (see sandboxResult.ts). It describes
+  //   the capture outcome and is ORTHOGONAL to hasScreenshot (upload/availability), so a captured-but-upload-
+  //   failed screenshot reads as ('captured', hasScreenshot=false) without a fourth value.
+  let screenshotCause: ScreenshotCause = 'not_captured';
   const trace = result.trace ?? null;
   const screenshot = result.screenshot ?? null;
   if (trace && trace.byteLength <= TRACE_CAP_BYTES) {
@@ -72,14 +77,16 @@ async function main(): Promise<void> {
     process.stderr.write(`sandboxMain: trace ${trace.byteLength}B over the ${TRACE_CAP_BYTES}B cap — dropped\n`);
   }
   if (screenshot && screenshot.byteLength <= SCREENSHOT_CAP_BYTES) {
+    screenshotCause = 'captured'; // captured within cap — set regardless of upload outcome (hasScreenshot carries that)
     hasScreenshot = await uploadSandboxArtifact(token, 'screenshot.png', screenshot, 'image/png');
   } else if (screenshot) {
+    screenshotCause = 'over_cap';
     process.stderr.write(`sandboxMain: screenshot ${screenshot.byteLength}B over the ${SCREENSHOT_CAP_BYTES}B cap — dropped\n`);
   }
 
   // The result JSON (→ `<token>.json` + echoed to stdout) — JSON-SAFE: no Buffers, hasTrace/hasScreenshot flags
-  // instead. Steps + trace_signals are small and travel inside it.
-  const payload = buildResultPayload(result, { hasTrace, hasScreenshot });
+  // + screenshotCause instead. Steps + trace_signals are small and travel inside it.
+  const payload = buildResultPayload(result, { hasTrace, hasScreenshot, screenshotCause });
   const resultJson = JSON.stringify(payload);
   process.stdout.write(resultJson + '\n');
   await uploadSandboxResult(token, resultJson);

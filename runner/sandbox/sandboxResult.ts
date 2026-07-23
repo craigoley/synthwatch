@@ -18,19 +18,33 @@ import type { PreviewResult } from './runSandboxPreview.js';
 // stdout in the result JSON is bounded so a stdout-spamming spec can't bloat `<token>.json`.
 const STDOUT_CAP_BYTES = 128 * 1024;
 
+// ★ Why there is (or isn't) a screenshot — the cause a single `hasScreenshot` boolean COLLAPSES. It has two
+//   FALSE arms that a viewer must not confuse: a run that produced none vs. one captured-then-DROPPED at the
+//   size cap. This three-state value NAMES that cause; it describes the CAPTURE outcome and is orthogonal to
+//   `hasScreenshot` (which still means captured-AND-within-cap-AND-uploaded). Read them together:
+//     • 'not_captured' — the run produced no screenshot (e.g. a pass). hasScreenshot=false.
+//     • 'captured'     — a screenshot was captured WITHIN the cap. Available iff hasScreenshot=true; a
+//                        'captured' with hasScreenshot=false is the rare "captured but the upload failed" edge.
+//     • 'over_cap'     — captured but exceeded SCREENSHOT_CAP_BYTES and was DROPPED. hasScreenshot=false.
+//   ★ DERIVED WHERE THE CAP DECISION IS MADE (sandboxMain.ts), passed in here — see buildResultPayload's note.
+export type ScreenshotCause = 'not_captured' | 'captured' | 'over_cap';
+
 /**
  * Build the result payload. PURE: no process.env, no I/O, no uploads, no process.exit, no module-level
  * side effects on import — every input arrives as an argument.
  *
- * ★ `hasTrace` / `hasScreenshot` are PARAMETERS, not derived here, and that is load-bearing rather than
- *   incidental. In sandboxMain they are the RETURN VALUES of the artifact uploads, so each means
- *   "captured AND within its size cap AND the upload succeeded" — not merely "the run produced one". An
- *   over-cap artifact is dropped and its flag stays false. Deriving them in here would quietly redefine
- *   them as "was one captured", which is a different and weaker claim.
+ * ★ `hasTrace` / `hasScreenshot` / `screenshotCause` are PARAMETERS, not derived here, and that is load-bearing
+ *   rather than incidental. In sandboxMain the flags are the RETURN VALUES of the artifact uploads, so each means
+ *   "captured AND within its size cap AND the upload succeeded" — not merely "the run produced one". An over-cap
+ *   artifact is dropped and its flag stays false. `screenshotCause` is likewise derived THERE, from the same
+ *   capture facts and the cap decision. Deriving any of them in here would quietly redefine them as "was one
+ *   captured" — a weaker claim that COLLAPSES the not_captured vs over_cap arms (the exact confusion this exists
+ *   to prevent; the golden's over-cap arm shares its `result` with the under-cap arm and differs ONLY in these
+ *   arguments, so an in-builder derivation reds it).
  */
 export function buildResultPayload(
   result: PreviewResult,
-  artifacts: { hasTrace: boolean; hasScreenshot: boolean },
+  artifacts: { hasTrace: boolean; hasScreenshot: boolean; screenshotCause: ScreenshotCause },
 ): {
   ok: boolean;
   tests: string[];
@@ -45,6 +59,7 @@ export function buildResultPayload(
   exitCode: number | null;
   hasTrace: boolean;
   hasScreenshot: boolean;
+  screenshotCause: ScreenshotCause;
 } {
   const stdoutCapped =
     result.stdout.length > STDOUT_CAP_BYTES ? `${result.stdout.slice(0, STDOUT_CAP_BYTES)}\n…(truncated)` : result.stdout;
@@ -62,5 +77,6 @@ export function buildResultPayload(
     exitCode: result.exitCode,
     hasTrace: artifacts.hasTrace,
     hasScreenshot: artifacts.hasScreenshot,
+    screenshotCause: artifacts.screenshotCause,
   };
 }

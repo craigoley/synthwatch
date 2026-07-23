@@ -1,6 +1,6 @@
 # preview-result-golden
 
-Anchors **`buildResultPayload`** (`runner/sandbox/sandboxResult.ts`) — the 13-field result payload the
+Anchors **`buildResultPayload`** (`runner/sandbox/sandboxResult.ts`) — the 14-field result payload the
 sandbox job writes to `<token>.json`, which the api serves **verbatim** as `PreviewStatusDto.Trace`, an
 **opaque string**, for the dashboard to `JSON.parse`.
 
@@ -39,18 +39,23 @@ own `provenance` string.
 
 ## The three arms — all required
 
-The flags mean *captured **and** within cap **and** upload succeeded*, because in `sandboxMain` they are the
-return values of `uploadSandboxArtifact`:
+`hasScreenshot` means *captured **and** within cap **and** upload succeeded*, because in `sandboxMain` it is the
+return value of `uploadSandboxArtifact`. `screenshotCause` (added alongside it) NAMES the capture outcome, so the
+**two `hasScreenshot=false` arms are no longer indistinguishable** — the reason a single boolean was too weak:
 
-| arm | `hasScreenshot` | why |
-|---|---|---|
-| pass | `false` | no screenshot captured — a passing run never produces one |
-| fail, under cap | `true` | captured (observed: 16577 B, well under the 4 MiB cap) and uploaded |
-| fail, **over cap** | `false` | captured but **dropped** — `sandboxMain` skips the upload |
+| arm | `hasScreenshot` | `screenshotCause` | why |
+|---|---|---|---|
+| pass | `false` | `not_captured` | no screenshot captured — a passing run never produces one |
+| fail, under cap | `true` | `captured` | captured (observed: 16577 B, well under the 4 MiB cap) and uploaded |
+| fail, **over cap** | `false` | `over_cap` | captured but **dropped** at the cap — `sandboxMain` skips the upload |
 
 A two-arm golden would encode "failing ⇒ screenshot", a rule the code does **not** make. The over-cap arm
 reuses the *same real failing `PreviewResult`* as the middle arm — only the `artifacts` argument differs,
-which is exactly how that path presents. No hand-shaped result object anywhere.
+which is exactly how that path presents. No hand-shaped result object anywhere. `screenshotCause` is derived in
+`sandboxMain` (where the cap decision is), **not** in `buildResultPayload`: deriving it from `result` in the pure
+builder would collapse the over-cap and under-cap arms back together (they share a `result`) — the failure this
+golden exists to catch. It is orthogonal to `hasScreenshot`: a `captured` cause with `hasScreenshot=false` is the
+honest "captured but the upload failed" edge, which no arm here exercises.
 
 ## Regenerating
 
