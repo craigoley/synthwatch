@@ -88,14 +88,14 @@ export interface Check {
   // legacy expected_status/body_must_contain. auth is a secret reference.
   assertions: Assertion[];
   request_headers: Record<string, string> | null;
-  // Per-monitor SECRET request headers (0061), references-only: { headerName -> ENV_VAR_NAME }. The
-  // runner resolves process.env[ENV_VAR_NAME] at request time (secretHeaders.ts); the value is never
-  // stored/logged/exposed. Mirrors `auth`'s *_env model. null = none.
+  // Per-monitor SECRET request headers (0061), model B: { headerName -> ENCRYPTED VALUE ("v1:…") }. The api
+  // encrypts the plaintext on write (CRED_ENC_KEY); the runner DECRYPTS at run start (secretHeaders.ts) and
+  // injects the plaintext per FIRST-PARTY request. The value is never stored-plaintext/logged/exposed. null = none.
   secret_headers: Record<string, string> | null;
-  // Per-monitor LOGIN CREDENTIALS (0067), references-only: { credentialRole -> ENV_VAR_NAME } (e.g.
-  // { username: 'SOME_USER_ENV', password: 'SOME_PASS_ENV' }). The runner resolves process.env[ENV_VAR_NAME]
-  // at run time and exposes it to the browser spec as credential(role) (loginCredentials.ts); the value is
-  // never stored/logged/exposed. Mirrors `secret_headers`/`auth`'s *_env model. null = none.
+  // Per-monitor LOGIN CREDENTIALS (0067), model B: { credentialRole -> ENCRYPTED VALUE ("v1:…") } (e.g.
+  // { username: 'v1:…', password: 'v1:…' }). The api encrypts the plaintext on write (CRED_ENC_KEY); the runner
+  // DECRYPTS at run time (loginCredentials.ts) and publishes it as SW_CRED_<ROLE>, read by the browser spec as
+  // credential(role). The value is never stored-plaintext/logged/exposed. null = none.
   login_credentials: Record<string, string> | null;
   request_body: string | null;
   auth: AuthConfig | null;

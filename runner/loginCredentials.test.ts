@@ -16,7 +16,7 @@ import { encryptCredValue, loadCredEncKey } from './crypto.js';
 import { makeRedactor } from './redact.js';
 
 const TEST_KEY_B64 = Buffer.from(Array.from({ length: 32 }, (_, i) => i)).toString('base64');
-const TOUCHED = ['CRED_ENC_KEY', 'SW_CRED_USERNAME', 'SW_CRED_PASSWORD'];
+const TOUCHED = ['CRED_ENC_KEY', 'SW_CRED_USERNAME', 'SW_CRED_PASSWORD', 'SW_SANDBOX'];
 function snapshot(): Record<string, string | undefined> {
   const s: Record<string, string | undefined> = {};
   for (const k of TOUCHED) s[k] = process.env[k];
@@ -123,7 +123,35 @@ test('credential(role): returns the published (decrypted) value; throws fail-clo
     const handles = applyLoginCredentials({ username: enc('alice@test') });
     assert.equal(credential('username'), 'alice@test');
     clearLoginCredentials(handles);
+    // ★ model-B message (NOT the stale model-A "role -> ENV_VAR_NAME / set an env var on the runner"): a live-run
+    //   miss points the operator at login_credentials + the dashboard Credentials panel, and states the runner
+    //   publishes SW_CRED_<ROLE> automatically.
     assert.throws(() => credential('username'), /credential\("username"\) is not available/);
+    assert.throws(() => credential('username'), /login_credentials\.username .* dashboard Credentials panel/);
+    assert.throws(() => credential('username'), /publishes SW_CRED_USERNAME automatically/);
+    let msg = '';
+    try { credential('username'); } catch (e) { msg = (e as Error).message; }
+    assert.ok(!/ENV_VAR_NAME/.test(msg), 'live message must not carry the stale model-A ENV_VAR_NAME language');
+    assert.ok(!/env var must be set on the runner/.test(msg), 'live message must not tell the operator to set a runner env var');
+  } finally {
+    restoreEnv(saved);
+  }
+});
+
+test('★ credential(role): the SANDBOX miss says preview creds never arrive (SW_SANDBOX-aware), not "set an env var"', () => {
+  // Item-2 behaviour: the sandbox sets SW_SANDBOX=1 and never receives SW_CRED_* (sandbox env boundary), so a
+  // credential()-based spec cannot resolve in a preview. credential() detects that and says so specifically.
+  const saved = snapshot();
+  try {
+    delete process.env.SW_CRED_USERNAME; // ensure unpublished
+    process.env.SW_SANDBOX = '1';
+    let msg = '';
+    try { credential('username'); } catch (e) { msg = (e as Error).message; }
+    assert.match(msg, /credential\("username"\) is not available/);
+    assert.match(msg, /preview\/sandbox run/);
+    assert.match(msg, /never receives SW_CRED_\*/);
+    assert.match(msg, /LIVE run/);
+    assert.ok(!/ENV_VAR_NAME/.test(msg), 'sandbox message must not carry the stale model-A ENV_VAR_NAME language');
   } finally {
     restoreEnv(saved);
   }
