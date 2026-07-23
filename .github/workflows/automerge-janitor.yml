@@ -1,5 +1,11 @@
 name: Auto-merge janitor
 
+# TWO recoveries, both for trusted PRs, both on the 30-min schedule:
+#   1. RE-ENABLE native auto-merge GitHub disabled for a transient reason (the original purpose, below).
+#   2. DISPATCH Deploy when main is ahead of the last Deploy with deploy-relevant changes — the token-merge
+#      recovery. A GITHUB_TOKEN-completed merge suppresses `on: push`, and the claude-review dispatcher is a
+#      ≤20-min poll that misses late/janitor-armed merges; this state-based sweep catches whatever it missed.
+
 # ──────────────────────────────────────────────────────────────────────────────────────────
 # RECOVERS a trusted-author PR whose native auto-merge GitHub DISABLED for a transient reason.
 #
@@ -34,6 +40,7 @@ jobs:
     permissions:
       contents: write # native auto-merge completes via GITHUB_TOKEN + branch-protection
       pull-requests: write # enable auto-merge
+      actions: write # list deploy runs + dispatch Deploy (the token-merge recovery below)
     steps:
       - name: Re-enable auto-merge on trusted, non-draft, auto-merge-off PRs
         env:
@@ -65,3 +72,51 @@ jobs:
             gh pr merge "$NUM" --repo "$REPO" --auto --squash --delete-branch \
               || echo "  (could not enable auto-merge on #$NUM — likely conflicting; will retry next window)"
           done < /tmp/prs.tsv
+
+      # ★ TOKEN-MERGE DEPLOY RECOVERY — the fix for the 2026-07-23 incidents-500 outage.
+      # A trusted PR that merges via GITHUB_TOKEN (native auto-merge completing, whether armed by the
+      # claude-review `automerge` job OR re-armed by this janitor) produces a push GitHub SUPPRESSES —
+      # verified: docs.github.com/actions/concepts/security/github_token, "events triggered by the
+      # GITHUB_TOKEN, with the exception of workflow_dispatch and repository_dispatch, will not create a
+      # new workflow run". So `deploy.yml`'s `on: push` never fires. The claude-review job dispatches Deploy
+      # itself, but only via a ≤20-minute poll tied to the PR event — so it MISSES a merge that lands later
+      # (a re-run/slow check; #361 merged after its 20m window) and a janitor-re-armed merge (no dispatcher
+      # at all). This step closes both: it is STATE-BASED (compares main HEAD to the last Deploy) and runs
+      # every 30 min, so it catches any deploy-relevant commit on main that no Deploy has picked up —
+      # regardless of which path merged it. Idempotent: skips when main is already deployed/in-flight.
+      - name: Dispatch Deploy if main is ahead of the last deploy (token-merge recovery)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.sha }}   # the default-branch HEAD at schedule time = origin/main
+        run: |
+          set -euo pipefail
+          # The newest Deploy run's headSha is what has been built+rolled (or is being). deploy.yml runs on
+          # workflow_dispatch/push with headSha = main HEAD at that time, so this is the authoritative
+          # "what main sha has a Deploy". Include in_progress so we never double-dispatch one already flying.
+          LAST=$(gh run list --repo "$REPO" --workflow deploy.yml --limit 30 \
+                   --json headSha,status,conclusion \
+                   --jq '[.[] | select(.status=="in_progress" or .conclusion=="success")][0].headSha // ""')
+          if [ -z "$LAST" ]; then
+            echo "::notice::No prior successful/in-flight Deploy found — not dispatching (nothing to compare against)."
+            exit 0
+          fi
+          if [ "$LAST" = "$HEAD_SHA" ]; then
+            echo "main ($HEAD_SHA) is already deployed or in-flight ($LAST) — nothing to do."
+            exit 0
+          fi
+          # main advanced past the last Deploy. Dispatch ONLY if the delta touches deploy-relevant paths —
+          # the SAME filter as deploy.yml's on.push.paths (runner/**, db/** except *.md, **/Dockerfile,
+          # the deploy workflow itself). Uses the compare API (no checkout needed).
+          CHANGED=$(gh api "repos/$REPO/compare/$LAST...$HEAD_SHA" --jq '.files[].filename' 2>/dev/null || echo "")
+          RELEVANT=$(printf '%s\n' "$CHANGED" | grep -vE '^db/.*\.md$' \
+                       | grep -E '^(runner/|db/|.*Dockerfile$|\.github/workflows/deploy\.yml$)' || true)
+          if [ -z "$RELEVANT" ]; then
+            echo "main is ahead of $LAST but only non-deploy paths changed — no Deploy needed."
+            exit 0
+          fi
+          # LOUD (item 7 visibility): a merged-but-undeployed runner/db commit reached main with no Deploy.
+          echo "::warning title=main ahead of deployed image — dispatching recovery Deploy::main ($HEAD_SHA) is ahead of the last Deploy ($LAST) with deploy-relevant changes and no Deploy fired (token-merged push is suppressed). Dispatching now."
+          printf '  relevant changes:\n%s\n' "$RELEVANT" | sed 's/^/    /'
+          gh workflow run deploy.yml --repo "$REPO" --ref main
+          echo "Deploy dispatched for main ($HEAD_SHA)."
