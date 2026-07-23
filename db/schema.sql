@@ -465,7 +465,13 @@ CREATE TABLE incidents (
     notify_attempted_at  TIMESTAMPTZ,
     notify_status        TEXT        CONSTRAINT incidents_notify_status_chk CHECK (notify_status IS NULL OR notify_status IN ('sent', 'failed', 'skipped')),
     notify_error         TEXT,
-    notify_attempts      INTEGER     NOT NULL DEFAULT 0
+    notify_attempts      INTEGER     NOT NULL DEFAULT 0,
+    -- WHY the incident closed (0095). NULL = a genuine cross-location recovery run (all pre-0095 rows);
+    -- non-null = closed by the stopped-monitor reconcile (runner/staleIncidents.ts) because the check can no
+    -- longer run — monitor_paused (enabled=false) / monitor_archived (archived_at) / monitor_removed
+    -- (git-removed → soft-disabled). resolved_run_id is NULL for these. /reports/mttr excludes non-null.
+    resolution_reason    TEXT        CONSTRAINT incidents_resolution_reason_chk
+                                     CHECK (resolution_reason IS NULL OR resolution_reason IN ('monitor_paused', 'monitor_archived', 'monitor_removed'))
 );
 
 -- At most one OPEN incident per check. Lets evaluate.ts rely on the DB to keep

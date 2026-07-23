@@ -30,6 +30,7 @@ import {
 import { runSslCheck } from './sslCheck.js';
 import { runDnsCheck, runTcpCheck, runPingCheck } from './netChecks.js';
 import { runMultistepChain } from './multistep.js';
+import { closeStrandedIncidents } from './staleIncidents.js';
 import {
   initOtel,
   emitRunSpan,
@@ -201,6 +202,13 @@ async function main(): Promise<void> {
   }
 
   await reapStaleRunning();
+
+  // ★ Close incidents STRANDED on a stopped monitor (0095). A paused/archived/removed check never runs, so
+  //   evaluate() never fires to resolve its open incident — it would sit `open` forever. This sweep resolves
+  //   them with a resolution_reason (distinct from a genuine recovery) and pages NO ONE. Placed beside
+  //   reapStaleRunning because both reconcile STALE STATE on the tick, independent of any due check running
+  //   (the affected check by definition does not run). Non-fatal: a failure must not break the tick.
+  await closeStrandedIncidents().catch((err) => console.warn('[stale-incidents] sweep failed (non-fatal):', err));
 
   // Publish the deployed flows to flow_manifest for the API/dashboard. Best-effort
   // — a sync failure must never break the tick.
