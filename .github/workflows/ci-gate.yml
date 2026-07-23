@@ -71,6 +71,14 @@ jobs:
       #   "Semgrep OSS" (app=github-advanced-security), which now gates via the all-checks-terminal rule.
       REQUIRED: >-
         ["Lint","Analyze (javascript-typescript)","Analyze (actions)","Claude review","Lib-flow parity","Test (Node + Postgres)","Deploy-script tests"]
+      # ★ DO NOT add a PATH-FILTERED check to REQUIRED. "Will this freeze synthwatch-api?" (schema-freeze-
+      #   preflight.yml, on db/migrations|db/schema.sql) and the mutation-gate run only on some PRs. A REQUIRED
+      #   name that never registers is perpetually "missing" → ci-gate times out → EVERY non-matching PR
+      #   deadlocks (the #102 skipped-required class). These already GATE when they run via "an UNCLASSIFIED
+      #   check gates by default" — ci_gate_failures catches a present failure — so the freeze-guard DOES block a
+      #   runner PR that would freeze the api without being REQUIRED. scripts/ci-gate-eval.sh --self-test cases
+      #   6-7 assert both halves (gates-when-present; REQUIRED-would-deadlock). Making one required needs a
+      #   path-aware conditional-REQUIRED mechanism that does not exist here — do not fake it with a static name.
       # OSV slot: its check-run NAME varies by PR type (nested "scan-pr / osv-scan" when the reusable
       # job runs; the caller "scan-pr" when skipped on Dependabot), so require ANY completed "scan-pr*".
       OSV_PREFIX: scan-pr

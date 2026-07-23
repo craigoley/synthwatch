@@ -128,6 +128,33 @@ if [ "${1:-}" = "--self-test" ]; then
   check "5 a failed orchestration/advisory check does NOT block a good PR" \
     "$(ci_gate_failures "$BROKEN" "$ADV" "$ORC")" ""
 
+  # 6 — ★ THE SCHEMA-FREEZE GUARD ("Will this freeze synthwatch-api?", schema-freeze-preflight.yml) GATES
+  #     WHEN PRESENT. It is UNCLASSIFIED (in none of the lists), so the "unclassified gates by default" rule
+  #     is exactly what holds a runner PR that would freeze the api: on a db/** PR the guard runs, and if it
+  #     REDS, ci_gate_failures must NAME it → ci-gate fails → merge held. (The "it's advisory / merges anyway"
+  #     reading doubted this; it is asserted here so no refactor can silently make the guard non-gating.)
+  FREEZE='Will this freeze synthwatch-api?'
+  DBPR_RED='[{"name":"Lint","status":"completed","conclusion":"success"},
+             {"name":"'"$FREEZE"'","status":"completed","conclusion":"failure"}]'
+  check "6 unclassified freeze-guard RED is caught → merge HELD (gates when present)" \
+    "$(ci_gate_failures "$DBPR_RED" "$ADV" "$ORC")" "$FREEZE"
+  # and ci-gate WAITS for it while it is still running (never settles past a running guard).
+  DBPR_RUN='[{"name":"Lint","status":"completed","conclusion":"success"},
+             {"name":"'"$FREEZE"'","status":"in_progress","conclusion":null}]'
+  check "6 ci-gate WAITS for a running freeze-guard" \
+    "$(ci_gate_not_ready "$DBPR_RUN" '["Lint"]' "$ADV" "$ORC")" "$FREEZE"
+
+  # 7 — ★ …AND THE GUARD MUST NOT BE ADDED TO REQUIRED. It is PATH-FILTERED (db/migrations/**, db/schema.sql),
+  #     so on a NON-db PR it never runs and never registers. As a REQUIRED name it would be perpetually
+  #     "missing" → ci_gate_not_ready never empties → the 15-min deadline trips → ci-gate FAILS → EVERY non-db
+  #     PR deadlocks (the #102 skipped-required/path-filter class this whole gate exists to avoid). Unclassified,
+  #     the SAME non-db PR settles clean. This pins WHY the correct posture is "gates-when-present", not REQUIRED.
+  NONDB='[{"name":"Lint","status":"completed","conclusion":"success"}]'
+  check "7 freeze-guard AS REQUIRED deadlocks a non-db PR (never registers)" \
+    "$(ci_gate_not_ready "$NONDB" '["Lint","'"$FREEZE"'"]' "$ADV" "$ORC")" "$FREEZE"
+  check "7 freeze-guard UNCLASSIFIED does NOT block a non-db PR (absent = fine)" \
+    "$(ci_gate_not_ready "$NONDB" '["Lint"]' "$ADV" "$ORC")" ""
+
   echo ""
   if [ "$fails" -eq 0 ]; then
     echo "ci-gate-eval self-test: ALL PASSED"
