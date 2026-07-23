@@ -1,5 +1,5 @@
 {
-  "_comment": "Golden for buildResultPayload (runner/sandbox/sandboxResult.ts) — the 13-field result payload the sandbox job writes to <token>.json and the api serves VERBATIM as PreviewStatusDto.Trace (an opaque string). The api has no hasScreenshot field, so the dashboard's captured-fixture harness cannot anchor this shape; the anchor lives here, at the producer. ★ SCOPE AND LIMIT: unlike trace-signals-golden — whose input is a CAPTURED artifact — this golden's inputs are chosen and its outputs recorded. It REDS ON DRIFT (a field added, removed, renamed, or re-derived) but does NOT prove the inputs resemble what runSandboxPreview really emits. Mitigation: each arm's `result` was captured from a REAL runSandboxPreview run against live chromium and then value-normalised for determinism (see `provenance` per arm and README.md) — the shape and field population are real, the timings/paths are scrubbed. What it still cannot catch: a change in what runSandboxPreview PRODUCES that buildResultPayload faithfully passes through.",
+  "_comment": "Golden for buildResultPayload (runner/sandbox/sandboxResult.ts) — the 14-field result payload the sandbox job writes to <token>.json and the api serves VERBATIM as PreviewStatusDto.Trace (an opaque string). The api has no hasScreenshot field, so the dashboard's captured-fixture harness cannot anchor this shape; the anchor lives here, at the producer. ★ SCOPE AND LIMIT: unlike trace-signals-golden — whose input is a CAPTURED artifact — this golden's inputs are chosen and its outputs recorded. It REDS ON DRIFT (a field added, removed, renamed, or re-derived) but does NOT prove the inputs resemble what runSandboxPreview really emits. Mitigation: each arm's `result` was captured from a REAL runSandboxPreview run against live chromium and then value-normalised for determinism (see `provenance` per arm and README.md) — the shape and field population are real, the timings/paths are scrubbed. What it still cannot catch: a change in what runSandboxPreview PRODUCES that buildResultPayload faithfully passes through.",
   "arms": [
     {
       "name": "pass — no screenshot was captured, so nothing to upload",
@@ -74,7 +74,8 @@
       },
       "artifacts": {
         "hasTrace": true,
-        "hasScreenshot": false
+        "hasScreenshot": false,
+        "screenshotCause": "not_captured"
       },
       "expected": {
         "ok": true,
@@ -144,7 +145,8 @@
         "timedOut": false,
         "exitCode": 0,
         "hasTrace": true,
-        "hasScreenshot": false
+        "hasScreenshot": false,
+        "screenshotCause": "not_captured"
       }
     },
     {
@@ -227,7 +229,8 @@
       },
       "artifacts": {
         "hasTrace": true,
-        "hasScreenshot": true
+        "hasScreenshot": true,
+        "screenshotCause": "captured"
       },
       "expected": {
         "ok": false,
@@ -304,7 +307,8 @@
         "timedOut": false,
         "exitCode": 0,
         "hasTrace": true,
-        "hasScreenshot": true
+        "hasScreenshot": true,
+        "screenshotCause": "captured"
       }
     },
     {
@@ -387,7 +391,8 @@
       },
       "artifacts": {
         "hasTrace": true,
-        "hasScreenshot": false
+        "hasScreenshot": false,
+        "screenshotCause": "over_cap"
       },
       "expected": {
         "ok": false,
@@ -464,7 +469,8 @@
         "timedOut": false,
         "exitCode": 0,
         "hasTrace": true,
-        "hasScreenshot": false
+        "hasScreenshot": false,
+        "screenshotCause": "over_cap"
       }
     }
   ]

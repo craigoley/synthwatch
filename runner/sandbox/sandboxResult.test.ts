@@ -15,14 +15,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { buildResultPayload } from './sandboxResult.js';
+import { buildResultPayload, type ScreenshotCause } from './sandboxResult.js';
 import type { PreviewResult } from './runSandboxPreview.js';
 
 interface Arm {
   name: string;
   provenance: string;
   result: PreviewResult;
-  artifacts: { hasTrace: boolean; hasScreenshot: boolean };
+  artifacts: { hasTrace: boolean; hasScreenshot: boolean; screenshotCause: ScreenshotCause };
   expected: Record<string, unknown>;
 }
 
@@ -65,10 +65,44 @@ test('★ the OVER-CAP arm is what a naive implementation loses', () => {
   );
 });
 
-test('the payload is exactly the 13 fields the dashboard parses — no more, no less', () => {
+test('the payload is exactly the 14 fields the dashboard parses — no more, no less', () => {
   // A field ADDED without updating the golden would slip past a per-field check; deepEqual above catches it,
-  // and this states the count explicitly so the intent is legible.
+  // and this states the count explicitly so the intent is legible. (14 = 13 + screenshotCause.)
   for (const arm of golden.arms) {
-    assert.equal(Object.keys(arm.expected).length, 13, `arm "${arm.name}" must emit 13 fields`);
+    assert.equal(Object.keys(arm.expected).length, 14, `arm "${arm.name}" must emit 14 fields`);
   }
+});
+
+test('★ screenshotCause NAMES the drop cause per arm — the two hasScreenshot=false arms are DISTINCT', () => {
+  // The whole point: a single hasScreenshot boolean collapses "no screenshot was produced" (pass) and
+  // "captured but DROPPED at the cap" (over-cap) into one false. screenshotCause must tell them apart, and it
+  // must never contradict hasScreenshot (present ⇒ 'captured').
+  const cause = (name: string) =>
+    golden.arms.find((a) => a.name.startsWith(name))!.expected.screenshotCause as ScreenshotCause;
+  assert.equal(cause('pass'), 'not_captured', 'pass: nothing was captured');
+  assert.equal(cause('fail, under cap'), 'captured', 'under-cap: captured within the cap');
+  assert.equal(cause('fail, OVER cap'), 'over_cap', 'over-cap: captured then dropped at the cap');
+
+  // ★ The two FALSE arms must not share a cause — otherwise the dashboard still cannot tell them apart.
+  assert.notEqual(
+    cause('pass'),
+    cause('fail, OVER cap'),
+    'the pass (not_captured) and over-cap (over_cap) arms BOTH have hasScreenshot=false; their cause MUST differ',
+  );
+
+  // hasScreenshot is UNCHANGED and consistent: a present screenshot (true) is always 'captured'.
+  for (const arm of golden.arms) {
+    if (arm.expected.hasScreenshot === true) {
+      assert.equal(arm.expected.screenshotCause, 'captured', `arm "${arm.name}": present ⇒ 'captured'`);
+    }
+  }
+});
+
+test('★ hasScreenshot is UNCHANGED by this change — a regression here would break prod (dashboard reads it)', () => {
+  // The api passes the payload through opaquely and the dashboard reads the EXISTING hasScreenshot field. Adding
+  // screenshotCause must not move a single hasScreenshot value: pass=false, under-cap=true, over-cap=false.
+  const has = (name: string) => golden.arms.find((a) => a.name.startsWith(name))!.expected.hasScreenshot;
+  assert.equal(has('pass'), false, 'pass: no screenshot');
+  assert.equal(has('fail, under cap'), true, 'under-cap: uploaded');
+  assert.equal(has('fail, OVER cap'), false, 'over-cap: dropped');
 });
