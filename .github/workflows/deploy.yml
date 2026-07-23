@@ -6,14 +6,26 @@ name: Deploy runner to ACA Job
 #
 # TRIGGERS:
 #   push (main, path-filtered) — direct human pushes deploy immediately.
-#   workflow_dispatch          — manual fallback AND the token-free auto-deploy path:
-#                                the claude-review `automerge` job dispatches this
-#                                after a hands-free auto-merge. (Native auto-merge
-#                                completes via GITHUB_TOKEN, whose push event GitHub
-#                                SUPPRESSES, so `on: push` does NOT fire post-auto-
-#                                merge — workflow_run off code-scanning default setup
-#                                does not fire either. workflow_dispatch is the
-#                                documented GITHUB_TOKEN exception that IS delivered.)
+#   workflow_dispatch          — manual fallback AND the token-free auto-deploy path.
+#                                Native auto-merge completes via GITHUB_TOKEN, whose push
+#                                event GitHub SUPPRESSES, so `on: push` does NOT fire
+#                                post-auto-merge (workflow_run off code-scanning default
+#                                setup doesn't fire either). workflow_dispatch is the
+#                                documented GITHUB_TOKEN exception that IS delivered.
+#                                ★ TWO dispatchers cover the hands-free case, because one
+#                                is not enough:
+#                                  • claude-review `automerge` — FAST path: dispatches
+#                                    within ≤20 min of arming auto-merge. Misses a merge
+#                                    that lands later (a re-run / slow check — #361) and a
+#                                    merge the janitor re-armed (it never runs for that PR).
+#                                  • automerge-janitor — the BACKSTOP: every 30 min it
+#                                    dispatches Deploy when main HEAD is ahead of the last
+#                                    Deploy with deploy-relevant changes, whatever merged
+#                                    it. State-based, so it cannot miss the way the poll can.
+#                                The 2026-07-23 incidents-500 outage was this gap: #361
+#                                token-merged past the 20m poll, nothing dispatched, the
+#                                migration never reached prod, and the api (mapping the new
+#                                column) 500'd on every /incidents read.
 on:
   push:
     branches: [main]
