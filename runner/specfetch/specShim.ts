@@ -177,20 +177,35 @@ export function specToFlow(fn: (args: { page: Page }) => Promise<void>, page: Pa
 }
 
 /**
- * Per-monitor LOGIN CREDENTIAL accessor. A spec reads `credential('username')` instead of hardcoding an
- * env-var name; the runner resolves the monitor's declared { role -> ENV_VAR_NAME } and publishes the value
- * as process.env[SW_CRED_<ROLE>] for the life of this run (cleared after — see runner/loginCredentials.ts).
- * Fail-CLOSED: an undeclared/unresolved role throws, so a mis-wired login monitor fails loudly instead of
- * submitting an empty credential. IN THE PARITY-HASHED BLOCK on purpose — a security-relevant, spec-reachable
- * accessor whose authoring (here) and runtime (specShim) copies must never silently drift. The env-var format
- * `SW_CRED_<ROLE>` must stay in lockstep with runner/loginCredentials.ts credentialEnvKey.
+ * Per-monitor LOGIN CREDENTIAL accessor (model B). A spec reads `credential('username')` instead of hardcoding
+ * a secret; the check's `login_credentials` stores { role -> ENCRYPTED VALUE } — an operator sets the plaintext
+ * in the dashboard Credentials panel and the api encrypts it under CRED_ENC_KEY. At RUN time the runner DECRYPTS
+ * it and publishes the plaintext as process.env[SW_CRED_<ROLE>] for the life of this run (cleared after — see
+ * runner/loginCredentials.ts). There is NO operator env-var step: the runner derives SW_CRED_<ROLE> itself.
+ * Fail-CLOSED: an unset/undecryptable role throws, so a mis-configured login monitor fails loudly instead of
+ * submitting an empty credential.
+ * ★ SANDBOX: a preview/sandbox run NEVER receives SW_CRED_* (they don't cross the sandbox env boundary, by
+ *   design — runner/sandbox/sandboxEnv.ts), so credential() cannot resolve in a preview regardless of how the
+ *   check is configured. It is a LIVE-run accessor; the error below detects the sandbox and says so.
+ * IN THE PARITY-HASHED BLOCK on purpose — a security-relevant, spec-reachable accessor whose authoring
+ * (synthwatch-monitors lib/flow.ts) and runtime (specShim) copies must never silently drift. The env-var
+ * format `SW_CRED_<ROLE>` must stay in lockstep with runner/loginCredentials.ts credentialEnvKey.
  */
 export function credential(role: string): string {
   const value = process.env[`SW_CRED_${role.toUpperCase()}`];
   if (value === undefined || value.length === 0) {
+    // Message-only branch (the THROW condition is unchanged): the sandbox sets SW_SANDBOX=1 and never receives
+    // SW_CRED_*, so a credential()-based spec can't resolve in a preview — say that specifically instead of
+    // sending the operator to a (model-A) runner env-var step that model B does not use.
+    const inSandbox = process.env.SW_SANDBOX === '1';
     throw new Error(
-      `credential("${role}") is not available — the monitor must declare login_credentials.${role} ` +
-        `(role -> ENV_VAR_NAME) and that env var must be set on the runner`,
+      inSandbox
+        ? `credential("${role}") is not available in a preview/sandbox run — the sandbox never receives ` +
+            `SW_CRED_* (secrets do not cross the sandbox boundary, by design), so a credential()-based spec ` +
+            `cannot resolve here no matter how the check is configured. Test it with a LIVE run.`
+        : `credential("${role}") is not available — set login_credentials.${role} on this check via the ` +
+            `dashboard Credentials panel (check detail page). The runner publishes SW_CRED_${role.toUpperCase()} ` +
+            `automatically from the stored, encrypted value at run time; there is no runner env-var step.`,
     );
   }
   return value;
