@@ -1,0 +1,48 @@
+name: Playwright pairing
+
+# ★ Turns the runner/Dockerfile "bump BOTH together" COMMENT into an enforced CHECK: the base-image version
+# in runner/Dockerfile (FROM mcr.microsoft.com/playwright:vX.Y.Z-noble) MUST equal the `playwright` version
+# in runner/package-lock.json. The rule was a comment, and Dependabot can't read comments — so #368 (a
+# group-bump) moved npm 1.61.1→1.62.0 without the Dockerfile and shipped a full-fleet browser outage
+# (2026-07-25) through a fully green build+deploy. This static parse would have RED-ed #368's CI.
+#
+# FAST sibling of browser-smoke.yml: the smoke PROVES the pairing by launching a browser in the built image
+# (~minutes, path-filtered to the pairing files); this asserts the versions match by static parse
+# (~milliseconds) and names the exact fix — so drift fails fast, before the expensive image build.
+#
+# No path filter — it ALWAYS runs so the "Playwright pairing" check is ALWAYS present for ci-gate (a
+# gates-when-present check via ci-gate's "unclassified gates by default" rule; a drift reds it → ci-gate
+# fails via aggregation). Same always-present shape as libflow-parity.yml. It's cheap (node stdlib only).
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: playwright-pairing-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  playwright-pairing:
+    name: Playwright pairing (Dockerfile ⇄ npm)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      # Prove the engine actually reds on drift (reconstructs #368's exact Dockerfile-1.61.0 / lock-1.62.0
+      # state), before trusting its green on the real files — the must-go-red anchor.
+      - name: Self-test the pairing check (must-go-red on #368's drift)
+        run: node scripts/check-playwright-pairing.mjs --self-test
+
+      - name: Assert Dockerfile base image == package-lock playwright version
+        run: node scripts/check-playwright-pairing.mjs
