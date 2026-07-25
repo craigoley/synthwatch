@@ -12,6 +12,8 @@ import {
   deterministicResult,
   extractTraceFacts,
   rcaScreenshotUrls,
+  isDeterministicInfraError,
+  infraDeterministicResult,
   type RcaFacts,
 } from './rca.js';
 import type { Check } from './db.js';
@@ -260,4 +262,101 @@ test('★ renderFactPack citeIndex: each token present IFF its fact is (isolates
   assert.ok(renderFactPack(mkFacts({ netFailed: [{ host: 'cdn.x.com', status: -1 }] })).citeIndex.has('network:cdn.x.com'));
   // a console line with NO sourceHost adds no console token (the `if (c.sourceHost)` guard)
   assert.ok(!renderFactPack(mkFacts({ firstPartyConsole: [{ origin: 'site', level: 'error', sourceHost: '', text: 'e' }] })).citeIndex.has('console:'));
+});
+
+// ── ★ DETERMINISTIC INFRA classification (2026-07-25 outage: a 100%-reproducible missing-browser-binary
+//    error was scored "flaky-transient / low confidence" — actively pointing away from "the runner is
+//    broken, redeploy"). A deterministic infra error must classify infra-deterministic/HIGH; a genuinely
+//    intermittent failure must NOT (no over-correction). ──
+
+// The EXACT prod error string from the full-fleet outage.
+const ERR_LAUNCH_OUTAGE =
+  "browserType.launch: Executable doesn't exist at " +
+  '/ms-playwright/chromium_headless_shell-1234/chrome-headless-shell-linux64/chrome-headless-shell';
+
+test('★ PROVE-CAN-FAIL: the exact prod launch error → deterministic-infra, HIGH confidence, NOT flaky', () => {
+  assert.equal(isDeterministicInfraError(ERR_LAUNCH_OUTAGE), true, 'the missing-executable launch error IS deterministic infra');
+  const r = infraDeterministicResult(ERR_LAUNCH_OUTAGE, 'sig');
+  assert.equal(r.classification, 'infra-deterministic', 'must NOT be flaky-transient');
+  assert.equal(r.confidence, 'high', 'a 100%-reproducible missing binary is HIGH confidence, not low');
+  assert.notEqual(r.classification, 'flaky-transient');
+  assert.ok(/redeploy|repair/i.test(r.summary), 'the summary must point at repairing the runner');
+  assert.ok(/not a flaky|deterministic/i.test(r.summary), 'the summary must explicitly frame it as NOT flaky / deterministic');
+  // observed cites the error fact; no confabulation needed — the string IS the cause.
+  assert.ok(r.observed.some((o) => /error_message/.test(o)), 'observed cites the error message');
+});
+
+test('★ PROVE-CAN-FAIL (no over-correction): a genuine intermittent timeout is NOT deterministic-infra', () => {
+  const timeout = 'Timeout 30000ms exceeded waiting for selector "button.add-to-cart"';
+  assert.equal(isDeterministicInfraError(timeout), false, 'a timeout keeps its normal (possibly transient) path');
+  // and it still routes to the transient fallback (the desired behaviour we must NOT break):
+  const thin: RcaFacts = {
+    checkName: 'x', kind: 'browser', targetUrl: 'https://x', sensitive: false,
+    runStatus: 'error', httpStatus: null, durationMs: 1200, failedStep: 'add-to-cart',
+    errorMessage: timeout, steps: [], recent: [], verdict: { failing: 1, total: 1 },
+    firstPartyConsole: [], thirdPartyConsoleErrorCount: 0, netFailed: [],
+  };
+  assert.equal(evidenceThin(thin), true, 'thin evidence');
+  assert.equal(deterministicResult(thin, 'sig', true).classification, 'flaky-transient', 'a timeout with thin evidence stays transient — unchanged');
+});
+
+test('★ each signature is INDEPENDENTLY load-bearing — a string matching ONLY one pattern still classifies (kills a broken-pattern mutant)', () => {
+  // Each string matches via EXACTLY ONE pattern (no other keyword present), so if that pattern regressed the
+  // result would flip to false — the mutation-visible must-go-red for every signature individually.
+  assert.equal(isDeterministicInfraError("Executable doesn't exist at /ms-playwright/x/y"), true, 'executable-missing alone');
+  assert.equal(isDeterministicInfraError('browserType.launch: something went wrong'), true, 'browserType.launch: alone (no other keyword)');
+  assert.equal(isDeterministicInfraError('browserType.launchPersistentContext: boom'), true, 'browserType.launchPersistentContext: alone');
+  assert.equal(isDeterministicInfraError('The browser Failed to launch cleanly'), true, 'failed-to-launch alone');
+  assert.equal(isDeterministicInfraError('libnss3.so: error while loading shared libraries: missing'), true, 'shared-libs alone');
+  assert.equal(isDeterministicInfraError('Host system is missing dependencies to run browsers'), true, 'missing-deps alone');
+  assert.equal(isDeterministicInfraError('Error: spawn /opt/chrome ENOENT'), true, 'spawn-ENOENT alone');
+  // a bare "browserType." with no colon, or "browser." (not browserType.), must NOT match — the pattern is
+  // browserType\.\w+: specifically (a mid-run "browser.newContext: ...closed" is a crash, not a launch fail).
+  assert.equal(isDeterministicInfraError('browser.newContext: Target page, context or browser has been closed'), false, 'a mid-run context-closed is NOT a launch failure');
+  assert.equal(isDeterministicInfraError('spawn something OK'), false, 'spawn without ENOENT does not match');
+});
+
+test('★ infraDeterministicResult content is pinned (kills the result-string mutants)', () => {
+  const r = infraDeterministicResult('browserType.launch: Executable doesn\'t exist', 'sig-x');
+  assert.equal(r.classification, 'infra-deterministic');
+  assert.equal(r.confidence, 'high');
+  assert.equal(r.model, null, 'no model call for a rule-classified infra error');
+  assert.equal(r.signature, 'sig-x');
+  assert.equal(r.observed.length, 1, 'exactly the cited error fact');
+  assert.match(r.observed[0], /^Error message: ".*" \[cite: error_message\]$/, 'observed cites the error message');
+  assert.equal(r.inferred.length, 2, 'two reasoning lines: what happened + it recurs every run');
+  assert.match(r.inferred[0], /runner|infrastructure|deterministic/i);
+  assert.match(r.inferred[1], /every run|retry/i);
+  assert.match(r.summary, /redeploy|repair/i);
+  // a null error → observed is empty (kills the ternary mutant), but it still classifies infra/high.
+  const rn = infraDeterministicResult(null, 'sig');
+  assert.deepEqual(rn.observed, []);
+  assert.equal(rn.classification, 'infra-deterministic');
+  assert.equal(rn.confidence, 'high');
+});
+
+test('★ the deterministic-infra matcher is NARROW — infra launch errors match, target/selector/perf errors do not', () => {
+  // MATCH (the runner's own environment is broken):
+  for (const e of [
+    "browserType.launch: Executable doesn't exist at /ms-playwright/chromium-1234/chrome-linux/chrome",
+    'browserType.launchPersistentContext: Failed to launch chromium because executable is missing',
+    'Failed to launch the browser process!',
+    'chrome-headless-shell: error while loading shared libraries: libnss3.so: cannot open shared object file',
+    'Host system is missing dependencies to run browsers.',
+    'spawn /ms-playwright/chromium/chrome ENOENT',
+  ]) {
+    assert.equal(isDeterministicInfraError(e), true, `should MATCH: ${e.slice(0, 50)}`);
+  }
+  // DO NOT MATCH (target/selector/perf/transient — keep their normal classification):
+  for (const e of [
+    'Timeout 30000ms exceeded waiting for selector "button.add-to-cart"',
+    'expected status eq 200, got 500',
+    'net::ERR_CONNECTION_REFUSED at https://www.wegmans.com',
+    'locator.click: element is not visible',
+    'add-bread: Add to Cart affordance not found (NET-NEW selector)',
+    null,
+    '',
+  ]) {
+    assert.equal(isDeterministicInfraError(e), false, `should NOT match: ${String(e).slice(0, 50)}`);
+  }
 });

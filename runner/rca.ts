@@ -50,6 +50,12 @@ const CLASSIFICATIONS = [
   'selector-drift',
   'environment-regional',
   'perf-regression',
+  // ★ infra-deterministic: the MONITORING RUNNER itself is broken (browser failed to launch, a missing/
+  //   mismatched executable, missing OS libs) — a hard, 100%-reproducible environment error, NOT the target
+  //   and NOT flaky. Classified by RULE (isDeterministicInfraError), high confidence: the identical error
+  //   every run is the strongest possible non-flaky signal, and it must point AT "the runner is broken,
+  //   redeploy" — the opposite of the flaky-transient/low the abstain fallback used to emit (2026-07-25 outage).
+  'infra-deterministic',
 ] as const;
 type Classification = (typeof CLASSIFICATIONS)[number];
 const CONFIDENCES = ['high', 'medium', 'low'] as const;
@@ -80,7 +86,7 @@ const SYSTEM_PROMPT = `You are a site-reliability failure classifier for a synth
 
 Return ONLY a JSON object with EXACTLY this shape:
 {
-  "classification": one of ["real-outage","flaky-transient","selector-drift","environment-regional","perf-regression"],
+  "classification": one of ["real-outage","flaky-transient","selector-drift","environment-regional","perf-regression","infra-deterministic"],
   "confidence": one of ["high","medium","low"],
   "observed": [up to 5 short strings — FACTS the evidence literally shows. ★ EACH observed item MUST END WITH a citation "[cite: TOKEN]" naming the artifact it comes from, where TOKEN is one of the CITE TOKENS listed in the evidence block. A claim with no cite, or a cite that is not in that list, is DISCARDED and your whole answer is thrown away.],
   "inferred": [up to 4 short strings — HYPOTHESES that follow from the observed facts; each is a reasoning step, NOT a fact. Do NOT cite here — inferred items are your reasoning, not artifacts.],
@@ -93,6 +99,7 @@ Classification definitions:
 - selector-drift: (browser/multistep) the PAGE changed so the check's selector/assertion is now stale — the MONITOR needs updating, not the target. Signals: an element/locator not found while the page otherwise rendered; a screenshot showing a working page with a moved/renamed/removed element.
 - environment-regional: an infra/network/regional blip — especially if only SOME locations are failing.
 - perf-regression: slow, not broken — a latency/timeout/budget issue rather than a hard error.
+- infra-deterministic: the MONITORING RUNNER ITSELF is broken, not the target — the browser failed to LAUNCH, a missing/mismatched executable, missing OS libraries, a broken runner image/environment. Signals: "browserType.launch: Executable doesn't exist", "Failed to launch", "error while loading shared libraries", a launch error with NO page/screenshot/steps (the browser never started). This is DETERMINISTIC and HIGH confidence — the IDENTICAL error every run — NOT flaky-transient. The fix is to repair/redeploy the runner, not to retry and not to investigate the target.
 
 HONESTY (critical): clearly separate OBSERVED facts from INFERRED hypotheses. LLMs tend to generate plausible-sounding but incorrect explanations — do NOT. If the evidence is thin or ambiguous, return LOW confidence and put MULTIPLE candidate causes in "inferred" rather than inventing one confident cause. Never state as observed anything the evidence does not literally show. An honest low-confidence answer beats a confident wrong one.
 
@@ -365,6 +372,64 @@ export function deterministicResult(facts: RcaFacts, signature: string, abstain:
   };
 }
 
+// ★ DETERMINISTIC-INFRA signatures — the RUNNER's own environment/browser is broken (not the target, not
+// flaky). Deliberately NARROW: only hard launch/executable/OS-dependency failures, which recur IDENTICALLY
+// every run. A timeout, a selector miss, a connection refused, a 5xx — none match here; those keep their
+// normal (possibly transient) classification, so this never over-corrects a genuinely intermittent failure
+// into "deterministic". (2026-07-25 outage: a missing chrome-headless-shell binary was scored flaky/low.)
+const DETERMINISTIC_INFRA_PATTERNS: readonly RegExp[] = [
+  /Executable doesn't exist/i, // Playwright: the bundled browser binary is absent (the outage)
+  /browserType\.\w+:/i, // Playwright browserType.launch/launchPersistentContext failure
+  /Failed to launch/i, // the browser process itself failed to start
+  /error while loading shared libraries/i, // a missing OS lib in the runner image
+  /Host system is missing dependencies/i, // Playwright's missing-OS-deps message
+  /\bspawn\b[^\n]*\bENOENT\b/i, // exec-not-found spawning the browser/helper
+];
+
+/**
+ * True iff the error is a DETERMINISTIC infrastructure failure of the RUNNER (browser won't launch, missing
+ * executable, missing OS libs) — a 100%-reproducible environment error, the strongest possible NON-flaky
+ * signal. Pure + exported for the must-go-red test. Narrow ON PURPOSE (see DETERMINISTIC_INFRA_PATTERNS): an
+ * intermittent timeout / selector miss / target outage returns false and keeps its normal classification.
+ */
+export function isDeterministicInfraError(errorMessage: string | null | undefined): boolean {
+  if (!errorMessage) return false;
+  return DETERMINISTIC_INFRA_PATTERNS.some((re) => re.test(errorMessage));
+}
+
+/**
+ * The RULE-BUILT result for a deterministic-infra error: classification 'infra-deterministic', HIGH
+ * confidence, no model call (the error string is unambiguous — asking a model to "classify" a missing binary
+ * only risks it guessing flaky). observed carries the cited error fact; the interpretation + remedy live in
+ * inferred/summary. This REPLACES the old abstain→deterministicResult path for launch errors, which emitted
+ * flaky-transient/low — pointing AWAY from the "the runner is broken, redeploy" response an outage needs.
+ */
+export function infraDeterministicResult(
+  errorMessage: string | null,
+  signature: string,
+): RcaResult {
+  const observed = errorMessage
+    ? [`Error message: "${errorMessage.slice(0, 140)}" [cite: error_message]`]
+    : [];
+  return {
+    classification: 'infra-deterministic',
+    confidence: 'high',
+    observed,
+    inferred: [
+      'The MONITORING RUNNER could not launch a browser — a deterministic infrastructure/environment failure ' +
+        '(e.g. a missing or version-mismatched browser binary in the runner image), NOT the target and NOT flaky.',
+      'The identical error recurs on EVERY run until the runner is repaired — retrying will not help.',
+    ],
+    summary:
+      'The monitoring runner could not launch a browser — a deterministic infrastructure failure (not a ' +
+      'flaky blip). Repair/redeploy the runner image; retrying and investigating the target will not help.',
+    signature,
+    model: null,
+    cached: false,
+    generated_at: new Date().toISOString(),
+  };
+}
+
 /**
  * ★ B10 SAFETY (privacy control). A SENSITIVE monitor's RCA is TEXT-ONLY — never fetch or forward a
  * screenshot to the (3rd-party) AI: a rendered cart/auth page shows cart contents / a logged-in
@@ -509,6 +574,17 @@ export async function runRca(
     // Pattern-cache: identical (check_id + error + failed_step) RCA'd recently? Reuse it.
     const cached = await cacheLookup(check.id, signature);
     if (cached) return { ...cached, cached: true, generated_at: new Date().toISOString() };
+
+    // ★ DETERMINISTIC INFRA — classify by RULE, before gatherContext/abstain (2026-07-25 outage lesson). A
+    //   browser-launch / missing-executable / broken-environment error is the RUNNER's own failure, not the
+    //   target, and it is 100% reproducible — the strongest NON-flaky signal there is. The old path routed it
+    //   through evidenceThin→deterministicResult (no trace/screenshot because the browser never launched →
+    //   thin) → flaky-transient/LOW, actively pointing AWAY from "the runner is broken, redeploy". No model
+    //   call: the error string is unambiguous, so we don't spend tokens letting a model second-guess it.
+    if (isDeterministicInfraError(run.error_message)) {
+      console.log('[rca] deterministic infra error (browser launch / missing executable) — infra-deterministic (high), no model call');
+      return infraDeterministicResult(run.error_message, signature);
+    }
 
     const ctx = await gatherContext(check, run, verdict);
 
