@@ -1,0 +1,57 @@
+name: Browser smoke
+
+# ★ Closes the exact gap that let #368 ship a 100%-down prod (2026-07-25): a MINOR bump of the npm
+# `playwright` version WITHOUT a matching `runner/Dockerfile` base-image bump left the built image with
+# the wrong chrome-headless-shell revision, so every browser check died at runtime with
+# "browserType.launch: Executable doesn't exist at .../chromium_headless_shell-<rev>/...". Nothing caught
+# it: `npm ci` succeeds (PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 never downloads a browser), the Test job runs
+# npm-installed Playwright on the GH runner (its OWN matching browsers), and the deploy verify checks
+# image-roll/env — NONE launch a browser IN THE BUILT IMAGE.
+#
+# This job BUILDS the runner image and LAUNCHES a browser inside it (runner/scripts/browser-smoke.mjs,
+# the runner's exact `chromium.launch()`), so a base-image ⇄ npm Playwright mismatch reds at PR time
+# instead of taking prod down. A red here = the pairing is wrong; fix runner/Dockerfile's FROM tag to
+# match the `playwright` version in runner/package.json (and confirm that vX.Y.Z-noble tag exists on mcr).
+#
+# ★ PATH-FILTERED to the files that can change the pairing, so the (heavier) image build runs only on the
+#   PRs that matter — like #368 would have. It therefore GATES-WHEN-PRESENT via ci-gate's "an unclassified
+#   check gates by default" rule (a mismatch reds this → ci-gate fails via aggregation), and must NOT be
+#   added to ci-gate's REQUIRED list: a path-filtered required check that skips on a non-matching PR
+#   deadlocks the gate's wait loop (see ci-gate.yml + schema-freeze-preflight.yml — the same pattern).
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'runner/Dockerfile'
+      - 'runner/package.json'
+      - 'runner/package-lock.json'
+      - 'runner/scripts/browser-smoke.mjs'
+      - '.github/workflows/browser-smoke.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: browser-smoke-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  browser-smoke:
+    name: Browser smoke (launch in built image)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Build the REAL runner image, exactly as deploy.yml does (context = runner/, -f runner/Dockerfile).
+      # This is the artifact that ships to prod — so the browser it bundles is the browser prod launches.
+      - name: Build the runner image
+        run: docker build -t synthwatch-runner-smoke -f runner/Dockerfile runner
+
+      # Launch a browser INSIDE that image. --ipc=host per the Dockerfile's runtime note (chromium needs
+      # more than the default 64MB /dev/shm). A base-image ⇄ npm mismatch makes chromium.launch() throw
+      # here — the #368 outage, caught at PR time.
+      - name: Launch a browser in the built image (the pairing proof)
+        run: docker run --rm --ipc=host synthwatch-runner-smoke node scripts/browser-smoke.mjs
