@@ -325,7 +325,7 @@ export function expect(target: unknown, message?: string): SpecExpect {
 // hashes lib/flow.ts's SHARED block and compares it to LIBFLOW-VENDOR-SHA below. When lib/flow.ts's
 // shared helpers change, that check FAILS until you mirror the change into the functions below AND
 // update this sha to the value the check prints. (Single-source refactor — option b — is a follow-up.)
-// LIBFLOW-VENDOR-SHA: c915affc731a26fb30d561c47a3426894a2bb6a5835318dbc0fbe6603b7b6824
+// LIBFLOW-VENDOR-SHA: 2d49870eac440a766fc4233b0f9c593d24158356365720e7b36275a111b06b85
 // ---------------------------------------------------------------------------
 export async function assertLoaded(
   page: Page,
