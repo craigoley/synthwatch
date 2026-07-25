@@ -1,10 +1,17 @@
 # SynthWatch runner image.
 #
-# Base image ships a real Chromium plus every OS dependency it needs (fonts,
-# libnss, etc.). It is pinned to the SAME version as the `playwright` npm
-# dependency (1.61.0) — if these drift, the browser binaries the npm package
-# looks for won't exist in the image and launches fail. Bump BOTH together.
-FROM mcr.microsoft.com/playwright:v1.61.0-noble
+# Base image ships a real Chromium (+ the chrome-headless-shell the runner launches)
+# plus every OS dependency it needs (fonts, libnss, etc.). It MUST be pinned to the
+# EXACT SAME version as the `playwright` npm dependency (1.61.1) — a MINOR drift bumps
+# the bundled browser revision, so the binary the npm package looks for won't exist in
+# the image and `chromium.launch()` fails at runtime (the 2026-07-25 outage: #368 moved
+# npm to 1.62.0 while this stayed 1.61.0, and prod's browser monitors went 100% down with
+# "Executable doesn't exist at .../chromium_headless_shell-<rev>/..."). Bump BOTH together,
+# and the browser-smoke.yml CI job (which launches a browser IN this built image) now proves
+# the pairing before merge. NOTE: npm is intentionally held at 1.61.1 — Playwright 1.62.0 has
+# NO stable base image on mcr yet (only -next-canary-*), so the 1.62.0 bump is deferred until
+# `mcr.microsoft.com/playwright:v1.62.0-noble` publishes.
+FROM mcr.microsoft.com/playwright:v1.61.1-noble
 
 WORKDIR /app
 
