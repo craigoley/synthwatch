@@ -1,3 +1,4 @@
+/* global process, console */
 // In-image browser smoke test — the gap that let #368 ship a 100%-down prod (2026-07-25).
 //
 // THE GAP: the runner image inherits its browsers from the pinned Playwright BASE IMAGE
