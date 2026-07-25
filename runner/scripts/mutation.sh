@@ -38,11 +38,13 @@ case "$MODULE" in
     MUTATE='["traceSignals.ts"]'; BREAK=69 ;;
   rca)
     CMD="node --test dist/rca.test.js"
-    # pure-function surface: extractTraceFacts + renderFactPack cite-logic (159-246) and validateCites /
-    # evidenceThin / deterministicResult / rcaScreenshotUrls (284-384). Excludes SYSTEM_PROMPT, the render TEXT
-    # (247-283), and the model/DB orchestration (gatherContext+). Measured surface 52.4%; break carries extra
-    # margin. Measured on THIS scope: 62.5% (higher than the whole-module surface — the range is tighter).
-    MUTATE='["rca.ts:159-246","rca.ts:284-384"]'; BREAK=59 ;;   # 62.5% − margin
+    # pure-function surface: extractTraceFacts + renderFactPack cite-logic (166-253) and validateCites /
+    # evidenceThin / deterministicResult / isDeterministicInfraError / infraDeterministicResult /
+    # rcaScreenshotUrls (299-447). Excludes SYSTEM_PROMPT, the render TEXT (254-298), and the model/DB
+    # orchestration (gatherContext+). ★ Ranges RE-DERIVED after the infra-deterministic classifier landed
+    # (the +lines shifted every boundary; the old 159-246/284-384 then mutated render-text and MISSED the new
+    # pure functions — the exact drift this comment warns about). The new functions ARE covered here.
+    MUTATE='["rca.ts:166-253","rca.ts:299-447"]'; BREAK=59 ;;
   evaluate)
     CMD="node --test dist/evaluate.test.js dist/evaluate.integration.test.js dist/confirmationRetry.integration.test.js dist/transientBaselineSuccess.integration.test.js dist/countableRun.integration.test.js"
     MUTATE='["evaluate.ts"]'; BREAK=28 ;;   # measured 31.8% (post #307/#308) − margin

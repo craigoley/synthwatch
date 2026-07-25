@@ -300,6 +300,41 @@ test('★ PROVE-CAN-FAIL (no over-correction): a genuine intermittent timeout is
   assert.equal(deterministicResult(thin, 'sig', true).classification, 'flaky-transient', 'a timeout with thin evidence stays transient — unchanged');
 });
 
+test('★ each signature is INDEPENDENTLY load-bearing — a string matching ONLY one pattern still classifies (kills a broken-pattern mutant)', () => {
+  // Each string matches via EXACTLY ONE pattern (no other keyword present), so if that pattern regressed the
+  // result would flip to false — the mutation-visible must-go-red for every signature individually.
+  assert.equal(isDeterministicInfraError("Executable doesn't exist at /ms-playwright/x/y"), true, 'executable-missing alone');
+  assert.equal(isDeterministicInfraError('browserType.launch: something went wrong'), true, 'browserType.launch: alone (no other keyword)');
+  assert.equal(isDeterministicInfraError('browserType.launchPersistentContext: boom'), true, 'browserType.launchPersistentContext: alone');
+  assert.equal(isDeterministicInfraError('The browser Failed to launch cleanly'), true, 'failed-to-launch alone');
+  assert.equal(isDeterministicInfraError('libnss3.so: error while loading shared libraries: missing'), true, 'shared-libs alone');
+  assert.equal(isDeterministicInfraError('Host system is missing dependencies to run browsers'), true, 'missing-deps alone');
+  assert.equal(isDeterministicInfraError('Error: spawn /opt/chrome ENOENT'), true, 'spawn-ENOENT alone');
+  // a bare "browserType." with no colon, or "browser." (not browserType.), must NOT match — the pattern is
+  // browserType\.\w+: specifically (a mid-run "browser.newContext: ...closed" is a crash, not a launch fail).
+  assert.equal(isDeterministicInfraError('browser.newContext: Target page, context or browser has been closed'), false, 'a mid-run context-closed is NOT a launch failure');
+  assert.equal(isDeterministicInfraError('spawn something OK'), false, 'spawn without ENOENT does not match');
+});
+
+test('★ infraDeterministicResult content is pinned (kills the result-string mutants)', () => {
+  const r = infraDeterministicResult('browserType.launch: Executable doesn\'t exist', 'sig-x');
+  assert.equal(r.classification, 'infra-deterministic');
+  assert.equal(r.confidence, 'high');
+  assert.equal(r.model, null, 'no model call for a rule-classified infra error');
+  assert.equal(r.signature, 'sig-x');
+  assert.equal(r.observed.length, 1, 'exactly the cited error fact');
+  assert.match(r.observed[0], /^Error message: ".*" \[cite: error_message\]$/, 'observed cites the error message');
+  assert.equal(r.inferred.length, 2, 'two reasoning lines: what happened + it recurs every run');
+  assert.match(r.inferred[0], /runner|infrastructure|deterministic/i);
+  assert.match(r.inferred[1], /every run|retry/i);
+  assert.match(r.summary, /redeploy|repair/i);
+  // a null error → observed is empty (kills the ternary mutant), but it still classifies infra/high.
+  const rn = infraDeterministicResult(null, 'sig');
+  assert.deepEqual(rn.observed, []);
+  assert.equal(rn.classification, 'infra-deterministic');
+  assert.equal(rn.confidence, 'high');
+});
+
 test('★ the deterministic-infra matcher is NARROW — infra launch errors match, target/selector/perf errors do not', () => {
   // MATCH (the runner's own environment is broken):
   for (const e of [
