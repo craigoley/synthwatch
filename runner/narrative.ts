@@ -12,6 +12,10 @@
 import { pool } from './db.js';
 import { aoaiConfigured, chatCompletionContent, extractJson, DEFAULT_DEPLOYMENT } from './aoai.js';
 import { costRatePerActiveSecond, freeGrantDollars, reconcileTargetMonthly } from './costModel.js';
+// ★ The failure-signature normaliser, imported from its ONE definition rather than re-expressed here.
+// Postgres supports the same lookbehind, so this aggregate could have been written in SQL — but a second
+// copy of the rule is exactly the drift this codebase keeps paying for. One definition, two consumers.
+import { normalizeSignatureText } from './rca.js';
 
 const WINDOW = '7d';
 const WINDOW_DAYS = 7;
@@ -89,6 +93,16 @@ export interface FactPack {
   };
   incidentList: IncidentFact[];
   anomalies: string[];
+  /**
+   * ★ The anomalies that must REACH A HUMAN, each with the `token` that proves the prose carried it.
+   *
+   * These are a SUBSET of `anomalies` (same strings), lifted out because delivery is guaranteed for them
+   * specifically: ensureAnomaliesDelivered appends any whose token is absent from the generated prose into
+   * `highlights` — a field validShape requires, upsert() persists and the dashboard renders. Being in
+   * `anomalies` alone was NOT delivery: the repeat-offender line reached fact_pack.anomalies in 10 of 38
+   * stored narratives and appeared in ZERO narrative bodies, because the model was never obliged to echo it.
+   */
+  criticalFindings: { token: string; line: string }[];
   cost: CostFacts | null; // fleet+notable cost (fleet scope) or this monitor's cost (monitor scope); null if unavailable
   deployMarkers: DeployMarker[]; // deploys in the window, for incident↔deploy correlation
 }
@@ -288,6 +302,143 @@ async function deployMarkersInWindow(startIso: string, endIso: string): Promise<
   }));
 }
 
+/** One repeat-offender group, as the aggregate returns it. */
+export interface RepeatGroup {
+  n: string | number;
+  step: string | null;
+  ids: number[];
+  check_name: string | null;
+}
+
+/**
+ * The repeat-offender anomaly line. NAMES the group so it is actionable: which step, how many incidents,
+ * WHICH incidents, and over what window. A fleet-scope line also names the monitor (a fleet report groups
+ * across checks, so "verify-cart-4" alone would not say whose).
+ *
+ * ★ The old line was "Repeat offender: N incidents with the same failure signature." — measured on check
+ *   355's real 7d window it rendered twice, identically, for two DIFFERENT groups (add-bread and
+ *   verify-cart-4). Naming the step is what turns it from a count into a work item.
+ */
+export function repeatOffenderLine(scopeType: 'fleet' | 'monitor', g: RepeatGroup, window: string): string {
+  const step = g.step ?? '(no step — non-stepped check)';
+  const who = scopeType === 'fleet' && g.check_name ? `${g.check_name} / ` : '';
+  const ids = g.ids.map((i) => `#${i}`).join(', ');
+  return `Repeat offender: ${who}${step} — ${g.n} incidents with ONE failure signature (${ids}), ${window}.`;
+}
+
+/** A per-(check, step) failure shape over the window — the monitor-defect discriminator's inputs. */
+export interface DefectCandidate {
+  checkId: number;
+  checkName: string | null;
+  step: string;
+  fails: number;
+  signatures: number;
+  windowRuns: number;
+}
+
+// ★ THRESHOLDS, derived from MEASURED fleet data (14d, 2026-07-30) — not picked by feel. All three must
+//   hold, because each alone over-fires:
+//     • VOLUME floor: a 2-failure step is not a pattern, whatever its ratio.
+//     • RATIO (fails per distinct signature): the actual monitor-vs-flaky discriminator.
+//       verify-cart-4 = 21.5 · check 396 "Open cart and verify item" = 101.0 · check 396 "Add item to
+//       cart" = 28.0, against add-bananas 3.5 / clear-cart 2.3 / checkout-pickup 2.0 / add-milk 1.0.
+//     • SHARE of the window: this is the guard that stops a ratio alone from over-firing, and it is
+//       load-bearing on REAL data — check 192 "assert a downloadable menu PDF is present" scores 5 fails
+//       with 1 signature (ratio 5.0, clearing BOTH the volume floor and the ratio) but only 0.75% of its
+//       window, so the share term is the only thing that excludes it. Five failures spread thinly across
+//       two weeks is an intermittent target; 7% of every run failing identically is a broken assertion.
+const DEFECT_MIN_FAILS = 5;
+const DEFECT_MIN_RATIO = 5;
+const DEFECT_MIN_SHARE_PCT = 3;
+
+/**
+ * Per-(check, step) failure shapes in the window that look like a MONITOR DEFECT rather than a flaky
+ * target. Reads `countable_run` — the same canonical window aggregateVerdict and countConsecutiveDown use
+ * (non-superseded, non-confirmation, non-sandbox), so a confirmation re-run cannot inflate a count (0081).
+ *
+ * Signatures are counted with rca.ts's OWN normalizeSignatureText, imported rather than re-expressed:
+ * Postgres does support the same lookbehind, but a second copy of the rule in SQL is a drift waiting to
+ * happen, and this codebase has paid for that class of divergence more than once.
+ */
+export async function monitorDefectCandidates(
+  checkId: number | null,
+  fromIso: string,
+  toIso: string,
+): Promise<DefectCandidate[]> {
+  const { rows } = await pool.query<{
+    check_id: number;
+    check_name: string | null;
+    failed_step: string | null;
+    error_message: string | null;
+  }>(
+    `SELECT cr.check_id, c.name AS check_name, r.failed_step, r.error_message
+       FROM countable_run cr
+       JOIN runs   r ON r.id = cr.id
+       LEFT JOIN checks c ON c.id = cr.check_id
+      WHERE cr.started_at >= $2 AND cr.started_at < $3
+        AND ($1::bigint IS NULL OR cr.check_id = $1)`,
+    [checkId, fromIso, toIso],
+  );
+
+  // Window size per check = ALL countable runs (pass included) — the denominator for "share of runs".
+  const windowRuns = new Map<number, number>();
+  const byStep = new Map<string, { c: DefectCandidate; sigs: Set<string> }>();
+  for (const r of rows) {
+    windowRuns.set(r.check_id, (windowRuns.get(r.check_id) ?? 0) + 1);
+    if (!r.failed_step) continue;
+    const key = `${r.check_id}|${r.failed_step}`;
+    let e = byStep.get(key);
+    if (!e) {
+      e = {
+        c: { checkId: r.check_id, checkName: r.check_name, step: r.failed_step, fails: 0, signatures: 0, windowRuns: 0 },
+        sigs: new Set<string>(),
+      };
+      byStep.set(key, e);
+    }
+    e.c.fails += 1;
+    e.sigs.add(normalizeSignatureText(r.error_message ?? ''));
+  }
+
+  const out: DefectCandidate[] = [];
+  for (const { c, sigs } of byStep.values()) {
+    c.signatures = sigs.size;
+    c.windowRuns = windowRuns.get(c.checkId) ?? 0;
+    if (isMonitorDefectShape(c)) out.push(c);
+  }
+  return out.sort((a, b) => b.fails / b.signatures - a.fails / a.signatures);
+}
+
+/** All three guards. Exported so the thresholds are pinnable — see the constants for why each exists. */
+export function isMonitorDefectShape(c: DefectCandidate): boolean {
+  if (c.signatures <= 0 || c.windowRuns <= 0) return false; // nothing measured → no claim
+  const ratio = c.fails / c.signatures;
+  const sharePct = (100 * c.fails) / c.windowRuns;
+  return c.fails >= DEFECT_MIN_FAILS && ratio >= DEFECT_MIN_RATIO && sharePct >= DEFECT_MIN_SHARE_PCT;
+}
+
+/**
+ * The monitor-defect anomaly line. Says what was measured, what it implies, and what to DO — the action
+ * is "fix the check", which no RCA classification currently recommends (real-outage / flaky-transient /
+ * infra-deterministic all point at the world or the runner, never at the assertion).
+ */
+export function monitorDefectLine(
+  c: DefectCandidate,
+  windowDays: number,
+  scopeType: 'fleet' | 'monitor' = 'fleet',
+): string {
+  const ratio = Math.round((10 * c.fails) / c.signatures) / 10;
+  const sharePct = Math.round((1000 * c.fails) / c.windowRuns) / 10;
+  // Name the monitor only on a FLEET report — a per-monitor report already knows whose it is (same rule as
+  // repeatOffenderLine, so the two lines read consistently side by side).
+  const who = scopeType === 'fleet' && c.checkName ? `${c.checkName} / ` : '';
+  const sigs = c.signatures === 1 ? '1 distinct error signature' : `${c.signatures} distinct error signatures`;
+  return (
+    `LIKELY MONITOR DEFECT: ${who}${c.step} failed ${c.fails}× with only ${sigs} — ${ratio} failures per ` +
+    `signature, ${sharePct}% of ${c.windowRuns} runs, ${windowDays}d. A wrong assertion repeats ONE error; ` +
+    `a flaky target drifts. Fix the check before investigating the target.`
+  );
+}
+
 export async function computeFactPack(
   scope: { type: 'fleet' | 'monitor'; checkId: number | null; key: string; name: string },
   asOf: Date = todayUtcMidnight(),
@@ -342,14 +493,41 @@ export async function computeFactPack(
     anomalies.push(`Incidents up ${current.incidents - previous.incidents} w/w (${previous.incidents} -> ${current.incidents}).`);
 
   // Repeat-offender: same RCA signature across >= 2 incidents this period.
-  const repeat = await pool.query<{ sig: string; n: string }>(
-    `SELECT i.rca->>'signature' AS sig, count(*) AS n FROM incidents i
+  // ★ NAMES THE GROUP (2026-07-30). The line used to read "Repeat offender: N incidents with the same
+  //   failure signature." — no step, no ids, no check. Two groups on ONE monitor therefore rendered
+  //   IDENTICALLY and neither was actionable: a reader could not tell which assertion to go look at.
+  //   The signature already contains check_id|message|failed_step, so the step is CONSTANT within a group
+  //   (max() is a constant-pick, not an aggregate choice) and the incident ids come free from array_agg.
+  const repeat = await pool.query<{ n: string; step: string | null; ids: number[]; check_name: string | null }>(
+    `SELECT count(*) AS n,
+            max(r.failed_step)  AS step,
+            array_agg(i.id ORDER BY i.id) AS ids,
+            max(c.name) AS check_name
+       FROM incidents i
+       LEFT JOIN runs r   ON r.id = i.opened_run_id
+       LEFT JOIN checks c ON c.id = i.check_id
       WHERE i.opened_at >= $2 AND i.opened_at < $3 AND i.rca->>'signature' IS NOT NULL
         AND ($1::bigint IS NULL OR i.check_id = $1)
-      GROUP BY 1 HAVING count(*) >= 2 ORDER BY count(*) DESC`,
+      GROUP BY i.rca->>'signature' HAVING count(*) >= 2 ORDER BY count(*) DESC`,
     [checkId, current.from, current.to],
   );
-  for (const r of repeat.rows) anomalies.push(`Repeat offender: ${r.n} incidents with the same failure signature.`);
+  const criticalFindings: { token: string; line: string }[] = [];
+  for (const r of repeat.rows) {
+    const line = repeatOffenderLine(scope.type, r, WINDOW);
+    anomalies.push(line);
+    if (r.step) criticalFindings.push({ token: r.step, line });
+  }
+
+  // ★ MONITOR-DEFECT SHAPE — "same step, one signature, over and over" vs "same step, many signatures".
+  //   A wrong assertion emits ONE error string forever; genuinely flaky target behaviour DRIFTS (different
+  //   timeouts, elements, counts) or resolves. This is the distinction the RCA taxonomy could not make:
+  //   flaky-transient means "ignore", so a recurring monitor bug wearing that label suppresses its own fix.
+  const defects = await monitorDefectCandidates(checkId, curStart.toISOString(), end.toISOString());
+  for (const d of defects) {
+    const line = monitorDefectLine(d, WINDOW_DAYS, scope.type);
+    anomalies.push(line);
+    criticalFindings.push({ token: d.step, line });
+  }
 
   // Worst monitors (fleet only).
   if (scope.type === 'fleet') {
@@ -387,9 +565,38 @@ export async function computeFactPack(
     },
     incidentList,
     anomalies,
+    criticalFindings,
     cost,
     deployMarkers,
   };
+}
+
+/**
+ * ★ DELIVERY GUARANTEE. Every criticalFinding must appear in what a human actually reads.
+ *
+ * The failure mode this closes, measured: the repeat-offender line reached `fact_pack.anomalies` in 10 of
+ * 38 stored narratives and ZERO narrative bodies. The model was handed the anomaly and simply did not echo
+ * it, so a correct signal sat in a JSON column nobody opens. Instructing the prompt harder does not FIX
+ * that — it only makes it likelier; the model may still drop the line and there is no way to tell after the
+ * fact that it did.
+ *
+ * So: if the prose (headline + body + highlights — the same surface missingFigures searches) does not carry
+ * a finding's token, the finding's LINE is appended to `highlights` verbatim. Additive, never destructive:
+ *
+ *   • it cannot fabricate — every line is computed from SQL in computeFactPack, not from the model;
+ *   • it does not DISCARD a good narrative the way missingFigures does. Forcing a fallback over a missing
+ *     step name would throw away genuinely useful cross-signal prose to punish a formatting miss; appending
+ *     the line delivers the signal AND keeps the analysis.
+ *
+ * Applied to the model path AND the fallback path — buildFallback slices highlights to 5, so a monitor
+ * defect could otherwise be truncated out of the deterministic output too.
+ */
+export function ensureAnomaliesDelivered(n: Narrative, fp: FactPack): Narrative {
+  if (!fp.criticalFindings.length) return n;
+  const prose = [n.headline, n.body, ...n.highlights].join(' ');
+  const undelivered = fp.criticalFindings.filter((f) => !prose.includes(f.token)).map((f) => f.line);
+  if (!undelivered.length) return n;
+  return { ...n, highlights: [...n.highlights, ...undelivered] };
 }
 
 // --- narrate (model only narrates) + deterministic fallback ---------------------------
@@ -420,6 +627,11 @@ const SYSTEM_PROMPT =
   `see the actual current availability number. This does NOT dilute the holistic style: still lead with the ` +
   `story and weave signals, then anchor it to the real aggregate figure (copy the number from the fact pack ` +
   `verbatim — do not round or restate it).\n` +
+  `- ★ criticalFindings, IF NON-EMPTY, OUTRANKS EVERYTHING ABOVE — including cost. Each is a monitor that ` +
+  `is failing the SAME assertion over and over, i.e. the MONITOR is probably wrong, not the target. LEAD ` +
+  `with it, name the step verbatim (its "token"), and say the action is to fix the CHECK — do NOT frame it ` +
+  `as an outage to investigate or as flakiness to wait out. A recurring monitor bug labelled "flaky" is ` +
+  `what suppresses its own fix.\n` +
   `- BAN filler: no greetings, no "in conclusion", no "all systems nominal". Every line carries a cited ` +
   `signal; if truly nothing notable changed, say that in one sentence.\n` +
   `Respond ONLY as JSON: {"headline": "<=1 sentence, the top item", "body": "2-6 sentences, markdown, ` +
@@ -576,7 +788,9 @@ export async function narrate(fp: FactPack): Promise<{ narrative: Narrative; mod
           highlights: parsed.highlights.slice(0, 5),
         };
         const missing = missingFigures(n, fp);
-        if (missing.length === 0) return { narrative: n, model: DEFAULT_DEPLOYMENT ?? 'aoai' };
+        // ★ Delivery guarantee applied to the ACCEPTED model output: a criticalFinding the prose dropped is
+        //   appended to highlights rather than silently lost (see ensureAnomaliesDelivered).
+        if (missing.length === 0) return { narrative: ensureAnomaliesDelivered(n, fp), model: DEFAULT_DEPLOYMENT ?? 'aoai' };
         // meta-lesson A: the DISCARDED output was previously invisible (only the fallback was stored), so a
         // spot-check false-rejection was un-diagnosable without re-deriving. Log the full discarded narrative
         // (non-sensitive fleet stats) + the exact figure it wanted, so the NEXT failure is one-glance:
@@ -593,7 +807,9 @@ export async function narrate(fp: FactPack): Promise<{ narrative: Narrative; mod
       console.warn('[narrative] model output not JSON — fallback:', err instanceof Error ? err.message : err);
     }
   }
-  return { narrative: buildFallback(fp), model: 'fallback-template' };
+  // The fallback carries anomalies in its body, but slices highlights to 5 — so run it through the same
+  // guarantee, or a monitor defect could be truncated out of the deterministic output too.
+  return { narrative: ensureAnomaliesDelivered(buildFallback(fp), fp), model: 'fallback-template' };
 }
 
 async function upsert(fp: FactPack, n: Narrative, model: string): Promise<void> {

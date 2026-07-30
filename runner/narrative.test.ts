@@ -3,7 +3,18 @@
 // correlation the timestamps don't support. buildFallback must cite cost/deploy when present, never fabricate.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { missingFigures, buildFallback, spotCheck, type FactPack, type Narrative } from './narrative.js';
+import {
+  missingFigures,
+  buildFallback,
+  spotCheck,
+  repeatOffenderLine,
+  isMonitorDefectShape,
+  monitorDefectLine,
+  ensureAnomaliesDelivered,
+  type FactPack,
+  type Narrative,
+  type DefectCandidate,
+} from './narrative.js';
 
 const EMPTY_PERIOD = {
   from: '2026-07-01', to: '2026-07-08', up: 100, down: 5, availabilityPct: 95.24, downtimeMin: 12,
@@ -18,6 +29,7 @@ function factPack(over: Partial<FactPack> = {}): FactPack {
     deltas: { availabilityPts: -2.76, downtimeMin: 8, incidents: 1, p95Pct: 10 },
     incidentList: [],
     anomalies: [],
+    criticalFindings: [],
     cost: {
       fleetProjected: 67.64, fleetMeasured: 50.17, fleetDivergence: 0.742,
       topDrivers: [{ name: 'recipe-nav', projected: 8.85 }],
@@ -172,4 +184,147 @@ test('buildFallback: NO fabricated cost/deploy when absent (cost null, no marker
   assert.doesNotMatch(fb.body, /deploy/i); // no deploy fabricated
   // the guard accepts the fallback (it cites availability + incidents, no invented figures)
   assert.deepEqual(missingFigures(fb, factPack({ cost: null, deployMarkers: [] })), []);
+});
+
+// ── ★ REPEAT-OFFENDER DELIVERY + THE MONITOR-DEFECT DISCRIMINATOR (2026-07-30) ──────────────────────
+// The signal already fired: the repeat-offender line reached fact_pack.anomalies in 10 of 38 stored
+// narratives — and ZERO narrative bodies. Detection was never the problem; DELIVERY and NAMING were.
+// Every number below is MEASURED (14d window, 2026-07-30), not invented.
+
+test('★ the repeat-offender line NAMES the group — step, count, incident ids, window', () => {
+  // Check 355's real 7d groups after #378: add-bread [185,187] and verify-cart-4 [219,223].
+  const line = repeatOffenderLine('monitor', { n: 2, step: 'verify-cart-4', ids: [219, 223], check_name: null }, '7d');
+  assert.match(line, /verify-cart-4/, 'the STEP is named — this is what makes it a work item');
+  assert.match(line, /#219, #223/, 'the incident ids are named');
+  assert.match(line, /2 incidents/);
+  assert.match(line, /7d/, 'the window is stated');
+
+  // ★ MUST-GO-RED vs the OLD text: two DIFFERENT groups on ONE monitor used to render IDENTICALLY.
+  const other = repeatOffenderLine('monitor', { n: 2, step: 'add-bread', ids: [185, 187], check_name: null }, '7d');
+  assert.notEqual(line, other, 'the two real groups must now be distinguishable');
+  const oldText = (n: number) => `Repeat offender: ${n} incidents with the same failure signature.`;
+  assert.equal(oldText(2), oldText(2), 'the old text was identical for both — the defect being fixed');
+});
+
+test('★ a fleet-scope line also names the MONITOR (a fleet report groups across checks)', () => {
+  const fleet = repeatOffenderLine('fleet', { n: 3, step: 'verify-cart-4', ids: [175, 219, 223], check_name: 'Wegmans: full authenticated pickup shopping flow' }, '30d');
+  assert.match(fleet, /Wegmans: full authenticated pickup shopping flow \/ verify-cart-4/);
+  const mon = repeatOffenderLine('monitor', { n: 3, step: 'verify-cart-4', ids: [175, 219, 223], check_name: 'Wegmans: full authenticated pickup shopping flow' }, '30d');
+  assert.ok(!mon.includes('Wegmans:'), 'a monitor-scope report already knows whose it is');
+});
+
+test('a non-stepped check still produces a readable line (step is nullable)', () => {
+  assert.match(
+    repeatOffenderLine('monitor', { n: 2, step: null, ids: [1, 2], check_name: null }, '7d'),
+    /no step — non-stepped check/,
+  );
+});
+
+// ── the discriminator: same signature = monitor defect; many signatures = flaky target ──────────────
+const c = (step: string, fails: number, signatures: number, windowRuns: number): DefectCandidate =>
+  ({ checkId: 355, checkName: null, step, fails, signatures, windowRuns });
+
+test('★★ MEASURED: check 355 verify-cart-4 IS monitor-defect-shaped; its flaky siblings are NOT', () => {
+  // 43 failures / 2 signatures over 602 countable runs → 21.5 per signature, 7.14% of the window.
+  assert.equal(isMonitorDefectShape(c('verify-cart-4', 43, 2, 602)), true);
+
+  // Real siblings from the same check + window. Each fails the RATIO — their errors DRIFT, which is what
+  // genuinely intermittent target behaviour looks like.
+  assert.equal(isMonitorDefectShape(c('add-bananas', 7, 2, 602)), false, 'ratio 3.5');
+  assert.equal(isMonitorDefectShape(c('clear-cart (teardown)', 7, 3, 602)), false, 'ratio 2.3');
+  assert.equal(isMonitorDefectShape(c('checkout-pickup', 6, 3, 602)), false, 'ratio 2.0');
+  assert.equal(isMonitorDefectShape(c('add-eggs', 3, 2, 602)), false, 'ratio 1.5 and under the volume floor');
+});
+
+test('★★ MEASURED: check 396 — 101 failures, ONE signature, 75% of its window — is the clearest case', () => {
+  assert.equal(isMonitorDefectShape(c('Open cart and verify item', 101, 1, 134)), true);
+  assert.equal(isMonitorDefectShape(c('Add item to cart', 28, 1, 134)), true);
+});
+
+test('★★ THE SHARE GUARD IS LOAD-BEARING — a ratio alone over-fires (real case: check 192)', () => {
+  // Check 192 "assert a downloadable menu PDF is present": 5 failures, 1 signature, 669 runs.
+  // It CLEARS the volume floor (5 >= 5) AND the ratio (5.0 >= 5) — only the share term excludes it.
+  const menu = c('assert a downloadable menu PDF is present', 5, 1, 669);
+  assert.ok(menu.fails >= 5, 'clears the volume floor');
+  assert.ok(menu.fails / menu.signatures >= 5, 'clears the ratio');
+  assert.equal(isMonitorDefectShape(menu), false, '…and is still correctly excluded, by SHARE (0.75%)');
+
+  // Same shape as the select-store-mckinley case the guard was specified against (5 fails / 1 sig / 602).
+  assert.equal(isMonitorDefectShape(c('select-store-mckinley', 5, 1, 602)), false, 'share 0.83% — excluded');
+
+  // MUST-GO-RED: drop the share term and check 192 would fire. This is what the guard is buying.
+  const withoutShare = (x: DefectCandidate) => x.fails >= 5 && x.fails / x.signatures >= 5;
+  assert.equal(withoutShare(menu), true, 'without the share term this over-fires on a thin, intermittent history');
+});
+
+test('★ the volume floor holds: a high ratio on tiny volume is not a pattern', () => {
+  assert.equal(isMonitorDefectShape(c('one-off', 4, 1, 20)), false, '4 failures — under the floor despite 20% share');
+  assert.equal(isMonitorDefectShape(c('one-off', 1, 1, 2)), false, '1 failure at 50% share is not a pattern');
+});
+
+test('★ degenerate inputs make NO claim (never divide by zero into a confident verdict)', () => {
+  assert.equal(isMonitorDefectShape(c('x', 10, 0, 100)), false, 'no signatures measured');
+  assert.equal(isMonitorDefectShape(c('x', 10, 1, 0)), false, 'no window measured');
+});
+
+test('★ the monitor-defect line states the measurement AND the action (fix the check)', () => {
+  const line = monitorDefectLine(c('verify-cart-4', 43, 2, 602), 14);
+  assert.match(line, /verify-cart-4/);
+  assert.match(line, /43×/);
+  assert.match(line, /2 distinct error signatures/);
+  assert.match(line, /21\.5 failures per signature/);
+  assert.match(line, /7\.1% of 602 runs/);
+  assert.match(line, /14d/);
+  assert.match(line, /Fix the check before investigating the target/, 'the ACTION — no RCA class says this');
+});
+
+// ── the delivery guarantee ───────────────────────────────────────────────────────────────────────────
+const narrative = (over: Partial<Narrative> = {}): Narrative =>
+  ({ headline: 'h', body: 'b', highlights: [], ...over });
+
+test('★★ DELIVERY: a criticalFinding the prose DROPS is appended to highlights', () => {
+  const fp = factPack({
+    criticalFindings: [{ token: 'verify-cart-4', line: 'LIKELY MONITOR DEFECT: verify-cart-4 failed 43× …' }],
+  });
+  // The model wrote a perfectly nice narrative that never mentions the step — the measured real behaviour
+  // (10 of 38 narratives had the anomaly in the fact pack; 0 bodies mentioned it).
+  const out = ensureAnomaliesDelivered(narrative({ body: 'Availability dipped; cost is flat.' }), fp);
+  assert.equal(out.highlights.length, 1, 'the finding is now in a field the dashboard renders');
+  assert.match(out.highlights[0], /LIKELY MONITOR DEFECT: verify-cart-4/);
+  // Non-destructive: the model's own prose is untouched.
+  assert.equal(out.body, 'Availability dipped; cost is flat.');
+  assert.equal(out.headline, 'h');
+});
+
+test('★ DELIVERY is idempotent — prose that ALREADY names the step is not duplicated', () => {
+  const fp = factPack({
+    criticalFindings: [{ token: 'verify-cart-4', line: 'LIKELY MONITOR DEFECT: verify-cart-4 failed 43× …' }],
+  });
+  for (const n of [
+    narrative({ body: 'verify-cart-4 keeps failing the same assertion — fix the check.' }),
+    narrative({ headline: 'verify-cart-4 is the story' }),
+    narrative({ highlights: ['verify-cart-4 43× one signature'] }),
+  ]) {
+    const out = ensureAnomaliesDelivered(n, fp);
+    assert.deepEqual(out.highlights, n.highlights, 'already delivered → nothing appended');
+  }
+});
+
+test('★ DELIVERY: no criticalFindings → the narrative is returned untouched', () => {
+  const n = narrative({ highlights: ['a'] });
+  assert.equal(ensureAnomaliesDelivered(n, factPack({ criticalFindings: [] })), n, 'same object, no copy');
+});
+
+test('★ DELIVERY reaches the FALLBACK path too (buildFallback slices highlights to 5)', () => {
+  // Five other anomalies would push a 6th out of buildFallback's highlights slice; the guarantee restores it.
+  const fp = factPack({
+    anomalies: ['a1', 'a2', 'a3', 'a4', 'a5', 'LIKELY MONITOR DEFECT: verify-cart-4 failed 43× …'],
+    criticalFindings: [{ token: 'verify-cart-4', line: 'LIKELY MONITOR DEFECT: verify-cart-4 failed 43× …' }],
+  });
+  const fb = buildFallback(fp);
+  const delivered = ensureAnomaliesDelivered(fb, fp);
+  assert.ok(
+    [delivered.headline, delivered.body, ...delivered.highlights].join(' ').includes('verify-cart-4'),
+    'the deterministic output carries it too',
+  );
 });
