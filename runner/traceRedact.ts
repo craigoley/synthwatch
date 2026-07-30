@@ -84,12 +84,102 @@ export function classifyEntry(entryName: string): 'scrub' | 'drop' {
   return TEXT_ENTRY.test(entryName) ? 'scrub' : 'drop';
 }
 
-/** The full text scrub: the monitor's redactor first (declared patterns + known secret values),
- *  then the structural session-material rules. Exported for direct unit-testing. */
-export function scrubTraceText(text: string, redact: Redactor): string {
+/** The PLAIN-form scrub: the monitor's redactor first (declared patterns + known secret values), then
+ *  the structural session-material rules. This sees only text as it literally appears in the entry —
+ *  a percent-ENCODED occurrence is invisible to it (see scrubEncodedRegions). Exported so the
+ *  prove-can-fail test can run the plain scrub ALONE and show the encoded sentinel surviving. */
+export function scrubPlainText(text: string, redact: Redactor): string {
   let out = redact(text);
   for (const [re, repl] of STRUCTURAL) out = out.replace(re, repl);
   return out;
+}
+
+// ── ★★ PERCENT-ENCODED PII — why a decode pass exists at all ────────────────────────────────────────
+//
+// Every rule above (declared redact_patterns, the builtin denylist, STRUCTURAL) matches the text as it
+// LITERALLY appears. But the highest-value PII in a real sensitive trace does not appear literally: the
+// 2026-07-29 classification recon found a member identity record — email, firstName, lastName, full
+// name, loyaltyNumber, phoneNumber — inside a hidden `<input>` value in the AstuteBot chat widget,
+// stored PERCENT-ENCODED in the DOM snapshot:
+//
+//   %22email%22%3A%22…%40wegmans.com%22%2C%22firstName%22%3A%22…%22%2C%22loyaltyNumber%22%3A104735137
+//
+// So a perfectly correct plain-form pattern like `"loyaltyNumber"\s*:\s*\d+` matches NOTHING and the
+// monitor's redact_patterns are a SILENT NO-OP against exactly the data they were added for. That
+// silence is the trap: the manifest looks protected, the tests pass, and the PII ships. Measured
+// against the real trace, the blob is SINGLY encoded (one decodeURIComponent pass reaches plain JSON).
+//
+// ★ DESIGN — scrub-on-decoded, REPLACE-ONLY-ON-CHANGE:
+//   1) find maximal runs of `[^"\\\s]` that contain at least one %XX (the charset deliberately EXCLUDES
+//      `"` and `\` so a run can never straddle a JSON string boundary in the NDJSON the trace viewer
+//      parses line-by-line);
+//   2) decode the run (bounded, until stable), scrub the DECODED form with the SAME plain pipeline —
+//      so declared patterns and STRUCTURAL both apply to it, no second rule set to drift;
+//   3) if the scrub changed nothing, emit the run's ORIGINAL BYTES. Only a run that actually contained
+//      PII is rewritten, so the ~everything-else of a 38MB trace is byte-identical to before.
+//
+// ★ Re-encoding is MINIMAL, not encodeURIComponent: only `%`, `"`, `\` and whitespace/controls are
+//   percent-escaped. That is exactly what JSON-string safety and the run charset require, and it keeps
+//   `/ : , @ { }` readable instead of blanket-encoding them. A consumer that decodes once gets the same
+//   string either way, so the rewrite is semantically equivalent — just legible.
+//
+// ★ ACCEPTED TRADES (both are over-redaction, which redact.ts states is acceptable on a sensitive
+//   monitor): a run that was DOUBLE-encoded is re-emitted at single depth (real data is single, so this
+//   is a hypothetical), and a run whose encoding is MALFORMED (`%ZZ`, a lone `%`) cannot be decoded and
+//   is left untouched — decoding is impossible there, and the plain pass has already run over it.
+const ENCODED_RUN = /[^"\\\s]+/g;
+const HAS_PCT_ESCAPE = /%[0-9A-Fa-f]{2}/; // non-global on purpose: .test() on a /g regex is stateful
+const MAX_DECODE_PASSES = 3;
+
+/** Decode percent-escapes until stable (bounded). Returns null if the run is not validly encoded — the
+ *  caller then leaves it untouched rather than guessing. */
+function decodeDeep(run: string): string | null {
+  let cur = run;
+  for (let i = 0; i < MAX_DECODE_PASSES; i++) {
+    let next: string;
+    try {
+      next = decodeURIComponent(cur);
+    } catch {
+      return i === 0 ? null : cur; // malformed at the first pass = undecodable; later = stop where we got to
+    }
+    if (next === cur) return cur;
+    cur = next;
+  }
+  return cur;
+}
+
+/** Percent-escape ONLY what JSON-string safety and the ENCODED_RUN charset require. */
+function encodeMinimal(s: string): string {
+  // Single pass: each matching char is replaced once, so an emitted '%' is never re-encoded. \p{Cc}
+  // (Unicode control category) is included because a control char cannot appear raw in a JSON string
+  // either. Deliberately NOT `-` or `.`: keeping those raw is what leaves the emitted
+  // `<redacted-username>` / `<redacted>` markers greppable inside a rewritten run.
+  return s.replace(/[%"\\\s\p{Cc}]/gu, (c) => {
+    const code = c.charCodeAt(0);
+    return code < 0x80 ? `%${code.toString(16).toUpperCase().padStart(2, '0')}` : encodeURIComponent(c);
+  });
+}
+
+/**
+ * Scrub PII that is present only in percent-ENCODED form. See the block comment above for the design.
+ * Exported so the prove-can-fail test can assert this step is load-bearing: with it skipped, an encoded
+ * sentinel survives the plain scrub.
+ */
+export function scrubEncodedRegions(text: string, redact: Redactor): string {
+  return text.replace(ENCODED_RUN, (run) => {
+    if (!HAS_PCT_ESCAPE.test(run)) return run; // nothing encoded here — cheap reject, original bytes
+    const decoded = decodeDeep(run);
+    if (decoded === null) return run; // malformed encoding — untouched (documented trade)
+    const scrubbed = scrubPlainText(decoded, redact);
+    if (scrubbed === decoded) return run; // ★ no PII found — emit the ORIGINAL bytes, not a re-encode
+    return encodeMinimal(scrubbed);
+  });
+}
+
+/** The full text scrub: the plain-form pipeline, then the same pipeline again over any percent-ENCODED
+ *  run (which the plain pass is structurally blind to). Exported for direct unit-testing. */
+export function scrubTraceText(text: string, redact: Redactor): string {
+  return scrubEncodedRegions(scrubPlainText(text, redact), redact);
 }
 
 /**

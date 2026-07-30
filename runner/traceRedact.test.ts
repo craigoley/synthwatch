@@ -12,7 +12,13 @@ import AdmZip from 'adm-zip';
 import { writeFileSync, rmSync, mkdtempSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildRedactedTraceZip, classifyEntry, scrubTraceText } from './traceRedact.js';
+import {
+  buildRedactedTraceZip,
+  classifyEntry,
+  scrubTraceText,
+  scrubPlainText,
+  scrubEncodedRegions,
+} from './traceRedact.js';
 import { makeRedactor, IDENTITY_REDACTOR } from './redact.js';
 
 // mkdtemp per test (the secure temp-file pattern used by traceSignals.test.ts).
@@ -90,6 +96,109 @@ test('classifyEntry: NDJSON + text bodies scrub; images/fonts/unknown DROP (fail
   assert.equal(classifyEntry('resources/font.woff2'), 'drop');
   assert.equal(classifyEntry('resources/mystery.bin'), 'drop');
   assert.equal(classifyEntry('resources/noextension'), 'drop');
+});
+
+// ── ★★ PERCENT-ENCODED PII (decode-then-scrub) ──────────────────────────────────────────────────────
+// The member identity record found by the 2026-07-29 recon is stored percent-ENCODED in a DOM snapshot,
+// so a plain-form declared pattern matches NOTHING. These tests pin the decode pass AND prove it is
+// load-bearing: the same input is run WITHOUT the decode step and the sentinel must SURVIVE. A redaction
+// test that cannot fail proves nothing.
+
+// The real shape, reproduced from run 1087934's trace.trace (values replaced with test data).
+const IDENTITY_PLAIN =
+  '{"userInfo":{"email":"member@wegmans.test","firstName":"Testy","lastName":"McTest","loyaltyNumber":104735137,"name":"Testy McTest","phoneNumber":"2065550123"}}';
+const IDENTITY_ENCODED = encodeURIComponent(IDENTITY_PLAIN);
+// …as it actually appears: inside a hidden input's value in a serialized DOM snapshot NDJSON line.
+const SNAPSHOT_LINE = JSON.stringify({
+  type: 'frame-snapshot',
+  html: `["INPUT",{"__playwright_value_":"${IDENTITY_ENCODED}","type":"hidden","id":"tokenJson"}]`,
+});
+
+// The patterns a monitor would declare for the identity blob (see the monitors-manifest PR). Written in
+// PLAIN form — which is the whole point: the author writes what the JSON looks like, not what it looks
+// like percent-mangled.
+//
+// ★ The FIRST pattern takes the whole `userInfo` OBJECT rather than field-by-field. That is deliberate:
+// the blob's full-name field is the generic key `"name"`, which cannot be matched on its own without
+// hitting the thousands of unrelated `"name"` attributes in a serialized DOM (and every HAR header
+// pair). Redacting the container catches `name` — and any field the vendor adds later — without that
+// collateral. The per-field patterns that follow are defence-in-depth for the same values appearing
+// outside a userInfo wrapper.
+const IDENTITY_PATTERNS = [
+  '"userInfo"\\s*:\\s*\\{[^{}]*\\}',
+  '"loyaltyNumber"\\s*:\\s*"?\\d+"?',
+  '"phoneNumber"\\s*:\\s*"[^"]*"',
+  '"(firstName|lastName)"\\s*:\\s*"[^"]*"',
+];
+const identityRedactor = makeRedactor(IDENTITY_PATTERNS, []);
+
+test('★★ PROVE-CAN-FAIL: the percent-encoded sentinel SURVIVES the plain scrub (decode step disabled)', () => {
+  // This is the bug the decode pass exists to fix. If this assertion ever flips to "gone", the test
+  // below stops proving anything — the plain pipeline would be doing the work on its own.
+  const plainOnly = scrubPlainText(SNAPSHOT_LINE, identityRedactor);
+  assert.ok(plainOnly.includes('104735137'), 'plain-form patterns CANNOT see percent-encoded PII');
+  assert.ok(plainOnly.includes(encodeURIComponent('"loyaltyNumber"').slice(0, 12)), 'the encoded key is still there');
+});
+
+test('★★ decode-then-scrub CATCHES the percent-encoded identity blob', () => {
+  const out = scrubTraceText(SNAPSHOT_LINE, identityRedactor);
+  assert.ok(!out.includes('104735137'), 'loyaltyNumber must be gone');
+  assert.ok(!out.includes('2065550123'), 'phoneNumber must be gone');
+  assert.ok(!out.includes('Testy'), 'firstName/lastName must be gone');
+  assert.ok(!out.includes('McTest'), 'surname must be gone');
+  assert.match(out, /redacted/, 'and a redaction marker is present in its place');
+});
+
+test('★★ decode-then-scrub: the rewritten NDJSON line is STILL VALID JSON', () => {
+  // The trace viewer parses trace.trace line-by-line; an invalid line is silently dropped.
+  const out = scrubTraceText(SNAPSHOT_LINE, identityRedactor);
+  const parsed = JSON.parse(out) as { type: string; html: string };
+  assert.equal(parsed.type, 'frame-snapshot');
+  // The rewritten run still decodes, and what it decodes to carries no PII.
+  const decoded = decodeURIComponent(/"__playwright_value_":"([^"]*)"/.exec(parsed.html)![1]);
+  assert.ok(!decoded.includes('104735137'));
+  assert.ok(decoded.includes('redacted'), 'the decoded value shows the marker, so the trace stays legible');
+});
+
+test('★★ REPLACE-ONLY-ON-CHANGE: an encoded run with no PII keeps its ORIGINAL bytes', () => {
+  // A 38MB trace is almost entirely innocuous encoded text (URLs, query strings). Re-encoding all of it
+  // would be gratuitous churn, so a run that scrubs to itself must come back byte-identical.
+  const innocuous = JSON.stringify({
+    url: 'https://www.wegmans.com/shop/search?q=milk%20and%20eggs&sort=relevance%3Adesc',
+  });
+  assert.equal(scrubEncodedRegions(innocuous, identityRedactor), innocuous);
+});
+
+test('★★ decode pass never crosses a JSON string boundary (the run charset excludes " and \\)', () => {
+  // Two adjacent encoded values in one line: scrubbing the first must not consume the second's quotes.
+  const line = JSON.stringify({ a: encodeURIComponent(IDENTITY_PLAIN), b: 'keep%20me', c: 42 });
+  const out = scrubTraceText(line, identityRedactor);
+  const parsed = JSON.parse(out) as { a: string; b: string; c: number };
+  assert.equal(parsed.b, 'keep%20me', 'the untouched sibling value is byte-identical');
+  assert.equal(parsed.c, 42);
+  assert.ok(!parsed.a.includes('104735137'));
+});
+
+test('★★ malformed percent-encoding is left UNTOUCHED rather than guessed at (documented trade)', () => {
+  const bad = 'value=%ZZnot-really-encoded%and-a-lone-percent';
+  assert.equal(scrubEncodedRegions(bad, identityRedactor), bad);
+  // A lone '%' with no hex pair is not even a candidate — cheap-reject path, no decode attempted.
+  assert.equal(scrubEncodedRegions('100% plain text', identityRedactor), '100% plain text');
+});
+
+test('★★ the decode pass composes with the KNOWN-VALUE rules (an encoded credential is caught too)', () => {
+  // Not just declared patterns: a typed credential that the browser stored URL-encoded is now caught,
+  // which the plain escaped-literal rule could not see. CRED_USER is the right probe here — it contains
+  // an '@', so its encoded form genuinely differs from its plain form (CRED_PASS is alphanumeric and
+  // percent-encodes to ITSELF, so it would be caught by the plain pass and prove nothing).
+  const encodedUser = encodeURIComponent(CRED_USER);
+  assert.notEqual(encodedUser, CRED_USER, 'probe must actually change under encoding');
+  const line = JSON.stringify({ body: `user=${encodedUser}` });
+  assert.ok(scrubPlainText(line, redactor).includes(encodedUser), 'plain scrub misses the encoded form');
+  const out = scrubTraceText(line, redactor);
+  assert.ok(!out.includes(encodedUser), 'encoded credential value must be scrubbed');
+  assert.ok(!out.includes(CRED_USER), 'and it must not appear decoded either');
+  JSON.parse(out); // still valid JSON
 });
 
 test('scrubTraceText: HAR header pair — cookie/set-cookie/authorization VALUES redacted, JSON stays valid', () => {
