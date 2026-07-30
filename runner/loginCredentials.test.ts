@@ -9,11 +9,11 @@ import {
   clearLoginCredentials,
   credentialEnvKey,
   redactableCredValues,
-  NON_SECRET_CRED_ROLES,
+  CRED_USERNAME_CLEARTEXT_ALLOWANCE,
 } from './loginCredentials.js';
 import { credential } from './specfetch/specShim.js';
 import { encryptCredValue, loadCredEncKey } from './crypto.js';
-import { makeRedactor } from './redact.js';
+import { makeRedactor, MARKER_USERNAME } from './redact.js';
 
 const TEST_KEY_B64 = Buffer.from(Array.from({ length: 32 }, (_, i) => i)).toString('base64');
 const TOUCHED = ['CRED_ENC_KEY', 'SW_CRED_USERNAME', 'SW_CRED_PASSWORD', 'SW_SANDBOX'];
@@ -157,46 +157,96 @@ test('★ credential(role): the SANDBOX miss says preview creds never arrive (SW
   }
 });
 
-// ── ★ un-redact the non-secret TEST-ACCOUNT username (was blocking shop-flow login debugging) ──
-// The runner registered ALL resolved credential values into the redactor, so the typed username was scrubbed
-// from traces/logs and Craig couldn't see what username failed to log in. redactableCredValues excludes the
-// 'username' role (a non-secret identifier) while keeping the password (and any other role) redacted.
+// ── ★ the username cleartext allowance is PER-CHECK (was global) ────────────────────────────────────
+// The exemption's premise — "a shop-flow TEST-ACCOUNT username is a login identifier, not a secret" —
+// holds for a dedicated throwaway account and FAILS for a named person's corporate address. A global set
+// could not tell those apart, so the named-employee address sat in cleartext across ~937 retained trace
+// zips. It is now keyed off checks.source_key, defaulting to REDACT, with a distinct MARKER_USERNAME so
+// the login debuggability the exemption bought is not silently lost.
 
-test('redactableCredValues: EXCLUDES the username value, KEEPS the password value', () => {
-  const vals = redactableCredValues({ username: 'shopflow@wegmans.test', password: 'sup3r-secret-pw' });
-  assert.deepEqual(vals, ['sup3r-secret-pw']); // username dropped, password kept
+const ALLOWED_KEY = 'wegmans-authorized-user-add-to-cart'; // verified throwaway account
+const DENIED_KEY = 'wegmans-full-shop-flow'; // named employee's corporate address
+
+test('redactableCredValues: password is ALWAYS registered with the generic marker', () => {
+  for (const key of [ALLOWED_KEY, DENIED_KEY, undefined, null]) {
+    const vals = redactableCredValues({ password: 'sup3r-secret-pw' }, key);
+    assert.deepEqual(vals, ['sup3r-secret-pw'], `password must be redactable for source_key=${String(key)}`);
+  }
 });
 
-test('redactableCredValues: username exclusion is case-insensitive; unknown roles stay redacted (fail-closed)', () => {
-  const vals = redactableCredValues({ Username: 'a@test', password: 'pw-secret', totpSecret: 'otp-secret' });
-  assert.ok(!vals.includes('a@test'), 'username (any case) must be excluded');
-  assert.ok(vals.includes('pw-secret'), 'password must stay redactable');
-  assert.ok(vals.includes('otp-secret'), 'an UNKNOWN role must default to redactable (fail-closed)');
-  assert.deepEqual([...NON_SECRET_CRED_ROLES], ['username']); // only username is declared non-secret
+test('redactableCredValues: ALLOWED check leaves the username in cleartext (unregistered)', () => {
+  const vals = redactableCredValues({ username: 'sreordertest@gmail.test', password: 'pw-secret' }, ALLOWED_KEY);
+  assert.deepEqual(vals, ['pw-secret'], 'username must NOT be registered for an allowance-granted check');
 });
 
-test('through makeRedactor: username appears in CLEARTEXT, password is REDACTED (must-go-red both ways)', () => {
-  const resolved = { username: 'shopflow@wegmans.test', password: 'sup3r-secret-pw' };
-  const src = 'shop-flow login: entered username shopflow@wegmans.test with password sup3r-secret-pw';
+test('redactableCredValues: DENIED check registers the username under MARKER_USERNAME', () => {
+  // Order is irrelevant (makeRedactor sorts by value length), so assert on membership.
+  const vals = redactableCredValues({ username: 'a.person@wegmans.test', password: 'pw-secret' }, DENIED_KEY);
+  assert.equal(vals.length, 2);
+  assert.ok(vals.includes('pw-secret'), 'password registered with the generic marker');
+  assert.deepEqual(
+    vals.find((v) => typeof v === 'object'),
+    { value: 'a.person@wegmans.test', marker: MARKER_USERNAME },
+  );
+});
 
-  // NEW (the fix): only the password value is registered → username survives, password scrubbed.
-  const fixed = makeRedactor(null, redactableCredValues(resolved))(src);
-  assert.match(fixed, /shopflow@wegmans\.test/, 'username MUST be visible (the whole point)');
-  assert.doesNotMatch(fixed, /sup3r-secret-pw/, 'password value MUST still be scrubbed');
-  assert.match(fixed, /<redacted>/, 'the password was replaced by the redaction marker');
+test('redactableCredValues: fail-CLOSED — an unlisted or NULL source_key redacts the username', () => {
+  for (const key of ['some-other-monitor', undefined, null]) {
+    const vals = redactableCredValues({ username: 'a@test.example', password: 'pw-secret' }, key);
+    assert.ok(
+      vals.some((v) => typeof v === 'object' && v.value === 'a@test.example'),
+      `username must be REDACTED by default for source_key=${String(key)}`,
+    );
+  }
+  // Only the one verified-throwaway monitor holds the allowance today.
+  assert.deepEqual([...CRED_USERNAME_CLEARTEXT_ALLOWANCE], [ALLOWED_KEY]);
+});
 
-  // OLD (Object.values — the bug): ALL values registered → the username was ALSO scrubbed, hiding it from
-  // Craig. This proves the redactor was the mechanism and the role-filter is load-bearing.
-  const old = makeRedactor(null, Object.values(resolved))(src);
-  assert.doesNotMatch(old, /shopflow@wegmans\.test/, 'old behavior wrongly redacted the username');
+test('redactableCredValues: role match is case-insensitive; unknown roles stay generic (fail-closed)', () => {
+  const vals = redactableCredValues({ Username: 'a@test.example', password: 'pw-secret', totpSecret: 'otp-secret' }, DENIED_KEY);
+  assert.ok(
+    vals.some((v) => typeof v === 'object' && v.value === 'a@test.example'),
+    'Username (any case) is the identifier role → marked, not generic',
+  );
+  assert.ok(vals.includes('pw-secret'), 'password stays redactable');
+  assert.ok(vals.includes('otp-secret'), 'an UNKNOWN role defaults to redactable (fail-closed)');
+});
+
+test('through makeRedactor: DENIED check scrubs the username to a DISTINCT marker (must-go-red both ways)', () => {
+  const resolved = { username: 'a.person@wegmans.test', password: 'sup3r-secret-pw' };
+  const src = 'shop-flow login: entered username a.person@wegmans.test with password sup3r-secret-pw';
+
+  const denied = makeRedactor(null, redactableCredValues(resolved, DENIED_KEY))(src);
+  assert.doesNotMatch(denied, /a\.person@wegmans\.test/, 'the employee address MUST NOT survive — the whole point');
+  assert.doesNotMatch(denied, /sup3r-secret-pw/, 'password value MUST still be scrubbed');
+  assert.match(denied, /<redacted-username>/, 'the username is scrubbed-but-PRESENT (debuggability preserved)');
+  assert.match(denied, /<redacted>/, 'the password took the generic marker');
+
+  // The other direction: the allowance really does still produce cleartext, so the marker above is the
+  // per-check branch doing work and not a blanket change.
+  const allowed = makeRedactor(null, redactableCredValues(resolved, ALLOWED_KEY))(src);
+  assert.match(allowed, /a\.person@wegmans\.test/, 'an allowance-granted check keeps the username visible');
+  assert.doesNotMatch(allowed, /<redacted-username>/, 'and emits no username marker');
+});
+
+test('the two markers are DISTINGUISHABLE — a username scrub is never confused with a secret scrub', () => {
+  const redact = makeRedactor(null, redactableCredValues({ username: 'u@test.example', password: 'pw-secret' }, DENIED_KEY));
+  const out = redact('user=u@test.example pass=pw-secret');
+  assert.equal(out, 'user=<redacted-username> pass=<redacted>');
 });
 
 test('no regression: cookies / authorization / session tokens still redacted (built-in key rules intact)', () => {
-  // The username exclusion only affects the credential-VALUE literal set; the built-in key-shape denylist
+  // The username handling only affects the credential-VALUE literal set; the built-in key-shape denylist
   // (cookie/authorization/token=/session_id=/jwt=…) is untouched.
-  const redact = makeRedactor(null, redactableCredValues({ username: 'shopflow@wegmans.test', password: 'pw-secret' }));
+  const redact = makeRedactor(null, redactableCredValues({ username: 'shopflow@wegmans.test', password: 'pw-secret' }, ALLOWED_KEY));
   const s = redact('set-cookie: session=abc123deadbeef; authorization: Bearer eyJraeReallyLongTokenValue; token=zzz9secret9value');
   assert.doesNotMatch(s, /abc123deadbeef/, 'session cookie value still redacted');
   assert.doesNotMatch(s, /eyJraeReallyLongTokenValue/, 'bearer token still redacted');
   assert.doesNotMatch(s, /zzz9secret9value/, 'token= value still redacted');
+});
+
+test('a marker containing $ cannot act as a String.replace substitution pattern', () => {
+  // Defensive: markers are our own constants today, but makeRedactor now takes them from callers.
+  const redact = makeRedactor(null, [{ value: 'secret-value', marker: '<$&$1>' }]);
+  assert.equal(redact('x secret-value y'), 'x <$&$1> y');
 });
