@@ -14,6 +14,8 @@ import {
   rcaScreenshotUrls,
   isDeterministicInfraError,
   infraDeterministicResult,
+  normalizeSignatureText,
+  signatureOf,
   type RcaFacts,
 } from './rca.js';
 import type { Check } from './db.js';
@@ -359,4 +361,94 @@ test('★ the deterministic-infra matcher is NARROW — infra launch errors matc
   ]) {
     assert.equal(isDeterministicInfraError(e), false, `should NOT match: ${String(e).slice(0, 50)}`);
   }
+});
+
+// ── ★ SIGNATURE NORMALISATION (2026-07-30) ──────────────────────────────────────────────────────────
+// narrative.ts's repeat-offender aggregate groups incidents by rca->>'signature' with HAVING count(*) >= 2.
+// It had NEVER fired — 0 of 38 stored narratives contained the line — because the raw error message embeds
+// per-run values, so every recurrence hashed unique. The strings below are the REAL error_message values
+// from check 355's incidents 219 and 223: the same defect, differing only in a diagnostic FLAG STRING
+// (oos1/oos0) and an item COUNT (8/5).
+
+const INCIDENT_219_ERR =
+  '[full-shop-flow] STEP-FAIL verify-cart-4 url=www.wegmans.com/cart f=li1sgn0cart0chk0ful1slot0oos1 ' +
+  'c=[‹control›,‹greeting›,Pickup] :: verify-cart-4: cart has 8 item(s) (>4) — baseline clear-cart did ' +
+  'not empty leftover items; clearing failed — expected 8 to be <= 4';
+const INCIDENT_223_ERR =
+  '[full-shop-flow] STEP-FAIL verify-cart-4 url=www.wegmans.com/cart f=li1sgn0cart0chk0ful1slot0oos0 ' +
+  'c=[‹control›,‹greeting›,Pickup] :: verify-cart-4: cart has 5 item(s) (>4) — baseline clear-cart did ' +
+  'not empty leftover items; clearing failed — expected 5 to be <= 4';
+
+test('★★ the REAL incidents 219 and 223 now hash to the SAME signature (the repeat-offender fix)', () => {
+  const a = signatureOf(355, INCIDENT_219_ERR, 'verify-cart-4');
+  const b = signatureOf(355, INCIDENT_223_ERR, 'verify-cart-4');
+  assert.equal(a, b, 'the same defect must produce one signature so HAVING count(*) >= 2 can see it');
+
+  // MUST-GO-RED the other way: the UN-normalised inputs really were different, so this test is not
+  // vacuously true — normalisation is doing the work, not a coincidence of the strings.
+  assert.notEqual(
+    `355|${INCIDENT_219_ERR.slice(0, 300)}|verify-cart-4`,
+    `355|${INCIDENT_223_ERR.slice(0, 300)}|verify-cart-4`,
+    'the raw strings differ — that difference is exactly why the aggregate never fired',
+  );
+});
+
+test('★ genuinely DIFFERENT failures keep DIFFERENT signatures (over-normalising is the worse error)', () => {
+  // Real messages from check 355: a banana selector failure vs an add-to-cart affordance failure vs a
+  // search-result failure. Same check, same step — only the TEXT differs, so they must stay distinct.
+  const buyBox =
+    '[full-shop-flow] STEP-FAIL add-bananas url=www.wegmans.com/shop/product/92685-Bananas-Sold-by ' +
+    'f=li0sgn0cart0chk0ful0slot0oos0 c=[‹control›,Home] :: add-bananas: the main buy-box "Add to Cart"';
+  const affordance =
+    '[full-shop-flow] STEP-FAIL add-bananas url=www.wegmans.com/shop/product/92928-Sweet-Cherries ' +
+    'f=li0sgn0cart0chk0ful1slot0oos0 c=[‹control›,Delivery] :: add-bananas: Add to Cart affordance not found';
+  const noBanana =
+    '[full-shop-flow] STEP-FAIL add-bananas url=www.wegmans.com/shop/search ' +
+    'f=li1sgn0cart0chk0ful0slot0oos0 c=[‹control›,‹greeting›,Pickup] :: add-bananas: no actual banana in the results';
+  const sigs = new Set([
+    signatureOf(355, buyBox, 'add-bananas'),
+    signatureOf(355, affordance, 'add-bananas'),
+    signatureOf(355, noBanana, 'add-bananas'),
+  ]);
+  assert.equal(sigs.size, 3, 'three distinct failure texts must remain three signatures');
+
+  // A selector failure and a checkout timeout are different steps AND different text.
+  assert.notEqual(
+    signatureOf(355, buyBox, 'add-bananas'),
+    signatureOf(355, '[full-shop-flow] STEP-FAIL checkout-pickup :: Timeout 20000ms exceeded', 'checkout-pickup'),
+  );
+});
+
+test('★ a run of 3+ digits SURVIVES — HTTP 500 and HTTP 502 must not merge (measured false-merge guard)', () => {
+  // Check 80, step "add cheese pizza to cart". A blanket /\d+/ → '#' merged these two into one signature;
+  // that was the ONLY false merge in 30 days of fleet messages, and this rule is chosen to avoid it.
+  const s500 = signatureOf(80, 'GATE-E: cart-items responded HTTP 500, expected 200. — expected 500 to be 200', 'add cheese pizza to cart');
+  const s502 = signatureOf(80, 'GATE-E: cart-items responded HTTP 502, expected 200. — expected 502 to be 200', 'add cheese pizza to cart');
+  assert.notEqual(s500, s502, 'different upstream statuses are different failures');
+  // …and the blanket rule really would have merged them (proves the lookaround is load-bearing).
+  const blanket = (s: string) => s.replace(/\d+/g, '#');
+  assert.equal(
+    blanket('responded HTTP 500, expected 200'),
+    blanket('responded HTTP 502, expected 200'),
+    'a blanket digit mask collapses them — which is why this rule anchors to maximal runs of <= 2',
+  );
+});
+
+test('normalizeSignatureText: masks maximal 1-2 digit runs, leaves 3+ digit runs intact', () => {
+  assert.equal(normalizeSignatureText('f=li1sgn0cart0oos1'), 'f=li#sgn#cart#oos#');
+  assert.equal(normalizeSignatureText('cart has 5 item(s)'), 'cart has # item(s)');
+  assert.equal(normalizeSignatureText('cart has 12 item(s)'), 'cart has # item(s)'); // 2 digits also mask
+  assert.equal(normalizeSignatureText('HTTP 500'), 'HTTP 500'); // 3 digits survive
+  assert.equal(normalizeSignatureText('Timeout 20000ms'), 'Timeout 20000ms'); // 5 digits survive
+  assert.equal(normalizeSignatureText('no digits here'), 'no digits here');
+});
+
+test('★ signatureOf normalises ONLY the message — check_id and failed_step stay exact', () => {
+  // Masking the id/step would collide different monitors and different steps: a recurrence signal turned
+  // into a cross-monitor collision, which is strictly worse than no signal.
+  assert.notEqual(signatureOf(355, 'same text', 'step'), signatureOf(358, 'same text', 'step'));
+  assert.notEqual(signatureOf(355, 'same text', 'step-1'), signatureOf(355, 'same text', 'step-2'));
+  // The step's digit is masked INSIDE the message text but preserved in the step segment.
+  assert.ok(signatureOf(355, 'at verify-cart-4', 'verify-cart-4').endsWith('|verify-cart-4'));
+  assert.ok(signatureOf(355, 'at verify-cart-4', 'verify-cart-4').includes('at verify-cart-#'));
 });
