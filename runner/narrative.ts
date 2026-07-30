@@ -18,7 +18,33 @@ import { costRatePerActiveSecond, freeGrantDollars, reconcileTargetMonthly } fro
 import { normalizeSignatureText } from './rca.js';
 
 const WINDOW = '7d';
-const WINDOW_DAYS = 7;
+export const WINDOW_DAYS = 7;
+
+/**
+ * ★ THE MONITOR-DEFECT WINDOW — DELIBERATELY LONGER THAN WINDOW_DAYS. DO NOT UNIFY THEM.
+ *
+ * They answer different questions, so they are different constants with different names (the same rule
+ * that keeps countable_run / latency_sample / flake-budget windows separate rather than collapsed into
+ * one "the window"):
+ *
+ *   • WINDOW_DAYS (7d) answers "WHAT CHANGED RECENTLY". Availability deltas, p95 movement, incident
+ *     counts and the week-over-week comparison are all only meaningful against a recent, short baseline.
+ *     Widening it would blur exactly the change it exists to detect.
+ *
+ *   • DEFECT_WINDOW_DAYS (30d) answers "IS THIS CHECK TRUSTWORTHY AT ALL". A wrong assertion stays wrong
+ *     for weeks; a monitor that was broken for four days three weeks ago is STILL a broken monitor. On 7d
+ *     that history is simply gone.
+ *
+ * ★ MEASURED, and this is why the constant exists (2026-07-30): check 396 is the loudest defect in the
+ *   fleet — 101 failures, ONE signature, 75% of its window — and was INVISIBLE at 7d because those
+ *   failures fell on 07-17..07-20. Correct windowed behaviour; wrong horizon for the question.
+ *
+ * ★ THE THRESHOLDS WERE RE-MEASURED AGAINST THIS WINDOW, not assumed to carry over. A longer window has
+ *   more runs, so the SHARE term shrinks for the same defect (check 355 verify-cart-4: 15.02% at 7d ->
+ *   5.75% at 30d) — but it still clears the 3% floor, and the fleet fire-count is UNCHANGED at 3. See
+ *   the guard constants for the full measurement.
+ */
+export const DEFECT_WINDOW_DAYS = 30;
 
 export interface PeriodFacts {
   from: string;
@@ -344,9 +370,20 @@ export interface DefectCandidate {
 //       cart" = 28.0, against add-bananas 3.5 / clear-cart 2.3 / checkout-pickup 2.0 / add-milk 1.0.
 //     • SHARE of the window: this is the guard that stops a ratio alone from over-firing, and it is
 //       load-bearing on REAL data — check 192 "assert a downloadable menu PDF is present" scores 5 fails
-//       with 1 signature (ratio 5.0, clearing BOTH the volume floor and the ratio) but only 0.75% of its
+//       with 1 signature (ratio 5.0, clearing BOTH the volume floor and the ratio) but only 0.22% of its
 //       window, so the share term is the only thing that excludes it. Five failures spread thinly across
-//       two weeks is an intermittent target; 7% of every run failing identically is a broken assertion.
+//       a month is an intermittent target; 75% of every run failing identically is a broken assertion.
+//
+// ★ RE-MEASURED against DEFECT_WINDOW_DAYS=30 (2026-07-30) — the thresholds were NOT assumed to carry
+//   over from the 7d calibration. Fleet at 30d: 14 steps clear the volume floor, 8 also clear the ratio,
+//   and exactly 3 clear all three — check 396's two steps (101/1/75.4% and 28/1/20.9%) and check 355
+//   verify-cart-4 (45/2/5.8%). SAME fire-count as the 7d calibration, so no recalibration was needed.
+//   ★ AND THE SHARE TERM GOT MORE LOAD-BEARING, not less: at 7d it excluded 1 candidate, at 30d it
+//   excludes 5 — check 77 (11 fails/1 sig/0.20%), check 81 (10/1/0.09%), check 80 (6/1/0.10%),
+//   check 194 (5/1/0.13%) and check 192 (5/1/0.22%). Those are HIGH-FREQUENCY monitors: thousands of
+//   runs a month, so a handful of identical failures is genuine intermittency, not a broken assertion.
+//   Without the share term a 30d window would fire on 8 instead of 3 — it is what makes the longer
+//   horizon safe.
 const DEFECT_MIN_FAILS = 5;
 const DEFECT_MIN_RATIO = 5;
 const DEFECT_MIN_SHARE_PCT = 3;
@@ -522,9 +559,12 @@ export async function computeFactPack(
   //   A wrong assertion emits ONE error string forever; genuinely flaky target behaviour DRIFTS (different
   //   timeouts, elements, counts) or resolves. This is the distinction the RCA taxonomy could not make:
   //   flaky-transient means "ignore", so a recurring monitor bug wearing that label suppresses its own fix.
-  const defects = await monitorDefectCandidates(checkId, curStart.toISOString(), end.toISOString());
+  //   ★ Runs over DEFECT_WINDOW_DAYS, NOT the 7d report window — see that constant for why the two differ.
+  //   Everything else in this fact pack is week-over-week by design; this one question is not.
+  const defectStart = new Date(end.getTime() - DEFECT_WINDOW_DAYS * 86_400_000);
+  const defects = await monitorDefectCandidates(checkId, defectStart.toISOString(), end.toISOString());
   for (const d of defects) {
-    const line = monitorDefectLine(d, WINDOW_DAYS, scope.type);
+    const line = monitorDefectLine(d, DEFECT_WINDOW_DAYS, scope.type);
     anomalies.push(line);
     criticalFindings.push({ token: d.step, line });
   }

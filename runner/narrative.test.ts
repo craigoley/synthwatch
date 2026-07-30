@@ -13,6 +13,8 @@ import {
   ensureAnomaliesDelivered,
   type FactPack,
   type Narrative,
+  WINDOW_DAYS,
+  DEFECT_WINDOW_DAYS,
   type DefectCandidate,
 } from './narrative.js';
 
@@ -327,4 +329,81 @@ test('★ DELIVERY reaches the FALLBACK path too (buildFallback slices highlight
     [delivered.headline, delivered.body, ...delivered.highlights].join(' ').includes('verify-cart-4'),
     'the deterministic output carries it too',
   );
+});
+
+// ── ★ THE MONITOR-DEFECT WINDOW IS ITS OWN, LONGER HORIZON (2026-07-30) ─────────────────────────────
+// Availability deltas answer "what changed recently" (7d). The defect discriminator answers "is this
+// check trustworthy at all", and a wrong assertion stays wrong for weeks. Check 396 is the proof: 101
+// failures, ONE signature, 75% of its window — and INVISIBLE at 7d because they fell on 07-17..07-20.
+
+test('★ the two windows are DIFFERENT constants — do not unify them', () => {
+  assert.equal(WINDOW_DAYS, 7, 'the report window stays short: it measures CHANGE');
+  assert.equal(DEFECT_WINDOW_DAYS, 30, 'the defect window is long: it measures TRUSTWORTHINESS');
+  assert.ok(
+    DEFECT_WINDOW_DAYS > WINDOW_DAYS,
+    'a monitor broken for four days three weeks ago is still a broken monitor — 7d cannot see it',
+  );
+});
+
+test('★★ check 396 FIRES at 30d and is INVISIBLE at 7d — the reason this window exists', () => {
+  // MEASURED: 101 failures / 1 signature over the 134 countable runs it has in a 30d window.
+  const at30 = { checkId: 396, checkName: 'Wegmans Authorized User Add to Cart', step: 'Open cart and verify item', fails: 101, signatures: 1, windowRuns: 134 };
+  assert.equal(isMonitorDefectShape(at30), true, '75.4% of runs failing identically — the loudest defect in the fleet');
+  assert.equal(isMonitorDefectShape({ ...at30, step: 'Add item to cart', fails: 28 }), true, '20.9% — its second step');
+
+  // At 7d those failures are OUTSIDE the window entirely: zero failures reach the predicate, so it
+  // cannot fire however broken the check is. That is the gap the longer horizon closes.
+  assert.equal(isMonitorDefectShape({ ...at30, fails: 0, windowRuns: 0 }), false, 'invisible at 7d');
+});
+
+test('★★ check 192 stays EXCLUDED at BOTH windows — the share guard survives the window change', () => {
+  // 5 failures / 1 signature at both horizons; only the denominator grows. It clears the volume floor
+  // AND the ratio at both, so the SHARE term is the only thing excluding it — at either window.
+  const at7 = { checkId: 192, checkName: 'Amore', step: 'assert a downloadable menu PDF is present', fails: 5, signatures: 1, windowRuns: 669 };
+  const at30 = { ...at7, windowRuns: 2248 };
+  for (const [label, c] of [['7d', at7], ['30d', at30]] as const) {
+    assert.ok(c.fails >= 5, `${label}: clears the volume floor`);
+    assert.ok(c.fails / c.signatures >= 5, `${label}: clears the ratio`);
+    assert.equal(isMonitorDefectShape(c), false, `${label}: still excluded, by SHARE alone`);
+  }
+  // A longer window makes the exclusion STRONGER, not weaker: 0.75% -> 0.22%.
+  assert.ok((100 * at30.fails) / at30.windowRuns < (100 * at7.fails) / at7.windowRuns);
+
+  // MUST-GO-RED at both windows: drop the share term and 192 fires either way.
+  const withoutShare = (c: DefectCandidate) => c.fails >= 5 && c.fails / c.signatures >= 5;
+  assert.equal(withoutShare(at7), true, 'without share: over-fires at 7d');
+  assert.equal(withoutShare(at30), true, 'without share: over-fires at 30d too');
+});
+
+test('★ at 30d the share term excludes MORE, not less — it is what makes the long horizon safe', () => {
+  // The high-frequency monitors that only become candidates at 30d: thousands of runs a month, so a
+  // handful of identical failures is genuine intermittency. All clear volume AND ratio; all excluded.
+  const highFrequency: DefectCandidate[] = [
+    { checkId: 77, checkName: null, step: 'open the first dinner recipe', fails: 11, signatures: 1, windowRuns: 5532 },
+    { checkId: 81, checkName: null, step: 'assert the homepage rendered', fails: 10, signatures: 1, windowRuns: 11537 },
+    { checkId: 80, checkName: null, step: 'open meals2go.com landing', fails: 6, signatures: 1, windowRuns: 6116 },
+    { checkId: 194, checkName: null, step: 'assert both location links are present', fails: 5, signatures: 1, windowRuns: 3749 },
+  ];
+  for (const c of highFrequency) {
+    assert.ok(c.fails >= 5 && c.fails / c.signatures >= 5, `check ${c.checkId} clears volume + ratio`);
+    assert.equal(isMonitorDefectShape(c), false, `check ${c.checkId} excluded by share`);
+  }
+  // Fleet measurement: 8 candidates clear volume+ratio at 30d, only 3 clear all three.
+  const all = [...highFrequency,
+    { checkId: 192, checkName: null, step: 'menu pdf', fails: 5, signatures: 1, windowRuns: 2248 },
+    { checkId: 396, checkName: null, step: 'Open cart and verify item', fails: 101, signatures: 1, windowRuns: 134 },
+    { checkId: 396, checkName: null, step: 'Add item to cart', fails: 28, signatures: 1, windowRuns: 134 },
+    { checkId: 355, checkName: null, step: 'verify-cart-4', fails: 45, signatures: 2, windowRuns: 783 },
+  ];
+  assert.equal(all.filter((c) => c.fails >= 5 && c.fails / c.signatures >= 5).length, 8, 'clear volume+ratio');
+  assert.equal(all.filter(isMonitorDefectShape).length, 3, 'clear all three — unchanged from the 7d calibration');
+});
+
+test('★ the line states the DEFECT window, not the report window', () => {
+  const line = monitorDefectLine(
+    { checkId: 355, checkName: null, step: 'verify-cart-4', fails: 45, signatures: 2, windowRuns: 783 },
+    DEFECT_WINDOW_DAYS,
+  );
+  assert.match(line, /30d/, 'a reader must not think this is a 7d figure');
+  assert.ok(!line.includes(' 7d'), 'the report window must not leak into the defect line');
 });
