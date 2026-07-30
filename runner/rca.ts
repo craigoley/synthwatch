@@ -77,9 +77,41 @@ export function rcaEnabled(): boolean {
   return Boolean(ENDPOINT && DEPLOYMENT);
 }
 
-/** check_id|error|failed_step — the cache signature (bounded, stable per failure mode). */
-function signatureOf(checkId: number, errorMessage: string | null, failedStep: string | null): string {
-  return `${checkId}|${(errorMessage ?? '').slice(0, 300)}|${failedStep ?? ''}`;
+/**
+ * Mask the VARIABLE numerics in an error message so the same failure mode hashes the same.
+ *
+ * ★ WHY (2026-07-30 recon). narrative.ts's repeat-offender aggregate groups incidents by
+ *   `rca->>'signature'` with `HAVING count(*) >= 2` and reports "N incidents with the same failure
+ *   signature". It had NEVER fired — 0 of 38 stored narratives contained the line — because the raw
+ *   message embeds per-run values, so every recurrence hashed unique. Check 355's two verify-cart-4
+ *   incidents differed ONLY here:
+ *     219: …f=li1sgn0cart0chk0ful1slot0oos1 … cart has 8 item(s)
+ *     223: …f=li1sgn0cart0chk0ful1slot0oos0 … cart has 5 item(s)
+ *   — a diagnostic FLAG STRING and an item COUNT. Same defect, two signatures, no signal. The 24h RCA
+ *   cache missed for the same reason, so an identical failure was re-analysed from scratch every time.
+ *
+ * ★ ONLY MAXIMAL RUNS OF 1-2 DIGITS ARE MASKED; a run of 3+ digits is left ALONE. Over-normalising
+ *   collides genuinely different failures, which is the worse error, so this is deliberately the
+ *   narrower rule. Measured over 30 days of real fleet messages (89 distinct check|step|message rows):
+ *     • this rule            → 81 signatures (8 collapsed, ALL of them a flag-string/count recurrence)
+ *     • blanket /\d+/ → '#'  → 80 signatures (9 collapsed — the extra one is a FALSE merge: check 80's
+ *                              "responded HTTP 500" and "HTTP 502" became one signature)
+ *   Keeping 3+ digit runs intact preserves HTTP statuses, ports, and long ids while still collapsing
+ *   the 1-digit flag string and the small counts that actually vary. `\d{1,2}` alone does NOT work —
+ *   it chews a 3-digit run into two matches (500 → '#' + '#'); the lookaround anchors it to a MAXIMAL
+ *   run, which is what makes 3+ survive.
+ */
+export function normalizeSignatureText(s: string): string {
+  return s.replace(/(?<!\d)\d{1,2}(?!\d)/g, '#');
+}
+
+/** check_id|error|failed_step — the cache signature (bounded, stable per failure mode).
+ *  ★ Only the MESSAGE is normalised. check_id and failed_step are identifiers, not variable data:
+ *  masking them would collide different checks (355 vs 358) and different steps (step-1 vs step-2),
+ *  turning a recurrence signal into a cross-monitor collision. The step therefore stays exact even
+ *  though its digit is masked inside the message text. */
+export function signatureOf(checkId: number, errorMessage: string | null, failedStep: string | null): string {
+  return `${checkId}|${normalizeSignatureText((errorMessage ?? '').slice(0, 300))}|${failedStep ?? ''}`;
 }
 
 const SYSTEM_PROMPT = `You are a site-reliability failure classifier for a synthetic monitoring tool. A monitored check just FAILED and opened an incident. Classify the failure and explain it for an on-call engineer.
