@@ -194,7 +194,7 @@ export function extractTraceSignals(
             // Whole-entry decode (identical bytes to AdmZip getData().toString('utf8')), then run the
             // extractor NOW and let the raw text + chunks go out of scope — only the compact summary survives.
             const text = Buffer.concat(chunks).toString('utf8');
-            if (name === TRACE_NETWORK) network = extractNetwork(text, targetHost);
+            if (name === TRACE_NETWORK) network = extractNetwork(text, targetHost, redact);
             else consoleSummary = extractConsole(text, targetHost, redact);
             zip.readEntry();
           });
@@ -229,9 +229,47 @@ interface Req {
   method: string;
 }
 
+// An account-identifier GUID sitting in a URL PATH SEGMENT — the shape the 2026-07-29 recon found at
+// rest in trace_signals: /commerce/instacart/fulfillment/users/<guid>/link. No token-shape rule can see
+// it (it is not a `key=value`), and it is the member's stable commercetools customer key.
+const GUID_PATH_SEGMENT = /\/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}(?=[/?#]|$)/g;
+
+/**
+ * The URL as PERSISTED into trace_signals.
+ *
+ * ★ DELIBERATE C#-PARITY DIVERGENCE, SENSITIVE MONITORS ONLY. See the raw-url note at the `slim`
+ * builder below: network urls are stored raw to byte-match the C# extractor, and #171/#172 fought to
+ * make that true. That parity is PRESERVED for every non-sensitive monitor — the identity redactor
+ * short-circuits to the untouched url, so the golden fixture (captured with a non-sensitive redactor)
+ * and the C# port stay byte-identical.
+ *
+ * For a SENSITIVE monitor we now diverge on purpose. The recon measured two things at rest in
+ * runs.trace_signals: a 478-char SignalR `access_token=<jwt>` in a query string (1,555 urls), and the
+ * member's account GUID in a PATH SEGMENT (2 runs). The parity comment already conceded that "a
+ * divergence here only shows on a sensitive input, which the golden guard can't see" — that cuts both
+ * ways: the golden guard also cannot NOTICE this divergence, so it costs the cross-repo contract
+ * nothing while removing real PII from a DB column that is never redacted anywhere else.
+ *
+ * The redactor supplies the token half (its builtin denylist already scrubs `access_token=` and any
+ * JWT); GUID_PATH_SEGMENT supplies the path half, which no key=value rule could reach.
+ */
+export function scrubNetworkUrl(url: string, redact: Redactor): string {
+  // Reference-equality on IDENTITY_REDACTOR is how this module already distinguishes sensitive from
+  // non-sensitive (extractConsole does the same via its default param) — index.ts hands us either
+  // makeRedactor(...) or IDENTITY_REDACTOR exactly. Non-sensitive ⇒ untouched, so C# parity holds.
+  if (redact === IDENTITY_REDACTOR) return url;
+  // ★ GUID_PATH_SEGMENT runs BEFORE the redactor, not after. A monitor may also declare a broader
+  // path pattern (the manifest declares `/users/<guid>`), and if that ran first it would swallow the
+  // `/users` segment too, leaving `…/fulfillment<redacted>/link`. Replacing the GUID alone first
+  // yields `…/fulfillment/users/<redacted-id>/link` — same PII removed, more route left to debug with,
+  // and the declared pattern then finds no GUID to match. Order is cosmetic for safety, real for signal.
+  return redact(url.replace(GUID_PATH_SEGMENT, '/<redacted-id>'));
+}
+
 export function extractNetwork(
   networkNdjson: string,
   targetHost: string | null,
+  redact: Redactor = IDENTITY_REDACTOR,
 ): NetworkSummary {
   const reqs: Req[] = [];
   for (const line of lines(networkNdjson)) {
@@ -256,12 +294,14 @@ export function extractNetwork(
     });
   }
 
-  // Store the url RAW — byte-matching C# (TraceRequestDto Slim stores r.Url; FromZip has no redactor). Network
-  // urls are NEVER redacted, completing the raw-URL parity #171 started for mutation urls: a divergence here (as
-  // the runner did before) only shows on a sensitive input, which the golden guard can't see. Redaction on the
-  // persist path is now scoped to console TEXT only (extractConsole below), not network urls.
+  // Store the url RAW — byte-matching C# (TraceRequestDto Slim stores r.Url; FromZip has no redactor),
+  // completing the raw-URL parity #171 started for mutation urls.
+  // ★ AMENDED: raw for every NON-SENSITIVE monitor (unchanged, golden-guarded), but a SENSITIVE monitor
+  // now goes through scrubNetworkUrl — see its doc comment for why that divergence is deliberate and why
+  // it costs the C# contract nothing. Only the PERSISTED url is scrubbed; r.url stays raw for hostOf()
+  // grouping and the first-party predicate, so third-party classification is byte-identical either way.
   const slim = (r: Req): TraceRequest => ({
-    url: r.url,
+    url: scrubNetworkUrl(r.url, redact),
     status: r.status,
     resourceType: r.rtype,
     timeMs: r.time,
@@ -319,13 +359,16 @@ export function extractNetwork(
     topThirdParties,
     // ★ The action(s) under test: every mutating request + the status the site returned, in first-seen order,
     // capped at 12 — mirrors C# TraceExtractor.ExtractNetwork's Mutations (Where(MutatingMethods).Take(12)).
-    // ★ The url is stored RAW — NOT redacted — to byte-match C# (MutationDto(r.Method, r.Url, r.Status): FromZip
-    // has no redactor, so it stores the raw url). This is a faithful-port parity requirement: redacting here
-    // (as #169 did) diverges from C# on a sensitive input — the exact drift the golden guard exists to prevent.
+    // ★ The url is stored RAW for a NON-SENSITIVE monitor — byte-matching C# (MutationDto(r.Method, r.Url,
+    // r.Status): FromZip has no redactor, so it stores the raw url), which is the faithful-port parity
+    // requirement #169 broke and #171/#172 restored. A SENSITIVE monitor takes the same scrubNetworkUrl
+    // divergence as `slim` above (that comment carries the full reasoning) — mutation urls are where the
+    // recon actually found the account GUID in a path segment, so leaving this one raw would have left the
+    // measured leak in place.
     mutations: reqs
       .filter((r) => MUTATING_METHODS.has(r.method.toUpperCase()))
       .slice(0, MUTATION_CAP)
-      .map((r) => ({ method: r.method, url: r.url, status: r.status })),
+      .map((r) => ({ method: r.method, url: scrubNetworkUrl(r.url, redact), status: r.status })),
   };
 }
 

@@ -17,7 +17,7 @@ import { createRequire } from 'node:module';
 // singleton. Grab THAT object (the ESM `import * as fs` namespace is a frozen wrapper adm-zip never sees) so the
 // memory-bound test below can spy on the whole-file read and prove the streaming extractor never performs it.
 const fsCjs = createRequire(import.meta.url)('node:fs') as typeof import('node:fs');
-import { extractNetwork, extractConsole, extractTraceSignals } from './traceSignals.js';
+import { extractNetwork, extractConsole, extractTraceSignals, scrubNetworkUrl } from './traceSignals.js';
 import { canonicalizeConsole } from './transientClass.js';
 import { makeRedactor, IDENTITY_REDACTOR } from './redact.js';
 
@@ -290,14 +290,90 @@ test('network mutations are capped at 12 in first-seen order (parity with C# Mut
   assert.equal(n.mutations[11].url, 'https://www.wegmans.com/api/x11'); // the 13th–15th dropped
 });
 
-// ★ PARITY: the mutation url is stored RAW to byte-match C# (MutationDto stores r.Url; FromZip has no redactor).
-// extractNetwork takes NO redactor at all — network-url redaction is structurally impossible now, so a
-// session-token-carrying url is stored raw (the fleet's store-more policy; these are non-sensitive monitors).
-test('the mutation url is stored RAW (not redacted), byte-matching C#', () => {
+// ★ PARITY: for a NON-SENSITIVE monitor the mutation url is stored RAW to byte-match C# (MutationDto
+// stores r.Url; FromZip has no redactor), so a session-token-carrying url is stored raw (the fleet's
+// store-more policy). extractNetwork's redactor param DEFAULTS to identity, which short-circuits
+// scrubNetworkUrl — so omitting it, as every non-sensitive caller does, is byte-identical to before.
+test('the mutation url is stored RAW for a NON-SENSITIVE monitor, byte-matching C#', () => {
   const ndjson =
     '{"type":"resource-snapshot","snapshot":{"_resourceType":"fetch","time":10,"timings":{"wait":5},"request":{"url":"https://www.wegmans.com/shop/cart?session=SECRET123&item=42","method":"POST"},"response":{"status":201,"_transferSize":100,"content":{"size":50}}}}';
-  const n = extractNetwork(ndjson, TARGET);
-  assert.equal(n.mutations[0].url, 'https://www.wegmans.com/shop/cart?session=SECRET123&item=42');
+  assert.equal(
+    extractNetwork(ndjson, TARGET).mutations[0].url,
+    'https://www.wegmans.com/shop/cart?session=SECRET123&item=42',
+  );
+  // …and explicitly passing the identity redactor is the same thing (the parity short-circuit).
+  assert.equal(
+    extractNetwork(ndjson, TARGET, IDENTITY_REDACTOR).mutations[0].url,
+    'https://www.wegmans.com/shop/cart?session=SECRET123&item=42',
+  );
+});
+
+// ── ★ SENSITIVE monitors: the deliberate C#-parity divergence on PERSISTED network urls ──────────────
+// The recon measured two PII classes at rest in runs.trace_signals — a 478-char SignalR
+// `access_token=<jwt>` in a query string (1,555 urls) and the member's account GUID in a PATH SEGMENT
+// (2 runs). Neither is redacted anywhere else in the platform. These tests pin BOTH directions: the
+// sensitive path scrubs, the non-sensitive path stays byte-raw (so the C# contract is untouched).
+
+const SENSITIVE_REDACT = makeRedactor(null, []); // builtin denylist only — no declared patterns needed
+const ACCOUNT_GUID = 'bb50e06f-aeb9-4bda-b54a-8f012b32d441';
+
+test('★ sensitive: an account GUID in a URL PATH SEGMENT is scrubbed (no key=value rule can see it)', () => {
+  const url = `https://api.digitaldevelopment.wegmans.cloud/commerce/instacart/fulfillment/users/${ACCOUNT_GUID}/link?api-version=2023-11-13-preview`;
+  const out = scrubNetworkUrl(url, SENSITIVE_REDACT);
+  assert.ok(!out.includes(ACCOUNT_GUID), 'the account GUID must not survive');
+  assert.match(out, /\/users\/<redacted-id>\/link/, 'path shape is preserved — still diagnosable');
+  assert.ok(out.includes('api-version=2023-11-13-preview'), 'non-sensitive query params survive');
+  // must-go-red the other way: identity redactor ⇒ untouched (this is the parity guarantee).
+  assert.equal(scrubNetworkUrl(url, IDENTITY_REDACTOR), url);
+});
+
+test('★ sensitive: a trailing GUID path segment (no trailing slash) is scrubbed too', () => {
+  const url = `https://api.wegmans.cloud/commerce/users/${ACCOUNT_GUID}`;
+  assert.equal(scrubNetworkUrl(url, SENSITIVE_REDACT), 'https://api.wegmans.cloud/commerce/users/<redacted-id>');
+});
+
+test('★ sensitive: the SignalR access_token JWT in a query string is scrubbed', () => {
+  const url =
+    'wss://commerce-signalr-azsrs-prod.service.signalr.net/client/?hub=orders&id=bCTywMY&access_token=eyJhbGciOiJIUzI1NiJ9.eyJhc3JzLnMudWlkIjoieCJ9.sigPART';
+  const out = scrubNetworkUrl(url, SENSITIVE_REDACT);
+  assert.ok(!out.includes('eyJhc3JzLnMudWlkIjoieCJ9'), 'the token payload must not survive');
+  assert.ok(out.includes('hub=orders'), 'the diagnostic query params survive');
+  assert.equal(scrubNetworkUrl(url, IDENTITY_REDACTOR), url); // parity direction
+});
+
+test('★ sensitive: the scrub reaches BOTH persisted url slots — mutations AND the slim lists', () => {
+  const ndjson = [
+    `{"type":"resource-snapshot","snapshot":{"_resourceType":"fetch","time":10,"timings":{"wait":5},"request":{"url":"https://api.wegmans.cloud/users/${ACCOUNT_GUID}/cart","method":"POST"},"response":{"status":500,"_transferSize":100,"content":{"size":50}}}}`,
+  ].join('\n');
+  const n = extractNetwork(ndjson, TARGET, SENSITIVE_REDACT);
+  assert.ok(!n.mutations[0].url.includes(ACCOUNT_GUID), 'mutations slot scrubbed');
+  assert.ok(!n.failed[0].url.includes(ACCOUNT_GUID), 'failed slot (slim) scrubbed');
+  assert.ok(!n.slowest[0].url.includes(ACCOUNT_GUID), 'slowest slot (slim) scrubbed');
+  // Non-url fields are untouched — the scrub must not cost the diagnostic.
+  assert.equal(n.mutations[0].status, 500);
+  assert.equal(n.mutations[0].method, 'POST');
+});
+
+test('★ sensitive: third-party grouping still uses the RAW url, so classification is unchanged', () => {
+  // hostOf()/isFirstParty() run on r.url before any scrub. If the scrub leaked into them, a scrubbed
+  // url could mis-parse and flip a request between first- and third-party.
+  const ndjson = [
+    `{"type":"resource-snapshot","snapshot":{"_resourceType":"fetch","time":10,"timings":{"wait":5},"request":{"url":"https://cdn.thirdparty.example/assets/${ACCOUNT_GUID}/x.js","method":"GET"},"response":{"status":200,"_transferSize":2048,"content":{"size":50}}}}`,
+  ].join('\n');
+  const raw = extractNetwork(ndjson, TARGET);
+  const sens = extractNetwork(ndjson, TARGET, SENSITIVE_REDACT);
+  assert.equal(sens.thirdPartyCount, raw.thirdPartyCount, 'third-party count identical');
+  assert.deepEqual(
+    sens.topThirdParties,
+    raw.topThirdParties,
+    'topThirdParties (host-keyed) identical — grouping reads the raw url',
+  );
+  assert.ok(!sens.slowest[0].url.includes(ACCOUNT_GUID), 'but the PERSISTED url is still scrubbed');
+});
+
+test('★ sensitive: a non-GUID path segment is NOT scrubbed (the rule is shape-scoped, not a blanket)', () => {
+  const url = 'https://www.wegmans.com/shop/product/62874-Walnut-Raisin-Bread-Half-Loaf';
+  assert.equal(scrubNetworkUrl(url, SENSITIVE_REDACT), url);
 });
 
 test('extractTraceSignals parses a real zip (both streams) + derives targetHost from the URL', async () => {
