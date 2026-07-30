@@ -27,7 +27,31 @@ const BUILTIN: Array<[RegExp, string]> = [
   [/\bBearer\s+[A-Za-z0-9._~+/-]+=*/gi, 'Bearer <redacted>'],
 ];
 
+/** Marker for a scrubbed login-IDENTIFIER (the `username` credential role), distinct from the generic
+ *  `<redacted>` on purpose. The B10 username exemption existed to keep login debugging possible — you
+ *  need to know WHICH username was typed when a credentialed login fails. A distinct marker keeps most
+ *  of that: because the ONLY value registered under this marker is the monitor's own configured
+ *  username, seeing `<redacted-username>` at the sign-in fill proves the configured credential WAS
+ *  typed there (and its absence proves it wasn't) — without putting a real person's address at rest.
+ *  See loginCredentials.ts CRED_USERNAME_CLEARTEXT_ALLOWANCE for when cleartext is still permitted. */
+export const MARKER_USERNAME = '<redacted-username>';
+
 export type Redactor = (s: string) => string;
+
+/** A known secret VALUE to register as an escaped-literal rule. A bare string scrubs to the generic
+ *  `<redacted>`; the object form scrubs to its own `marker` instead, for the cases where "a value of
+ *  THIS kind was here" is itself the diagnostic (see MARKER_USERNAME). Callers can mix both forms in
+ *  one array, so spreading string lists (e.g. secret-header values) alongside marked ones still works. */
+export interface MarkedValue {
+  value: string;
+  marker: string;
+}
+export type KnownValue = string | MarkedValue;
+
+/** Normalize either KnownValue form to {value, marker}. A bare string takes the generic marker. */
+function asMarked(v: KnownValue): MarkedValue {
+  return typeof v === 'string' ? { value: v, marker: REDACTED } : v;
+}
 
 /** No-op redactor for non-sensitive monitors — keeps the extraction hot path byte-for-byte identical. */
 export const IDENTITY_REDACTOR: Redactor = (s) => s;
@@ -52,7 +76,7 @@ export function escapeRegExp(s: string): string {
  */
 export function makeRedactor(
   declaredPatterns: string[] | null | undefined,
-  knownValues?: readonly string[],
+  knownValues?: readonly KnownValue[],
 ): Redactor {
   const rules: Array<[RegExp, string]> = [...BUILTIN];
   for (const p of declaredPatterns ?? []) {
@@ -64,8 +88,13 @@ export function makeRedactor(
   }
   // ★ known secret values → escaped-literal rules. Longest-first so a value that contains another
   // (e.g. password ⊃ username substring) is redacted before its substring can partially match.
-  for (const v of [...(knownValues ?? [])].filter((v) => v && v.length >= 3).sort((a, b) => b.length - a.length)) {
-    rules.push([new RegExp(escapeRegExp(v), 'g'), REDACTED]);
+  // Each value carries its own marker (generic `<redacted>` for a bare string) — `$` in a marker is
+  // escaped to `$$` so a marker can never be read as a String.replace substitution pattern.
+  for (const { value, marker } of [...(knownValues ?? [])]
+    .map(asMarked)
+    .filter((m) => m.value && m.value.length >= 3)
+    .sort((a, b) => b.value.length - a.value.length)) {
+    rules.push([new RegExp(escapeRegExp(value), 'g'), marker.replace(/\$/g, '$$$$')]);
   }
   return (s) => {
     let out = s;

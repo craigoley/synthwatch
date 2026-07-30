@@ -57,7 +57,7 @@ import {
 } from './artifacts.js';
 import { extractTraceSignals } from './traceSignals.js';
 import { buildRedactedTraceZip } from './traceRedact.js';
-import { makeRedactor, IDENTITY_REDACTOR, tracePersistPlan, scrubError } from './redact.js';
+import { makeRedactor, IDENTITY_REDACTOR, tracePersistPlan, scrubError, type KnownValue } from './redact.js';
 import { captureEgressIp } from './egress.js';
 import { unlink } from 'node:fs/promises';
 import {
@@ -566,9 +566,13 @@ async function runOneInner(
   // BOTH redactors (run-level below + the step redactor in executeBrowser) as escaped-literal rules so the
   // bare typed value is scrubbed from console/error/trace_signals. Only for a sensitive monitor (a
   // non-sensitive monitor gets IDENTITY_REDACTOR — no scrubbing — so registering values would be moot).
-  // redactableCredValues EXCLUDES the non-secret 'username' role (a test-account identifier), so the typed
-  // username stays visible for login debugging while the password + every other role stay redacted.
-  const credValues = check.sensitive ? redactableCredValues(resolveLoginCredentials(check.login_credentials)) : [];
+  // redactableCredValues registers the password + every unknown role for redaction unconditionally. The
+  // `username` role is PER-CHECK (source_key ⇒ CRED_USERNAME_CLEARTEXT_ALLOWANCE): a monitor on a verified
+  // throwaway account keeps it in cleartext for login debugging; every other monitor scrubs it to
+  // MARKER_USERNAME, which still shows that the configured credential was typed at that step.
+  const credValues = check.sensitive
+    ? redactableCredValues(resolveLoginCredentials(check.login_credentials), check.source_key)
+    : [];
   // Wall-clock start of the executor — the OTel root span's start. ONE attempt: the in-run fast-retry loop
   // was retired in 0084 (a failure now confirms by re-run, not in-run). retry_count is a fixed 1 (the api
   // trust report's retryRate still reads runs.retry_count; it is now structurally 0% — see the PR body).
@@ -944,7 +948,7 @@ async function executeBrowser(
   // ★ #232 defect-2: the run's resolved login-credential VALUES, registered into the step redactor as
   // escaped-literal rules so a typed cred is scrubbed from a per-step error_message. [] for non-login/
   // non-sensitive monitors (resolved once upstream in runOneInner so both redactors agree).
-  credValues: readonly string[] = [],
+  credValues: readonly KnownValue[] = [],
 ): Promise<Outcome> {
   // FAIL-LOUD before opening a browser: a malformed origin pair REFUSES the run rather than silently
   // running the spec against its hardcoded PROD host (a false-green against prod). Compiled once here.

@@ -16,6 +16,7 @@
 // ★ PROVISIONING CEILING: values are set via the editor/write-endpoint (encrypted with CRED_ENC_KEY) — there
 //   is still no per-monitor secret vault; the single symmetric key gates all of them.
 import { loadCredEncKey, decryptCredValue } from './crypto.js';
+import { MARKER_USERNAME, type KnownValue } from './redact.js';
 
 /** credentialRole -> CIPHERTEXT ("v1:…", CredCrypto v1). Only the DECRYPTED value is secret. */
 export type LoginCredentialValues = Record<string, string>;
@@ -47,25 +48,74 @@ export function resolveLoginCredentials(enc: LoginCredentialValues | null | unde
 }
 
 /**
- * Credential ROLES whose value is a NON-SECRET identifier — safe to appear in CLEARTEXT in traces/logs.
- * A shop-flow TEST-ACCOUNT username is a login identifier (like a throwaway email), not a secret; redacting
- * it hid what username was actually typed and blocked debugging the failing shop-flow login. Everything NOT
- * listed here (password + any future role) STAYS redacted — fail-CLOSED, so a new secret role is never
- * silently leaked; only an explicitly-declared non-secret role becomes visible. Compared case-insensitively
- * (roles are upper-cased into SW_CRED_<ROLE>).
+ * The ONE credential role whose value is a login IDENTIFIER rather than a secret, and is therefore even
+ * ELIGIBLE for the cleartext allowance below. Every other role (password + any future role) is ALWAYS
+ * registered for redaction — fail-CLOSED, so a new secret role can never be silently exposed. Compared
+ * case-insensitively (roles are upper-cased into SW_CRED_<ROLE>).
  */
-export const NON_SECRET_CRED_ROLES: ReadonlySet<string> = new Set(['username']);
+const IDENTIFIER_CRED_ROLE = 'username';
 
 /**
- * The subset of resolved credential VALUES that must be scrubbed from traces/logs: every role EXCEPT the
- * NON_SECRET_CRED_ROLES. So the password (and any unrecognised role) is registered for redaction while the
- * username identifier is left visible. This feeds ONLY the redactors (run/step/zip) — it is NOT the publish
- * path, so every role (username included) is still injected to the spec via SW_CRED_<ROLE>.
+ * ★ PER-CHECK cleartext allowance for the `username` credential value, keyed by checks.source_key.
+ *
+ * The original exemption was GLOBAL and rested on one premise: "a shop-flow TEST-ACCOUNT username is a
+ * login identifier (like a throwaway email), not a secret" — redacting it hid what username was actually
+ * typed and blocked debugging a failing credentialed login. That premise is TRUE for a dedicated
+ * throwaway account and FALSE for a named person's corporate address, and the global set could not tell
+ * the difference. The 2026-07-29 classification recon measured both cases in retained trace zips:
+ *   • wegmans-authorized-user-add-to-cart → sreordertest@gmail.com, a dedicated test account with
+ *     firstName/lastName/loyaltyNumber/phoneNumber all UNPOPULATED. Premise holds; allowance granted.
+ *   • wegmans-full-shop-flow             → a named employee's @wegmans.com address, whose account
+ *     carries a real name, phone number and loyalty number. Premise FAILS; NOT listed, so the value is
+ *     scrubbed to MARKER_USERNAME (which still proves the configured credential was typed — see there).
+ *
+ * DEFAULT IS REDACT: a check absent from this set (or with no source_key at all — an unmanaged/hand-made
+ * check) gets its username scrubbed. So the exemption is now something a reviewer GRANTS per monitor
+ * with the account's contents in hand, not something every credentialed monitor inherits by default.
+ *
+ * Seam choice mirrors reconcile.ts REDACTION_STRIP_ALLOWANCE deliberately — same reasoning applies: it is
+ * (a) in-repo + reviewable in a PR diff, (b) per-monitor not global, (c) auditable via git blame on this
+ * constant, and it keeps the privacy decision in the RUNNER (where the redactor lives) rather than
+ * splitting it cross-repo into a new synthwatch-monitors manifest field + schema. To grant the allowance:
+ * confirm the account has no real-person identity fields populated, then add its source_key here in a
+ * reviewed PR.
  */
-export function redactableCredValues(resolved: Record<string, string>): string[] {
-  return Object.entries(resolved)
-    .filter(([role]) => !NON_SECRET_CRED_ROLES.has(role.toLowerCase()))
-    .map(([, value]) => value);
+export const CRED_USERNAME_CLEARTEXT_ALLOWANCE: ReadonlySet<string> = new Set<string>([
+  // Dedicated throwaway (sreordertest@gmail.com): name / phone / loyalty all unpopulated — measured
+  // across its retained trace zips, which carry the email and nothing else identifying.
+  'wegmans-authorized-user-add-to-cart',
+]);
+
+/** Whether this check may keep its username in CLEARTEXT. Fail-closed: no source_key ⇒ redact. */
+export function isUsernameCleartextAllowed(sourceKey: string | null | undefined): boolean {
+  return typeof sourceKey === 'string' && CRED_USERNAME_CLEARTEXT_ALLOWANCE.has(sourceKey);
+}
+
+/**
+ * The resolved credential VALUES to register with the redactors (run/step/zip), each with the marker it
+ * scrubs to. This feeds ONLY the redactors — it is NOT the publish path, so every role (username
+ * included) is still injected to the spec via SW_CRED_<ROLE> regardless of what this returns.
+ *
+ *  • any role except `username`  → registered with the generic `<redacted>` marker (fail-closed).
+ *  • `username`, check NOT in the allowance → registered with MARKER_USERNAME, so it is scrubbed but
+ *    still legible as "the configured username was typed here".
+ *  • `username`, check IN the allowance → NOT registered, i.e. left in cleartext (today's behaviour,
+ *    now scoped to the monitors where the throwaway-account premise actually holds).
+ */
+export function redactableCredValues(
+  resolved: Record<string, string>,
+  sourceKey?: string | null,
+): KnownValue[] {
+  const usernameCleartext = isUsernameCleartextAllowed(sourceKey);
+  const out: KnownValue[] = [];
+  for (const [role, value] of Object.entries(resolved)) {
+    if (role.toLowerCase() !== IDENTIFIER_CRED_ROLE) {
+      out.push(value); // secret (or unknown → fail-closed): generic marker
+    } else if (!usernameCleartext) {
+      out.push({ value, marker: MARKER_USERNAME }); // scrubbed-but-present
+    }
+  }
+  return out;
 }
 
 /** A published SW_CRED_<ROLE> env var + the value it had BEFORE publish (undefined = didn't exist), so the

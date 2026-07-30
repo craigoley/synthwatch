@@ -162,6 +162,11 @@ export interface Check {
   // null => a legacy/dashboard check that runs the baked-in flow_name. claim() does SELECT *,
   // so it rides along; typed here so executeBrowser can branch on it.
   spec_path: string | null;
+  // Reconcile's stable manifest identity for a Git-managed check (checks_source_key_uniq); null => an
+  // unmanaged/hand-made check. claim() does SELECT *, so it rides along; typed here because the runner
+  // keys PER-CHECK privacy allowances off it (loginCredentials.CRED_USERNAME_CLEARTEXT_ALLOWANCE) — a
+  // null source_key therefore fails CLOSED into the redacting default.
+  source_key: string | null;
   // Environment dimension (0059). 'prod' (default) | 'staging' | 'dev'. The runner does not gate on it
   // (the pre-prod EXCLUDE is API-side); read here so reconcile can detect drift + it rides SELECT *.
   environment: string;
