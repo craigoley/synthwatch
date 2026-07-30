@@ -452,3 +452,21 @@ test('★ signatureOf normalises ONLY the message — check_id and failed_step s
   assert.ok(signatureOf(355, 'at verify-cart-4', 'verify-cart-4').endsWith('|verify-cart-4'));
   assert.ok(signatureOf(355, 'at verify-cart-4', 'verify-cart-4').includes('at verify-cart-#'));
 });
+
+test('★ signatureOf stays BOUNDED — the message is capped at 300 chars', () => {
+  // The cap is what keeps the signature (a DB-stored key) bounded regardless of how long a monitor's
+  // error text grows. Two messages that differ ONLY past char 300 are the same signature; differing
+  // WITHIN the first 300 keeps them distinct.
+  const head = 'x'.repeat(300);
+  assert.equal(signatureOf(1, head + 'AAAA', 's'), signatureOf(1, head + 'BBBB', 's'));
+  assert.notEqual(signatureOf(1, 'x'.repeat(299) + 'A', 's'), signatureOf(1, 'x'.repeat(299) + 'B', 's'));
+  assert.ok(signatureOf(1, 'y'.repeat(500), 's').length < 320, 'the signature does not grow with the message');
+});
+
+test('★ signatureOf: a null message or null failed_step becomes an EMPTY segment, not a literal', () => {
+  // Both params are nullable (a non-stepped check has no failed_step; an abstain path can have no
+  // message). The empty-string fallbacks must stay empty so the segment layout is stable.
+  assert.equal(signatureOf(7, null, null), '7||');
+  assert.equal(signatureOf(7, null, 'login'), '7||login');
+  assert.equal(signatureOf(7, 'boom', null), '7|boom|');
+});

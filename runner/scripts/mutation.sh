@@ -38,13 +38,21 @@ case "$MODULE" in
     MUTATE='["traceSignals.ts"]'; BREAK=69 ;;
   rca)
     CMD="node --test dist/rca.test.js"
-    # pure-function surface: extractTraceFacts + renderFactPack cite-logic (166-253) and validateCites /
-    # evidenceThin / deterministicResult / isDeterministicInfraError / infraDeterministicResult /
-    # rcaScreenshotUrls (299-447). Excludes SYSTEM_PROMPT, the render TEXT (254-298), and the model/DB
-    # orchestration (gatherContext+). ★ Ranges RE-DERIVED after the infra-deterministic classifier landed
-    # (the +lines shifted every boundary; the old 159-246/284-384 then mutated render-text and MISSED the new
-    # pure functions — the exact drift this comment warns about). The new functions ARE covered here.
-    MUTATE='["rca.ts:166-253","rca.ts:299-447"]'; BREAK=59 ;;
+    # pure-function surface, in THREE ranges:
+    #   • normalizeSignatureText + signatureOf (104-115) — the failure-signature normaliser;
+    #   • extractTraceFacts + renderFactPack cite-logic (198-285);
+    #   • validateCites / evidenceThin / deterministicResult / isDeterministicInfraError /
+    #     infraDeterministicResult / rcaScreenshotUrls (331-479).
+    # Excludes SYSTEM_PROMPT, the render TEXT (286-330), and the model/DB orchestration (gatherContext+).
+    # ★ Ranges RE-DERIVED — TWICE now, for the same reason. First after the infra-deterministic classifier
+    # landed (the old 159-246/284-384 then mutated render-text and MISSED the new pure functions). Again on
+    # 2026-07-30 when signatureOf's normaliser added +32 lines ABOVE both windows: 166-253/299-447 slid onto
+    # the render TEXT, so the gate reported survivors in prompt strings it is meant to EXCLUDE and the score
+    # fell 59 → 55.85 with no test having gotten worse. THE LESSON, twice paid: these are FIXED line numbers
+    # against a file that grows at the top, so ANY insertion above line ~500 silently re-aims the whole gate.
+    # Shifting by exactly the inserted line count (+32) preserves the identical measured window the BREAK=59
+    # baseline was derived from; the new range is additive and its mutants are killed in rca.test.ts.
+    MUTATE='["rca.ts:104-115","rca.ts:198-285","rca.ts:331-479"]'; BREAK=59 ;;
   evaluate)
     CMD="node --test dist/evaluate.test.js dist/evaluate.integration.test.js dist/confirmationRetry.integration.test.js dist/transientBaselineSuccess.integration.test.js dist/countableRun.integration.test.js"
     MUTATE='["evaluate.ts"]'; BREAK=28 ;;   # measured 31.8% (post #307/#308) − margin
