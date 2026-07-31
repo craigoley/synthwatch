@@ -1,0 +1,97 @@
+name: Inventory freshness
+
+# ★ WHY. docs/handover/INVENTORY.md is the migration's source of truth for the LIVE system, read by
+#   someone who cannot see this subscription. A stale inventory is WORSE than none: it looks
+#   authoritative while asserting facts that have since changed — the exact failure that has already put
+#   two wrong premises into the migration plan. This gate makes staleness impossible to ignore.
+#
+# ★ WHAT IT DOES NOT DO. It does not regenerate the file. Regeneration needs Azure Contributor, a
+#   GitHub token with repo-admin (and, for org secrets, `admin:org`), and DATABASE_URL — a credential
+#   set CI deliberately does not hold. So the gate checks the ONE thing it can check without
+#   credentials, honestly: how old the committed file is. A partial auto-regeneration would be worse
+#   than none, because it would silently drop the sections it lacked rights to read.
+
+on:
+  pull_request:
+  schedule:
+    - cron: '0 8 * * 1'      # Monday 08:00 UTC — fails loudly at the start of the week, not mid-migration
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Beyond this, the gate FAILS. 30 days ≈ one migration planning cycle: long enough not to nag, short
+  # enough that no plan is ever written against facts older than a month.
+  MAX_AGE_DAYS: '30'
+  # Warn (but pass) from here, so the failure is never a surprise on the day it lands.
+  WARN_AGE_DAYS: '21'
+  INVENTORY: docs/handover/INVENTORY.md
+
+jobs:
+  freshness:
+    name: Inventory freshness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # The detector itself must be provably able to fire — a scan that reports "no duplicates" while
+      # being incapable of finding one is the anti-pattern this repo keeps paying for. Needs no creds.
+      - name: Self-test the duplicate-job-name detector
+        run: bash scripts/generate-handover-inventory.sh --self-test
+
+      - name: Check the committed inventory is fresh
+        run: |
+          set -uo pipefail
+          f="${INVENTORY}"
+          if [[ ! -f "$f" ]]; then
+            echo "::error::${f} is missing — regenerate with scripts/generate-handover-inventory.sh"
+            exit 1
+          fi
+
+          # Parse the generation timestamp OUT OF THE FILE, not from git mtime: a rebase, a squash or a
+          # touch changes mtime without regenerating a single fact. The timestamp is written by the
+          # generator and is the only honest age signal.
+          gen="$(grep -oE '\*\*Generated at \(UTC\)\*\* \| `[0-9T:Z-]+`' "$f" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+Z' | head -1)"
+          if [[ -z "$gen" ]]; then
+            echo "::error::could not parse a generation timestamp from ${f} — has the header been hand-edited?"
+            exit 1
+          fi
+
+          gen_s=$(date -u -d "$gen" +%s)
+          now_s=$(date -u +%s)
+          age=$(( (now_s - gen_s) / 86400 ))
+          echo "Inventory generated: ${gen} (${age} days ago)"
+          echo "### Inventory age: ${age}d (warn ${WARN_AGE_DAYS}d / fail ${MAX_AGE_DAYS}d)" >> "$GITHUB_STEP_SUMMARY"
+
+          # A timestamp in the future means a clock or a hand-edit — refuse to call that fresh.
+          if (( age < 0 )); then
+            echo "::error::${f} claims a FUTURE generation time (${gen}) — it has been hand-edited or a clock is wrong"
+            exit 1
+          fi
+
+          if (( age > MAX_AGE_DAYS )); then
+            echo "::error::${f} is ${age} days old (max ${MAX_AGE_DAYS}). Re-run: scripts/generate-handover-inventory.sh (needs az + gh + DATABASE_URL), then commit the result."
+            exit 1
+          fi
+          if (( age > WARN_AGE_DAYS )); then
+            echo "::warning::${f} is ${age} days old and will FAIL at ${MAX_AGE_DAYS} — regenerate soon."
+          fi
+          echo "OK: inventory is ${age} days old."
+
+      # An inventory whose gaps have gone unread is halfway back to a hand-written document. Surface them
+      # on every run so they stay visible rather than living at the bottom of a long file.
+      - name: Surface the unresolved gaps
+        if: always()
+        run: |
+          set -uo pipefail
+          f="${INVENTORY}"
+          [[ -f "$f" ]] || exit 0
+          n="$(sed -n '/^## ⚠️ Gaps/,$p' "$f" | grep -cE '^- \*\*' || true)"
+          {
+            echo "### Unresolved inventory gaps: ${n}"
+            sed -n '/^## ⚠️ Gaps/,$p' "$f" | grep -E '^- \*\*' | sed 's/^/  /' || true
+          } >> "$GITHUB_STEP_SUMMARY"
+          if (( n > 0 )); then
+            echo "::warning::${f} has ${n} unresolved gap(s) — see the job summary. These are facts the migration must NOT assume are covered."
+          fi
