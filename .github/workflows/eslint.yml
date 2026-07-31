@@ -3,8 +3,10 @@ name: ESLint
 on:
   push:
     branches: [main]
+  # ★ NO `branches:` FILTER ON pull_request — DELIBERATE, DO NOT ADD ONE BACK. With `branches: [main]`
+  #   this gate did not run at all on a PR targeting a non-main base, so a STACKED PR displayed no gate
+  #   run and read to a reviewer as gated while asserting nothing. See scripts/check-pr-trigger-coverage.sh.
   pull_request:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
