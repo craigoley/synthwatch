@@ -44,8 +44,10 @@ name: CI gate
 # ──────────────────────────────────────────────────────────────────────────────────────────
 
 on:
+  # ★ NO `branches:` FILTER ON pull_request — DELIBERATE, DO NOT ADD ONE BACK. With `branches: [main]`
+  #   this gate did not run at all on a PR targeting a non-main base, so a STACKED PR displayed no gate
+  #   run and read to a reviewer as gated while asserting nothing. See scripts/check-pr-trigger-coverage.sh.
   pull_request:
-    branches: [main]
 
 permissions:
   checks: read
@@ -107,6 +109,13 @@ jobs:
       #   name, no new workflow, and the guard can never rot unnoticed.
       - name: Self-test the gate logic (must-go-red anchor + deadlock guard)
         run: bash scripts/ci-gate-eval.sh --self-test
+
+      # ★ Every PR-triggered workflow must run on EVERY base, not just main-based PRs. Lives HERE, in the
+      #   one REQUIRED context, for the same reason the self-test does: no new check name, no new workflow,
+      #   and it cannot rot unnoticed. It also protects ci-gate specifically — ci-gate fails CLOSED when a
+      #   REQUIRED sibling never registers, so a base filter left on a sibling would deadlock stacked PRs.
+      - name: PR-trigger coverage (no gate may skip a non-main base)
+        run: bash scripts/check-pr-trigger-coverage.sh
 
       - name: Aggregate sibling check results (wait for ALL gating checks; fail only on a REAL failure)
         run: |

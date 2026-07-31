@@ -20,8 +20,10 @@ name: Browser smoke
 #   deadlocks the gate's wait loop (see ci-gate.yml + schema-freeze-preflight.yml — the same pattern).
 
 on:
+  # ★ NO `branches:` FILTER ON pull_request — DELIBERATE, DO NOT ADD ONE BACK. With `branches: [main]`
+  #   this gate did not run at all on a PR targeting a non-main base, so a STACKED PR displayed no gate
+  #   run and read to a reviewer as gated while asserting nothing. See scripts/check-pr-trigger-coverage.sh.
   pull_request:
-    branches: [main]
     paths:
       - 'runner/Dockerfile'
       - 'runner/package.json'
