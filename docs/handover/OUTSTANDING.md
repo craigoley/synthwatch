@@ -1,41 +1,362 @@
 # SynthWatch — outstanding-items register (handover)
 
-> _DRAFT · 2026-07-15 · a live register, not a status report. Ordered by **blast radius, not age**. Each item
-> carries **why it's unresolved** and **the next logical step** (a comment on *why* is what cuts onboarding
-> friction). Owners in **[brackets]** are Wegmans placeholders. See
-> [`../../TRANSITION.md`](../../TRANSITION.md) + [`RACI.md`](RACI.md)._
+> **★ THE RULE: no item may be marked done on the strength of a report — only on the strength of its
+> verification command's output.**
+>
+> This register exists because status was travelling as prose, and prose drifts. The plan has carried
+> items marked *done* that were not, and items marked *to-do* that were. Every row below therefore ends
+> in a **command whose output decides the status**. If you doubt a row, run its command — that is the
+> point. If a row's status and its command's output disagree, **the output wins** and the row is wrong.
+
+**Re-derive every status in one line:**
+
+```bash
+bash scripts/verify-handover-status.sh          # prints a status table; needs az + gh + psql
+```
+
+_Statuses below were re-derived on **2026-07-31** by running every command in this file. Ordered by
+**blast radius, not age**. Owners in **[brackets]** are Wegmans placeholders. See
+[`../../TRANSITION.md`](../../TRANSITION.md) · [`RACI.md`](RACI.md) · [`GATES.md`](GATES.md) ·
+[`INVENTORY.md`](INVENTORY.md)._
+
+**Status vocabulary** — deliberately small, because a rich vocabulary is how "done" gets fudged:
+
+| | |
+|---|---|
+| **DONE** | The verification command's output satisfies the item. Nothing left to do. |
+| **NOT DONE** | The command's output shows the work has not happened. |
+| **PARTIAL** | Some legs verified, others not — the row names which. |
+| **BLOCKED** | Cannot be verified or completed from here; the blocker is named. |
+
+---
 
 ## ★ Highest blast radius — data loss / silent failure / incident response
 
-| Item | Bucket | Why unresolved | Next step | Owner |
-|---|---|---|---|---|
-| **`synthwatch-sandbox` is neither ROLLED nor VERIFIED by deploy — ★ worse than "unverified"** | Proof-gated build | The sandbox job runs `image: runnerImage` (`infra/main.bicep:657`) but is **absent from `RUNNER_IMAGE_JOBS`** (`scripts/lib/deploy-lib.sh:22`), so (a) `deploy.yml` never issues an `az containerapp job update` for it — **nothing rolls its image at all**, it sits on whatever the last full bicep deployment set — and (b) `deploy.sh`'s image check iterates `RUNNER_IMAGE_JOBS + MIGRATE_JOB`, so it is never compared. The pass line still prints **`all jobs on image <sha>`** (`deploy.sh:1112`), which is false twice over: it omits the sandbox, and its parenthesised list `(runner+migrate+narrative+rollup+reconcile+centralus)` is stale against its own 7-entry array (no westus2, no retention). ★ **Blast radius: the sandbox executes UPLOADED, UNMERGED code (RCE by design) on arbitrarily old runner logic, while every deploy reports success.** Concretely: #349's `@playwright/test` fix may not be live in the sandbox even though the deploy went green. | Add `SANDBOX_JOB` to `RUNNER_IMAGE_JOBS` **and** the `az containerapp job update` list in `.github/workflows/deploy.yml` — the #180 parity guard (`scripts/deploy_test.sh`) asserts those two match EXACTLY, so it must be both or CI reds (the **three-place wiring** rule in CLAUDE.md). Then correct the `deploy.sh:1112` pass string to name the real set, or derive it from the array so it cannot go stale again. ★ Prove-can-fail: pin the sandbox to an old SHA and confirm verify FLUNKS. | **[Wegmans platform eng]** |
-| **`CRED_ENC_KEY` → Key Vault** | Wegmans | It lives only in `~/.synthwatch.env` on the Mac mini; **no Key Vault exists**. Encryption-at-rest deps on a transferred resource can be **unrecoverable**. | Escrow to Wegmans KV **+ a second independent escrow**; verify a decrypt round-trips. **Phase -1 gate — nothing moves until green.** | Craig → **[Wegmans secrets]** |
-| **Gate B — prod↔replay drift detector** | Proof-gated build | Not built. It's the **only** thing that would catch `runs.location`-class drift (schema.sql/replay vs the actual prod catalog); today that class is caught only by hand. CI can't reach prod, but the runner's ACA env can. | Build as a scheduled ACA job (sibling of rollup/retention): dump prod catalog, diff vs the deployed image's schema.sql+migrations, write a `runner_errors` row + alert on divergence. Prove-can-fail. **Three-place ACA wiring** (CLAUDE.md). | **[Wegmans platform eng]** |
-| **DR / backup topology** | Wegmans | Undocumented. The *restore model* exists (`schema.sql` + migrations), but Postgres backup cadence, blob-artifact backup, and a DR-region plan are not defined. | Define backup cadence + a rehearsed restore + a DR posture; document in TRANSITION set. | **[Wegmans platform]** |
-| **Rehearse a rollback** | Craig-only | Every rollback section is stamped **DRAFT · UNREHEARSED · NEVER EXECUTED** — no image or Vercel rollback has ever been run against the live stack. An untested rollback is not a rollback. | Rehearse ONE (runner image via `deploy.sh --sha`, or dashboard via Vercel Instant Rollback) **in the shadow period, run by Wegmans, Craig watching** (Phase 2 requires it). | Craig → **[Wegmans on-call]** |
-| **On-call roster (one inbox → routed)** | Craig-only | The alert `channels` table is a single row → `craig.oley@wegmans.com`, with critical **and** warning to the same inbox (*prior recon; DB firewalled — re-verify*). Alerts reach a person, not a team. | Add a Wegmans on-call channel/rota + severity routing; retire the sole personal inbox. | Craig → **[Wegmans SRE]** |
-| **Payment & order-placement monitoring** | Wegmans | The seed monitors cover reachability/search, **not** the revenue path (add-to-cart → checkout → order). Deferred: needs test accounts, test cards, and sensitive-flow handling. | Scope a payment/checkout monitor with test credentials + the sensitive-trace redaction rule (`docs/proposals/spec-auth-and-secrets.md`). | **[Wegmans]** |
+### `CRED_ENC_KEY` escrow → Key Vault · **NOT DONE** · Craig → **[Wegmans secrets]**
+
+The key lives only in `~/.synthwatch.env` on the Mac mini. It decrypts `checks.login_credentials`;
+without it every authenticated monitor is unrecoverable. **Phase -1 gate — nothing moves until green.**
+
+```bash
+az keyvault list --query "length(@)" -o tsv      # DONE when ≥1 AND the secret is present
+```
+**Output 2026-07-31: `0`** — there is no Key Vault in the subscription at all.
+
+---
+
+### Rehearse a rollback · **NOT DONE — all four legs** · Craig → **[Wegmans on-call]**
+
+Every rollback section is stamped *DRAFT · UNREHEARSED · NEVER EXECUTED*. An untested rollback is not a
+rollback. ★ The 2026-07-25 Playwright outage (4h45m, 633 failed runs, 19 checks) was fixed **forward**,
+not rolled back — the one moment it would have been exercised.
+
+```bash
+# A rollback = a deploy whose target commit is OLDER than the previously deployed commit.
+gh run list --workflow deploy.yml --limit 40 --json createdAt,headSha,conclusion \
+  -q '.[]|select(.conclusion=="success")|[.createdAt,.headSha]|@tsv' | sort | \
+while IFS=$'\t' read -r ts sha; do
+  cts=$(git show -s --format=%ct "$sha" 2>/dev/null || echo 0); [ "$cts" -eq 0 ] && continue
+  [ -n "${p:-}" ] && [ "$cts" -lt "$p" ] && echo "ROLLBACK: $ts -> ${sha:0:8}"; p=$cts
+done                                            # DONE when ≥1 ROLLBACK line
+```
+**Output 2026-07-31: no ROLLBACK lines** across **26** successful deploys. (Both `push` and
+`workflow_dispatch` events appear — the absence of a rollback is the finding, not the trigger type.)
+
+**The four legs, none rehearsed:** runner image · migrate job · dashboard (Vercel Instant Rollback) ·
+api. Rehearse **one** in the shadow period, run by Wegmans with Craig watching.
+
+---
+
+### Gate B — prod↔replay drift detector · **NOT DONE** · **[Wegmans platform eng]**
+
+The only thing that would catch `runs.location`-class drift (schema.sql/replay vs the actual prod
+catalog). CI cannot reach prod; the runner's ACA env can.
+
+```bash
+az containerapp job list -g synthwatch-rg --query "[?contains(name,'drift')].name" -o tsv
+```
+**Output 2026-07-31: empty** (10 ACA jobs exist, none is a drift detector).
+
+---
+
+### DR / backup topology · **PARTIAL** · **[Wegmans platform]**
+
+The *restore model* exists (`schema.sql` + migrations). The **posture** is now measured — and it is
+thinner than "backups exist" implies:
+
+```bash
+az postgres flexible-server show -g synthwatch-rg -n synthwatch-pg-e2 \
+  --query "{retentionDays:backup.backupRetentionDays,geo:backup.geoRedundantBackup,ha:highAvailability.mode}" -o json
+```
+**Output 2026-07-31:** `retentionDays: 7` · `geo: Disabled` · `ha: Disabled`.
+
+So: **7 days of PITR, single region, no HA.** Blob artifacts have their own 90d lifecycle
+(see `INVENTORY.md` §1.4) — **a 7d DB window against 90d artifacts is a mismatch worth a decision**, not
+a bug. Still missing: a documented DR posture and a **rehearsed** restore.
+
+---
+
+### On-call roster (one inbox → routed) · **NOT DONE** · Craig → **[Wegmans SRE]**
+
+```bash
+psql "$DATABASE_URL" -c "SELECT id,name,type,enabled,config FROM channels WHERE enabled"
+```
+**Output 2026-07-31:** exactly **one** enabled channel — `default email list` (email) →
+`craig.oley@wegmans.com`; 2 rows in `alert_routes`. Critical **and** warning reach the same personal
+inbox. Alerts reach a person, not a team.
+
+---
+
+### Payment & order-placement monitoring · **NOT DONE** · **[Wegmans]**
+
+Monitors cover reachability/search and add-to-cart, **not** the revenue path through checkout.
+
+```bash
+psql "$DATABASE_URL" -tAc "SELECT count(*) FROM checks WHERE enabled
+  AND (name ILIKE '%checkout%' OR name ILIKE '%payment%' OR name ILIKE '%order%')"
+```
+**Output 2026-07-31: `0`.**
+
+★ Note the deliberate ceiling: `full-shop-flow` reaches checkout and **never places the order** (the spec
+logs *"a place-order control is present — NOT clicking it"*). Extending past that needs test cards and a
+sensitive-flow decision, not just a selector.
+
+---
 
 ## Medium blast radius — correctness gates & coverage
 
-| Item | Bucket | Why unresolved | Next step | Owner |
-|---|---|---|---|---|
-| **Gate A — schema.sql↔replay** | Proof-gated build | The `--schema-vs-replay` mode is built + committed (`feat/gate-a` branches) but its **cost_projection must-go-red proof was interrupted when Docker Desktop's daemon dropped**. A gate nobody has seen fail must not merge. | Bring the daemon up, run the red→green proof in the #318 devcontainer, paste the output, open the PR. | Craig → **[Wegmans platform eng]** |
-| **OpenAPI spec (api)** | Proof-gated build | The api has **no** machine-readable API spec; the only shape source is the dashboard's contract fixtures. A blocker for any team integrating with it. | Generate from the C# (Swashbuckle) and CI-verify it against the actual `[Function]` routes — same tripwire pattern as `auth-gates.md`. | **[Wegmans api eng]** |
-| **Narrative — holistic build** | Proof-gated build | The holistic-brief design was delivered as **recon only** (correlation pass, cite/abstain, sample-size honesty). The build is deferred. | Build the read-time correlation pass (shared-host clustering, deploy-marker correlation) reusing RCA's cite/abstain machinery; do not re-invent it. | **[Wegmans runner eng]** |
-| **PR-b — 2nd golden canonicalize fixture** | Proof-gated build | The runner↔C# canonicalize golden-parity gate ships with one fixture; a second (adversarial) fixture was queued to widen coverage. | Add the 2nd shared golden fixture; keep both implementations byte-parity. | **[Wegmans eng]** |
-| **`evaluate.ts` mutation coverage (31.8%)** | Proof-gated build | The mutation gate's `evaluate` module baseline is the lowest of the six (paging logic is under-pinned). Ratcheted, not raised. | Add targeted tests to kill the surviving mutants, then raise the module's break threshold. | **[Wegmans runner eng]** |
-| **esbuild arm64 native binary (local-test gap) — ★ one root, two symptoms** | Handover | The runner's `node_modules` ships the **linux-arm64** esbuild binary (from CI/Docker installs), so every `compileSpec`-dependent test throws _"You installed esbuild for another platform"_ on an **arm64 Mac** and passes only in CI (Linux). This ROOT-CAUSES two things: (1) the **8 spec-compile/esbuild-shim tests "red locally, green in CI"** mystery a Wegmans engineer hits on day one (looks like 8 broken tests; it's the wrong native binary), and (2) **local sandbox-preview testing is blocked** (`runner/sandbox/sandboxIsolation.test.ts` needs `compileSpec`). | `postinstall` installs `@esbuild/darwin-arm64` (version-matched) on macOS, or a devcontainer note. Verified locally: `npm i --no-save @esbuild/darwin-arm64@<ver>` turns the 8 red → green and unblocks the sandbox suite. | **[Wegmans runner eng]** |
-| **Rate-based trigger** | Proof-gated build | A rate-based alert trigger (fire on a rate-of-change, not just a threshold) was scoped but not built. ★ **Scope to confirm with Craig** before building. | Confirm the exact signal + threshold, then build with a prove-can-fail replay (like the 0085 WARNING debounce). | **[Wegmans eng]** |
-| **Cart-DOM snapshot** | Craig-only | A checkout/cart monitor needs a DOM snapshot that Craig captured manually; the selectors depend on it and it's not committed/documented. | Capture + commit the snapshot (or the selector set) with provenance; hand off the capture procedure. | Craig → **[Wegmans monitor authors]** |
-| **api CI gotchas — `# nosemgrep` and TRX skip-counting** | Handover | Two traps that each cost a full push→CI round-trip to rediscover, and both look like something else while you're in them. (1) `# nosemgrep` does **not** clear the `Semgrep OSS` check that `ci-gate` blocks on — semgrep honours the annotation and emits `suppressions:[{kind:inSource}]`, but GitHub code scanning ignores that field; the local-vs-CI split makes it read as bad syntax. (2) A TRX `<Counters>` has **no `skipped` attribute** (it's `notExecuted`), and `notExecuted` can read 0 while tests genuinely skipped — so counter-based skip gates are **fail-open**, the exact failure such a gate exists to prevent. Written up, not "unresolved" — but a Wegmans engineer touching api CI will hit them cold. | Read **`synthwatch-api/CLAUDE.md` → "Lessons from 2026-07-20"** before changing api CI or a Semgrep finding; use `scripts/assert-tests-ran.py` (real XML parse, scoped to the `[Collection("postgres")]` invariant) rather than re-deriving a counter grep. Optional follow-up: make the fixture **throw** rather than skip when `DATABASE_URL` is set, so the suite reds on its own and the guard becomes a backstop. | **[Wegmans api eng]** |
+### ★ Monitor cart gates exist but **DO NOT RUN IN CI** · **NOT DONE** · **[Wegmans monitor authors]**
+
+`synthwatch-monitors/package.json` defines a composite `npm run check` including
+`check:clear-cart-gate`, `check:cart-count-gate` and `check:cart-identity-gate`. **`check.yml` never
+calls it** — it invokes the individual scripts, so those three gates protect a local run only.
+
+```bash
+gh api repos/craigoley/synthwatch-monitors/contents/.github/workflows/check.yml \
+  --jq '.content' | base64 -d | grep -cE "clear-cart-gate|cart-count-gate|cart-identity-gate"
+```
+**Output 2026-07-31: `0`.** (Beware `grep -c "npm run check"` — it false-positives on
+`npm run check:matchers`. Match the gate names, not the prefix.)
+
+**Fix:** one step in `check.yml`. Introduced across monitors #118/#119/#120 on the assumption CI ran the
+composite. This is the exact class the gates exist to prevent — a check that looks present and asserts
+nothing.
+
+---
+
+### ★ Check 355 `verify-cart-4` still failing — NEW failure mode · **NOT DONE** · **[Wegmans monitor authors]**
+
+monitors #121 (read the cart body inside the add step) **is merged** and live (spec etag `2f9c3ce`), and
+it **did** fix what it targeted — the *"no parseable cart body"* error is gone. A **different** GATE-2
+branch now fires.
+
+```bash
+psql "$DATABASE_URL" -tAc "SELECT status||' | '||coalesce(failed_step,'-')||' | '||left(error_message,70)
+  FROM runs WHERE check_id=355 ORDER BY started_at DESC LIMIT 1"
+```
+**Output 2026-07-31:** `error | verify-cart-4 | … no cart write was observed during the add steps.`
+
+**What the evidence says.** All four `add-*` steps **pass** (~24s each — the ladder throws unless a rung
+commits), and the teardown clear-cart takes 54s (so the cart *did* hold items). Yet the per-add listener
+saw no cart write.
+
+**Leading hypothesis, not yet proven:** the ladder returns as soon as the stepper transform appears,
+which can be *before* the cart-write response lands — so `withCartBodyCapture` detaches its listener too
+early. That would be a second-order defect in the #121 fix, traded from the first. **Do not treat this
+row as fixed until the command above prints `pass`.**
+
+---
+
+### Gate A — schema.sql ↔ replay · **NOT DONE** · Craig → **[Wegmans platform eng]**
+
+Built on a branch; its `cost_projection` must-go-red proof was interrupted when Docker Desktop's daemon
+dropped. **A gate nobody has seen fail must not merge.**
+
+```bash
+grep -rl "schema-vs-replay" scripts/ 2>/dev/null | head -1   # DONE when non-empty on main
+```
+**Output 2026-07-31: empty** — not on `main`.
+
+---
+
+### OpenAPI spec (api) · **NOT DONE** · **[Wegmans api eng]**
+
+No machine-readable API spec; the only shape source is the dashboard's contract fixtures. A blocker for
+any team integrating.
+
+```bash
+cd ../synthwatch-api && { find . -iname "*openapi*" -o -iname "*swagger*" | grep -v obj/ | head -1; \
+  grep -rl "AddSwaggerGen" --include="*.cs" . | head -1; }
+```
+**Output 2026-07-31: empty** — no spec file, no Swashbuckle.
+
+---
+
+### Narrative — holistic build · **NOT DONE** · **[Wegmans runner eng]**
+
+Delivered as **recon only**. `narrative.ts` mentions correlation, but ★ **only as a prompt instruction to
+the model** — there is no read-time correlation/clustering pass in code.
+
+```bash
+grep -nE "^(export )?(async )?function .*(cluster|correlat)" runner/narrative.ts
+```
+**Output 2026-07-31: empty** — instruction text only. (Grepping for the *word* `correlation` returns 5
+hits and would wrongly read as done; match the **function definition**.)
+
+---
+
+### PR-b — 2nd golden canonicalize fixture · **NOT DONE** · **[Wegmans eng]**
+
+The runner↔C# canonicalize parity gate ships with one fixture; an adversarial second was queued.
+
+```bash
+ls runner/test-fixtures/trace-signals-golden/ | grep -c canonicalize   # DONE when ≥2
+```
+**Output 2026-07-31: `1`.**
+
+---
+
+### `evaluate.ts` mutation coverage · **NOT DONE (open by design)** · **[Wegmans runner eng]**
+
+Lowest of the six modules; paging logic under-pinned. Ratcheted, not raised.
+
+```bash
+grep -A1 "^  evaluate)" runner/scripts/mutation.sh | grep -o "BREAK=[0-9]*"
+```
+**Output 2026-07-31: `BREAK=28`** (measured 31.8%). Raise the threshold *after* killing survivors —
+raising it first just reds the gate.
+
+---
+
+### esbuild arm64 native binary · **NOT DONE** · **[Wegmans runner eng]**
+
+One root, two symptoms: 8 spec-compile tests are "red locally, green in CI" on an arm64 Mac, and local
+sandbox-preview testing is blocked. Both are the wrong native binary, not broken tests. **A Wegmans
+engineer hits this on day one.**
+
+```bash
+python3 -c "import json;print(json.load(open('runner/package.json'))['scripts'].get('postinstall','(none)'))"
+```
+**Output 2026-07-31: `(none)`.** Workaround that works today:
+`npm i --no-save @esbuild/darwin-arm64@<matching-version>`.
+
+---
+
+### Rate-based alert trigger · **NOT DONE (scope unconfirmed)** · **[Wegmans eng]**
+
+Scoped, never built. ★ **Confirm the signal + threshold with Craig before building.**
+
+```bash
+grep -rln "rateTrigger\|rate-based" runner/*.ts | head -1
+```
+**Output 2026-07-31: empty.**
+
+★ **Build it on the shared per-check aggregate, not a second one.** The monitor-defect discriminator
+(`narrative.ts`, `monitorDefectCandidates`) already reads `countable_run` for "what does this check's
+recent history say" — the rate trigger needs the same primitive.
+
+---
+
+### Cart-DOM snapshot · **PARTIAL / largely superseded** · Craig → **[Wegmans monitor authors]**
+
+Originally: the cart selectors depended on a DOM snapshot Craig captured by hand and never committed.
+Monitors #118–#120 have since committed **synthetic HTML fixtures** reproducing the real shapes, with
+provenance in comments.
+
+```bash
+ls ../synthwatch-monitors/scripts/redtest-*.mjs | wc -l   # committed fixture-bearing red-tests
+```
+**Output 2026-07-31: `4`.**
+
+**Still open:** those fixtures are *reconstructions*, not Craig's original capture, and no capture
+**procedure** is documented for the next selector change.
+
+---
+
+### api CI gotchas (`# nosemgrep`, TRX skip-counting) · **DONE (documented)** · **[Wegmans api eng]**
+
+Two traps that each cost a push→CI round-trip. Written up, and the real guard exists.
+
+```bash
+cd ../synthwatch-api && grep -c "Lessons from 2026-07-20" CLAUDE.md && ls scripts/assert-tests-ran.py
+```
+**Output 2026-07-31:** `1` and the file exists. See [`GATES.md`](GATES.md) for the full incident.
+
+---
 
 ## Lower blast radius — access model
 
-| Item | Bucket | Why unresolved | Next step | Owner |
-|---|---|---|---|---|
-| **Postgres per-user accounts** | Wegmans | Access today is `synthadmin` (shared) + managed identities; no per-engineer accounts, so actions aren't attributable. | Create per-user Postgres roles (least-privilege) during Phase 1. | **[Wegmans DBA]** |
+### Postgres per-user accounts · **NOT DONE** · **[Wegmans DBA]**
 
-> _This register is a snapshot. As items close, move them out — a register that only grows is a status report,
-> not a tracker._
+```bash
+psql "$DATABASE_URL" -tAc "SELECT string_agg(rolname,', ' ORDER BY rolname)
+  FROM pg_roles WHERE rolcanlogin AND rolname NOT LIKE 'pg_%'"
+```
+**Output 2026-07-31:** `CraigOley@gmail.com, azuresu, replication, synthadmin, synthwatch-api,
+synthwatch-runner-id` — service principals plus one personal Entra admin. **No per-engineer roles**, so
+actions are not attributable.
+
+---
+
+## Inventory gaps that block a clean migration
+
+### GitHub **organization-level** secrets are not enumerable · **BLOCKED** · Craig / **[org owner]**
+
+★ **Highest-risk gap in the handover set.** `craigoley` is an **Organization**. Org secrets **do not
+transfer with a repo** — and they are invisible to the current token, so a migration that accounts only
+for repo secrets loses them **silently**.
+
+```bash
+gh api orgs/craigoley/actions/secrets --jq '.secrets[].name'
+```
+**Output 2026-07-31: HTTP 403** (`admin:org` scope missing). Resolve with
+`gh auth refresh -h github.com -s admin:org`, then re-run `scripts/generate-handover-inventory.sh`.
+
+---
+
+### Vercel project / env vars / domains not enumerated · **BLOCKED** · **[Wegmans dashboard eng]**
+
+```bash
+command -v vercel >/dev/null && vercel project ls || echo "NO VERCEL CLI/TOKEN"
+```
+**Output 2026-07-31: `NO VERCEL CLI/TOKEN`.**
+
+★ **Do not fill this in from memory** — that is the failure this register exists to end. When resolved,
+capture env-var **names** per environment, which are `NEXT_PUBLIC_*` (**inlined at build time — changing
+one needs a rebuild, and its value is publicly readable**), custom domains, and the protection-bypass
+setting.
+
+---
+
+## ✅ Closed since the last revision — verified, not asserted
+
+### `synthwatch-sandbox` is rolled AND image-verified · **DONE** (#351/#353)
+
+Previously the register's **top** item, described as *"neither ROLLED nor VERIFIED — worse than
+unverified"*. It is now closed on both halves — an example of the exact drift this rewrite exists to
+prevent, since the register still carried it as outstanding.
+
+```bash
+bash -c 'source scripts/lib/deploy-lib.sh; printf "%s\n" "${RUNNER_IMAGE_JOBS[@]}"' | grep -c synthwatch-sandbox
+grep -n 'pass "all ${#RUNNER_IMAGE_JOBS\[@\]}+1 jobs' scripts/deploy.sh
+```
+**Output 2026-07-31:** `1`, and the pass line prints **`all 8+1 jobs on image <sha> (<derived list>)`** —
+the list is now **derived from the array**, so the stale-parenthetical half of the item cannot recur.
+
+---
+
+### Azure cost headline is live · **DONE**
+
+```bash
+curl -s https://synthwatch-api.azurewebsites.net/api/reports/cost | jq -e '.azure.mtdActual != null'
+```
+**Output 2026-07-31: `true`** — `mtdActual: 117.60`, `forecastMonth: 125.63`, `fetchedAt: 2026-07-30`.
+
+★ Verify on `.azure.mtdActual`, **not** on `.azure != null`: the object is present but its fields can be
+null, so the coarse check reports done while the headline shows nothing. (That mistake was made and
+caught while writing this file — which is the argument for commands over prose in one line.)
+
+---
+
+> _A register that only grows is a status report. As an item closes, move it to **Closed** with its
+> verification output — then delete it once the migration no longer needs the evidence._
