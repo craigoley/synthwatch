@@ -33,7 +33,7 @@ jobs:
     name: Inventory freshness
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # The detector itself must be provably able to fire — a scan that reports "no duplicates" while
       # being incapable of finding one is the anti-pattern this repo keeps paying for. Needs no creds.
