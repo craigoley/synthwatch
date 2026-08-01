@@ -102,7 +102,7 @@ jobs:
         ["ci-gate","automerge","heal"]
     steps:
       - name: Checkout (for scripts/ci-gate-eval.sh — the gate's decision logic)
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # ★ The gate SELF-TESTS its own logic before using it: a regression that would silently WIDEN the
       #   merge gate (or re-introduce the heal deadlock) fails ci-gate loudly on every PR — no new check
