@@ -98,8 +98,12 @@ jobs:
       # ★ Deliberate that a FAILED heal/automerge cannot block a good PR: self-heal is a remediation bot
       #   (it reported FAILURE on every run while the #313 OIDC bug was live — that blocked merges), and
       #   the auto-merge job fails benignly on a draft PR.
+      # ★ `deploy-dispatch` (deploy-on-merge.yml) is plumbing too: it runs on `pull_request: closed`,
+      #   so it is normally absent while a PR is open — but ci-gate CAN be re-run after a merge (that is
+      #   exactly what #393 needed), and an unclassified-but-present check GATES by default here. Classify
+      #   it rather than rely on it never showing up.
       ORCHESTRATION: >-
-        ["ci-gate","automerge","heal"]
+        ["ci-gate","automerge","heal","deploy-dispatch"]
     steps:
       - name: Checkout (for scripts/ci-gate-eval.sh — the gate's decision logic)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

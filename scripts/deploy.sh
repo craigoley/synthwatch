@@ -361,7 +361,27 @@ wait_for_target_image() {
       proceed) c_green "  CI finished — ${target:0:12} is built in both repos; proceeding." >&2; return 0 ;;
       refuse)  c_red   "  CI build for ${target:0:12} ended '${concl}' (no image will appear) — refusing." >&2; return 1 ;;
     esac
-    (( tries % 4 == 0 )) && c_yellow "  …still building (${concl:-no run yet}); waited $(( tries * nap ))s." >&2
+    # ★ "no run yet" DOES NOT MEAN "a build is on its way". GitHub SUPPRESSES the push event for a
+    #   GITHUB_TOKEN (auto-merge) merge, so deploy.yml never fires on the merge itself; a Deploy arrives
+    #   only when something DISPATCHES it. Say which, so the wait is not read as progress:
+    #     • deploy-on-merge.yml — a `pull_request: closed` EVENT, fires within seconds of a merged PR
+    #       (this is the normal path, and why most deploys land +4s..+12s after merge);
+    #     • claude-review `automerge` — a <=20 min POLL from when auto-merge was ARMED; a merge that
+    #       lands later than that (a hand re-run of a stale gate) is OUTSIDE it and gets nothing;
+    #     • automerge-janitor — cron '*/30', but MEASURED median ~107 min and worst 191 (GitHub
+    #       throttles schedules), so it is an EVENTUAL catch-all, not a 30-minute recovery.
+    #   So a persistent "no run yet" is not a slow build — it is very likely NO BUILD AT ALL, and the
+    #   remedy is a manual dispatch: `gh workflow run deploy.yml --repo craigoley/synthwatch --ref main`.
+    if (( tries % 4 == 0 )); then
+      if [[ -z "${concl}" ]]; then
+        c_yellow "  …no Deploy run exists for ${target:0:12} yet; waited $(( tries * nap ))s." >&2
+        c_yellow "     A merge does NOT trigger Deploy directly (GitHub suppresses the push event for" >&2
+        c_yellow "     GITHUB_TOKEN merges) — it is dispatched. If this persists, nothing dispatched it:" >&2
+        c_yellow "     gh workflow run deploy.yml --repo ${GITHUB_REPO:-craigoley/synthwatch} --ref main" >&2
+      else
+        c_yellow "  …still building (${concl}); waited $(( tries * nap ))s." >&2
+      fi
+    fi
     sleep "${nap}"; tries=$(( tries + 1 ))
   done
   c_red "  timed out after $(( max * nap / 60 ))m waiting for CI to build ${target:0:12}." >&2
