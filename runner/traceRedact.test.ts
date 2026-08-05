@@ -18,6 +18,8 @@ import {
   scrubTraceText,
   scrubPlainText,
   scrubEncodedRegions,
+  looksLikeRedactableText,
+  SNIFF_BYTES,
 } from './traceRedact.js';
 import { makeRedactor, IDENTITY_REDACTOR } from './redact.js';
 
@@ -95,6 +97,8 @@ test('classifyEntry: NDJSON + text bodies scrub; images/fonts/unknown DROP (fail
   assert.equal(classifyEntry('resources/frame.jpeg'), 'drop');
   assert.equal(classifyEntry('resources/font.woff2'), 'drop');
   assert.equal(classifyEntry('resources/mystery.bin'), 'drop');
+  // ★ .dat is Playwright's unknown-mime bucket — CANDIDATE, decided by content (looksLikeRedactableText).
+  assert.equal(classifyEntry('resources/ab12.dat'), 'sniff');
   assert.equal(classifyEntry('resources/noextension'), 'drop');
 });
 
@@ -597,6 +601,112 @@ test('★★ END-TO-END: a REAL zip built with the header present contains no oc
       assert.ok(!text.includes(VERCEL_TOKEN), `LEAK: the Vercel token survived in ${entry.entryName}`);
       assert.ok(!text.includes(APIM_KEY), `LEAK: the APIM key survived in ${entry.entryName}`);
     }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── ★★ `.dat` — PLAYWRIGHT'S UNKNOWN-MIME BUCKET ────────────────────────────────────────────────────
+// The Wegmans cart API serves `Content-Type: text/json`; Playwright cannot name that mime, so it writes
+// the body to resources/<sha>.dat. `.dat` was not in TEXT_ENTRY, so it dropped: MEASURED on run 1146366,
+// ZERO of 15 cart bodies survived while 499 .json resources did. `.dat` is genuinely mixed, so it is a
+// CANDIDATE decided by CONTENT — never a class admitted by extension.
+const DAT_SENTINEL = 'DATBODYSENTINEL_cart_sku_55066';
+
+test('★ looksLikeRedactableText: admits a JSON document, refuses everything else', () => {
+  assert.equal(looksLikeRedactableText(Buffer.from('{"cartData":[{"lineItems":[]}]}', 'utf8')), true);
+  assert.equal(looksLikeRedactableText(Buffer.from('  \n\t[{"sku":"1"}]', 'utf8')), true, 'leading whitespace ok');
+  assert.equal(looksLikeRedactableText(Buffer.from('\uFEFF{"a":1}', 'utf8')), true, 'BOM tolerated');
+  // (1) NUL ⇒ binary, even though the rest is ASCII
+  assert.equal(looksLikeRedactableText(Buffer.from([0x7b, 0x22, 0x00, 0x61])), false, 'NUL ⇒ binary');
+  // (2) invalid UTF-8 ⇒ binary
+  assert.equal(looksLikeRedactableText(Buffer.from([0x7b, 0xff, 0xfe, 0xfd, 0xfc])), false, 'bad UTF-8 ⇒ binary');
+  // (3) valid UTF-8 text that is NOT a JSON document — deliberately refused (our rules are written for
+  //     JSON/HAR shapes; an unknown text format could carry a secret none of them match)
+  assert.equal(looksLikeRedactableText(Buffer.from('GIF89a plain text here', 'utf8')), false, 'non-JSON text refused');
+  assert.equal(looksLikeRedactableText(Buffer.alloc(0)), false, 'empty ⇒ drop');
+  // a real PNG header
+  assert.equal(looksLikeRedactableText(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])), false);
+});
+
+test('★ looksLikeRedactableText: a multi-byte char split by the sniff window is NOT misread as binary', () => {
+  // Fill the window so the last character is cut in half — the false-binary trap the trim guards.
+  const pad = '{"note":"' + 'é'.repeat(SNIFF_BYTES) + '"}';
+  assert.equal(looksLikeRedactableText(Buffer.from(pad, 'utf8')), true);
+});
+
+test('★★ END-TO-END: a text/json .dat body SURVIVES with its secrets scrubbed; a binary .dat is DROPPED', async () => {
+  const dir = tmpDir();
+  try {
+    const src = join(dir, 'trace.zip');
+    const dest = join(dir, 'out.zip');
+    const zip = new AdmZip();
+    zip.addFile('trace.trace', Buffer.from(TRACE_NDJSON, 'utf8'));
+    // the cart body Playwright wrote as .dat, carrying a secret AND the diagnostic we need to keep
+    zip.addFile(
+      'resources/aaa1.dat',
+      Buffer.from(JSON.stringify({ cartData: [{ lineItems: [{ sku: DAT_SENTINEL }] }], sessionToken: SESS_TOKEN }), 'utf8'),
+    );
+    // a binary .dat — must still drop, fail-closed
+    zip.addFile('resources/bbb2.dat', Buffer.from([0x00, 0x01, 0x02, 0xff, 0xfe, 0x00, 0x42]));
+    writeFileSync(src, zip.toBuffer());
+
+    assert.equal(await buildRedactedTraceZip(src, dest, makeRedactor(null, [CRED_PASS])), true);
+    const out = new AdmZip(dest);
+    const names = out.getEntries().map((e) => e.entryName);
+
+    // ★ THE POINT OF THE PR: the cart body is now retained…
+    assert.ok(names.includes('resources/aaa1.dat'), 'the text/json .dat body must be RETAINED');
+    const kept = out.getEntry('resources/aaa1.dat')!.getData().toString('utf8');
+    assert.ok(kept.includes(DAT_SENTINEL), 'and its DIAGNOSTIC content must survive — that is why we keep it');
+    assert.ok(kept.includes('lineItems'), 'the shape must be readable — the question this unblocks');
+    // …and scrubbed: the auth-ish JSON key rule applies to it like any other text entry.
+    assert.ok(!kept.includes(SESS_TOKEN), 'LEAK: a secret in a .dat body must be scrubbed');
+
+    // ★ fail-closed half: the binary .dat is still dropped, not copied through a text scrubber.
+    assert.ok(!names.includes('resources/bbb2.dat'), 'a binary .dat must still be DROPPED');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('★ PROVE-CAN-FAIL: extension-only classification LEAVES the cart body out — the test is not vacuous', async () => {
+  // Reconstruct the pre-fix rule (TEXT_ENTRY without .dat, no sniff): the body must be ABSENT. If this
+  // ever finds it present, the assertion above is proving nothing.
+  const PRE_FIX_TEXT = /\.(trace|network|stacks|html?|js|mjs|css|json|txt|svg|xml|csv|map)$/i;
+  assert.equal(PRE_FIX_TEXT.test('resources/aaa1.dat'), false, '★ VACUOUS: .dat already matched pre-fix');
+  assert.equal(classifyEntry('resources/aaa1.dat'), 'sniff', 'and it is now decided by content');
+});
+
+test('★ a huge BINARY .dat is sniffed then DRAINED, not accumulated — the memory bound survives the sniff', async () => {
+  // ★ THE REGRESSION THIS GUARDS. Before the sniff, `.dat` dropped WITHOUT opening a read stream. It is
+  //   now opened so its content can be classified — so the drain-don't-accumulate path is what keeps the
+  //   bound. If someone "simplifies" the data handler into an unconditional chunks.push(), this reds.
+  const dir = tmpDir();
+  try {
+    const BIG = 160 * 1024 * 1024; // 160 MiB, incompressible, binary
+    const src = join(dir, 'trace.zip');
+    {
+      const { randomBytes } = await import('node:crypto');
+      const zip = new AdmZip();
+      zip.addFile('trace.trace', Buffer.from(TRACE_NDJSON, 'utf8'));
+      const blob = randomBytes(BIG);
+      blob[0] = 0x00; // guarantee the NUL tell on the very first chunk
+      zip.addFile('resources/huge.dat', blob);
+      writeFileSync(src, zip.toBuffer());
+    }
+    const dest = join(dir, 'out.zip');
+    const before = process.memoryUsage().rss;
+    const ok = await buildRedactedTraceZip(src, dest, redactor);
+    const grew = process.memoryUsage().rss - before;
+
+    assert.equal(ok, true);
+    const names = new AdmZip(dest).getEntries().map((e) => e.entryName);
+    assert.ok(!names.includes('resources/huge.dat'), 'a binary .dat is still dropped');
+    assert.ok(
+      grew < BIG / 2,
+      `RSS grew ${(grew / 1048576).toFixed(1)} MiB sniffing a 160 MiB binary .dat — the drain path is not holding`,
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
