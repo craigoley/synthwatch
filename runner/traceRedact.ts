@@ -41,6 +41,20 @@ const REDACTED = '<redacted>';
 // /.css/.json/.png (trace.network's content._sha1 embeds it) — and screencast frames are
 // resources/page@<hash>-<ts>.jpeg. So text bodies really are scrubbed-and-kept here, and image
 // entries (screencast + body) really are dropped. Re-verify this probe on a Playwright upgrade.
+//
+// ★★ WHAT THAT PROBE DID NOT COVER, AND WHY EXTENSION-BASED CLASSIFICATION IS THE WEAK POINT. The probe
+//    sampled the mimes a page load happens to produce — html/css/json/png — and every one of them maps
+//    to a name Playwright recognises. It never saw a mime Playwright CANNOT name. Those land in the
+//    `.dat` bucket, and `.dat` was absent from this list, so they dropped silently.
+//    OBSERVED 2026-08-05: the Wegmans cart API serves `Content-Type: text/json` (not application/json),
+//    so every one of its bodies was written as resources/<sha1>.dat and discarded — ZERO of 15 kept in
+//    run 1146366, while 499 `.json` resources from the same run survived.
+//    ★ THE LESSON IS ABOUT THE MECHANISM, not the one mime: an extension is a PROXY for content, chosen
+//    by the producer from a mime WE do not control, so an empirical sample can only ever show which
+//    proxies appeared that day. A mime nobody has emitted yet is indistinguishable from a mime that
+//    cannot exist. `.dat` is therefore classified by CONTENT (classifyEntry → 'sniff' →
+//    looksLikeRedactableText), which is the only test that does not depend on a naming convention
+//    staying complete. The extension list below remains for the mimes Playwright DOES name.
 const TEXT_ENTRY = /\.(trace|network|stacks|html?|js|mjs|css|json|txt|svg|xml|csv|map)$/i;
 
 // Auth-ish name fragment shared by both structural rules (mirrors the redact.ts BUILTIN key list —
@@ -119,9 +133,72 @@ const STRUCTURAL: Array<[RegExp, string]> = [
   ],
 ];
 
-/** How buildRedactedTraceZip treats a zip entry. Exported so the drop-by-default policy is pinnable. */
-export function classifyEntry(entryName: string): 'scrub' | 'drop' {
-  return TEXT_ENTRY.test(entryName) ? 'scrub' : 'drop';
+// ── ★★ `.dat` — THE EXTENSION PLAYWRIGHT USES WHEN IT CANNOT NAME THE MIME ───────────────────────────
+//
+// ★ FOUND 2026-08-05: the Wegmans cart API serves `Content-Type: text/json`. Playwright maps a mime it
+//   does not recognise to `resources/<sha1>.dat`, `.dat` is not in TEXT_ENTRY, and so the body was
+//   dropped fail-closed. MEASURED on run 1146366: ZERO of 15 cart bodies survived while 499 `.json`
+//   resources did — i.e. for every SENSITIVE check, this API's response bodies are absent from the
+//   persisted trace. That is the exact artifact needed to answer a cart-shape question, and its absence
+//   blocked a live diagnosis (check 355 GATE 2).
+//
+// ★★ NOT SOLVED BY ADDING `.dat` TO THE EXTENSION LIST. `.dat` is Playwright's "unknown mime" bucket, so
+//    it is genuinely mixed: a `text/json` body lands there, and so would an `application/octet-stream`
+//    download or any binary whose mime is unrecognised. Adding the extension would copy those through a
+//    TEXT scrubber — bytes that no rule matches, emitted verbatim into the zip. That is precisely the
+//    fail-OPEN this module's drop-by-default exists to prevent.
+//
+// ★ SO `.dat` IS A CANDIDATE, NOT A CLASS: it is admitted only if its CONTENT proves it is text we can
+//   scrub. The test is deliberately narrow (see looksLikeRedactableText) — this widens the kept set by
+//   one well-understood shape, JSON documents, rather than by "not obviously binary".
+const SNIFF_ENTRY = /\.dat$/i;
+
+/** How many leading bytes the sniff inspects. One chunk's worth is plenty to see a JSON opener, and
+ *  bounding it keeps a hostile/huge entry from being buffered just to classify it. */
+export const SNIFF_BYTES = 512;
+
+/**
+ * Does this entry's leading data prove it is TEXT WE CAN SCRUB? Deliberately strict — three conditions,
+ * each of which a binary blob fails:
+ *
+ *   1. NO NUL BYTE. The single most reliable binary tell; no UTF-8 text contains U+0000 in practice.
+ *   2. STRICT UTF-8. A fatal TextDecoder rejects arbitrary bytes. (When the window is full we trim the
+ *      last 3 bytes first — a multi-byte character straddling the boundary would otherwise read as
+ *      invalid and misclassify a perfectly good JSON body as binary.)
+ *   3. STARTS WITH A JSON DOCUMENT — first non-whitespace char is `{` or `[`.
+ *
+ * ★ WHY REQUIRE (3) AT ALL, when 1+2 already say "this is text"? Because "is valid UTF-8" is not the
+ *   question — "is this a shape whose secrets our rules are written for" is. STRUCTURAL and the
+ *   knownValue rules are built for JSON and HAR-ish text; a UTF-8 blob of some other format could carry
+ *   a secret in an encoding none of them match, and we would ship it believing it scrubbed. Requiring a
+ *   JSON opener keeps the widening to the case actually needed (API response bodies) and leaves
+ *   everything else on the drop-by-default path where it was.
+ *
+ * ★ Exported so the policy is pinnable by test, like classifyEntry.
+ */
+export function looksLikeRedactableText(prefix: Buffer): boolean {
+  if (prefix.length === 0) return false; // an empty body carries nothing; drop it
+  const head = prefix.subarray(0, SNIFF_BYTES);
+  if (head.includes(0)) return false; // (1) NUL ⇒ binary
+  // (2) If we filled the window the last character may be cut in half — trim before validating.
+  const safe = head.length === SNIFF_BYTES ? head.subarray(0, head.length - 3) : head;
+  try {
+    new TextDecoder('utf-8', { fatal: true }).decode(safe);
+  } catch {
+    return false;
+  }
+  const s = safe.toString('utf8').replace(/^\uFEFF/, '').trimStart(); // tolerate a BOM
+  return s.startsWith('{') || s.startsWith('['); // (3) a JSON document
+}
+
+/** How buildRedactedTraceZip treats a zip entry.
+ *  'scrub' — known text extension, redact and keep.
+ *  'sniff' — `.dat`, Playwright's unknown-mime bucket: keep ONLY if the content proves it is text.
+ *  'drop'  — everything else (fail-closed default).
+ *  Exported so the drop-by-default policy is pinnable. */
+export function classifyEntry(entryName: string): 'scrub' | 'sniff' | 'drop' {
+  if (TEXT_ENTRY.test(entryName)) return 'scrub';
+  return SNIFF_ENTRY.test(entryName) ? 'sniff' : 'drop';
 }
 
 /** The PLAIN-form scrub: the monitor's redactor first (declared patterns + known secret values), then
@@ -322,17 +399,33 @@ function buildRedactedTraceZipInner(
         //   images, and copies their bytes through VERBATIM (an image cannot be text-scrubbed; the whole
         //   point is that the preview operator gets to look at it).
         const isImage = keepImages && IMAGE_ENTRY.test(name);
-        if (classifyEntry(name) === 'drop' && !isImage) {
+        const cls = classifyEntry(name);
+        if (cls === 'drop' && !isImage) {
           zip.readEntry();
           return;
         }
         zip.openReadStream(entry, (streamErr, rs) => {
           if (streamErr || !rs) return fail(zip);
           const chunks: Buffer[] = [];
+          // ★ SNIFF ON THE FIRST CHUNK, then either accumulate (text) or DRAIN WITHOUT ACCUMULATING
+          //   (binary). That preserves the memory bound this loop is built for — a huge binary `.dat`
+          //   costs one chunk, not its whole length — while still letting a text body through to the
+          //   scrubber. `null` verdict at 'end' (a zero-byte entry) falls to the drop side.
+          let verdict: 'text' | 'binary' | null = cls === 'sniff' ? null : 'text';
           rs.on('error', () => fail(zip));
-          rs.on('data', (c: Buffer) => chunks.push(c));
+          rs.on('data', (c: Buffer) => {
+            if (verdict === null) verdict = looksLikeRedactableText(c) ? 'text' : 'binary';
+            if (verdict === 'binary') return; // drain to 'end' so the walk continues; keep nothing
+            chunks.push(c);
+          });
           rs.on('end', () => {
             if (settled) return;
+            // A sniffed entry that did not prove itself text is DROPPED — same outcome as before this
+            // change, reached by evidence rather than by its extension.
+            if (verdict !== 'text') {
+              zip.readEntry();
+              return;
+            }
             try {
               const raw = Buffer.concat(chunks);
               if (isImage) {
