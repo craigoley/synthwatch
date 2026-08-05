@@ -348,7 +348,7 @@ export function expect(target: unknown, message?: string): SpecExpect {
 // hashes lib/flow.ts's SHARED block and compares it to LIBFLOW-VENDOR-SHA below. When lib/flow.ts's
 // shared helpers change, that check FAILS until you mirror the change into the functions below AND
 // update this sha to the value the check prints. (Single-source refactor — option b — is a follow-up.)
-// LIBFLOW-VENDOR-SHA: 5af81791930abb3fcf2d7fee885c15ee6b5a0c3007fba02fbb5e786e8b90a4ab
+// LIBFLOW-VENDOR-SHA: 42d59fcae352c910ecf32af99787ba575431dc4ac2aac17ef8675ecbc007fce5
 // ---------------------------------------------------------------------------
 export async function assertLoaded(
   page: Page,
@@ -392,16 +392,45 @@ async function isInsideFlowModal(el: Locator): Promise<boolean> {
   }
 }
 
-/** origin+pathname only — the part a NAVIGATION changes. Query/hash churn and a reload are not
- *  navigations for our purposes, and a cookie-accept that reloads must not be mistaken for one. */
-function navKey(url: string): string {
-  try {
-    const u = new URL(url);
-    return u.origin + u.pathname;
-  } catch {
-    return url;
-  }
-}
+/**
+ * Dismiss the common interstitials production e-comm sites throw up (cookie
+ * banners, location/store pickers, newsletter modals) that otherwise intercept
+ * clicks. Best-effort: never fails the flow if a given interstitial isn't
+ * present. Add site-specific dismissals here as flows discover them.
+ *
+ * IMPORTANT: skips any candidate inside a FLOW-DRIVEN modal (see
+ * FLOW_MODAL_EXCLUDE_SELECTOR) so it never closes a modal a spec is actively
+ * driving. Iterates real matches (not just .first()) so a flow-modal close
+ * button never shadows a genuine nuisance-popup button of the same name.
+ *
+ * ★★ DO NOT ADD A "THIS MUST NOT NAVIGATE" GUARD HERE. One was added and REVERTED the same day; it
+ *    took three green checks down (355 login, 77 twice) within one tick of shipping.
+ *
+ *    WHY IT CANNOT WORK IN THAT FORM: a guard comparing the URL before/after cannot distinguish
+ *      (a) a control IT clicked navigating, from
+ *      (b) a navigation ALREADY IN FLIGHT completing while it was looking,
+ *    and (b) is COMMON — every deliberate click that kicks off an async route change or an OAuth
+ *    redirect near a dismissInterstitials call trips it. Observed, all on etag 083d854d:
+ *      • 355 login  "Clicked an unidentified control; wegmans.com/ -> myaccount.wegmans.com/.../authorize"
+ *                   — the spec clicked Sign In itself; the B2C redirect landed during this call.
+ *      • 77         "Clicked an unidentified control; /recipes/search -> /recipes/main-dishes/..."
+ *                   — a recipe-tile click the spec had already issued.
+ *    "Clicked an unidentified control" is the guard ADMITTING it had no click to attribute — it was
+ *    reporting a navigation it did not cause.
+ *
+ *    AND ATTRIBUTION ALONE IS NOT ENOUGH. The third failure was
+ *      • 77         'Clicked "Close"; wegmans.com/ -> wegmans.com/recipes'
+ *    a genuinely self-navigating control this helper DID click — but the spec's very next step is
+ *    /recipes, so the navigation was WANTED. A correct guard would have to attribute the navigation
+ *    to a click it issued AND know whether the flow wanted it, and only the caller knows the second.
+ *
+ *    ★ A fixed settle does not rescue it either (and is banned fleet-wide): waiting WIDENS the window
+ *      in which an unrelated redirect can land, making misattribution more likely, not less.
+ *
+ *    What actually removed the known cause is the ANCHORED /^continue$/i candidate below — the loose
+ *    /continue/i was clicking Wegmans' "Continue Shopping". Keep that. If a self-navigating control is
+ *    found again, exclude it by NAME here; do not re-add a global URL guard.
+ */
 
 export async function dismissInterstitials(page: Page): Promise<void> {
   const candidates: Array<{ role: 'button'; name: RegExp }> = [
@@ -418,10 +447,6 @@ export async function dismissInterstitials(page: Page): Promise<void> {
     //    been the next one.
     { role: 'button', name: /^continue$/i },
   ];
-  // ★ Where we started. A dismisser must never move the page — see the exit guard below.
-  const startedAt = navKey(page.url());
-  let lastClicked: string | null = null;
-
   for (const c of candidates) {
     const matches = page.getByRole(c.role, { name: c.name });
     // Declared without an initializer (the runner's eslint flags the dead `= 0`); the catch's
@@ -442,36 +467,15 @@ export async function dismissInterstitials(page: Page): Promise<void> {
         // Never dismiss a button the active flow is driving (e.g. the meals2go
         // fulfillment modal's close button) -- that would close it on the flow.
         if (await isInsideFlowModal(el)) continue;
-        lastClicked = (await el.textContent({ timeout: 500 }).catch(() => null))?.trim().slice(0, 40) ?? '(unnamed)';
         await el.click({ timeout: 2000 });
         break; // one genuine dismissal per candidate is enough
-        // ★ THIS break IS UNCONDITIONAL, and must stay so. An earlier draft of this change made it
-        //   conditional on "did the page move?", which quietly turned the loop into "click EVERY
-        //   visible match for this candidate" — widening the click surface in the very change whose
-        //   purpose is to narrow it. The navigation check belongs AFTER the inner loop (below), where
-        //   it stops the OUTER candidate walk without adding clicks.
+        // ★ THIS break IS UNCONDITIONAL, and must stay so. A draft of the (now-reverted) navigation
+        //   guard made it conditional on "did the page move?", which quietly turned the loop into
+        //   "click EVERY visible match for this candidate" — widening the click surface in the very
+        //   change whose purpose was to narrow it.
       } catch {
         // best-effort; ignore
       }
     }
-    if (navKey(page.url()) !== startedAt) break; // stop clicking things on a page we did not choose
-  }
-
-  // ★★ THE GUARD — A SILENT NAVIGATION IS WORSE THAN A LOUD REFUSAL. This helper exists to clear
-  //    nuisance overlays; moving the page is never a correct outcome for it. If it happens, every
-  //    assertion after the call would be measuring a different page, and the failure would surface
-  //    somewhere unrelated — which is exactly what cost two separate diagnoses (the mega-menu in the
-  //    clear-cart occlusion, and verify-cart-4 reporting url=/shop/categories).
-  //    ★ Compared on origin+pathname, so a reload or a query/hash change does NOT trip it — only a
-  //      real move. Throwing is deliberate: the caller's step fails HERE, naming the control, instead
-  //      of an assertion failing later against the wrong page.
-  const endedAt = navKey(page.url());
-  if (endedAt !== startedAt) {
-    throw new Error(
-      `dismissInterstitials NAVIGATED the page — it must only dismiss overlays, never move. ` +
-        `Clicked ${lastClicked === null ? 'an unidentified control' : `"${lastClicked}"`}; ` +
-        `${startedAt} -> ${endedAt}. Every assertion after this call would have run on a page the ` +
-        `flow did not choose. Narrow the candidate that matched, or exclude this control.`,
-    );
   }
 }
