@@ -24,7 +24,19 @@ name: Auto-merge janitor
 
 on:
   schedule:
-    - cron: '*/30 * * * *' # every 30 min — a stuck trusted PR recovers within one window
+    # ★★ `*/30` IS A REQUEST, NOT A GUARANTEE — AND IT IS NOT WHAT HAPPENS. GitHub throttles schedule
+    #    events heavily. MEASURED on this workflow, 13 consecutive firings (2026-08-05):
+    #        95 / 103 / 142 / 116 / 170 / 159 / 191 / 136 / 86 / 76 / 107 / 56 / 60 minutes
+    #    median ~107 min, worst 191 min — i.e. ~3.5x the interval asked for. The comment this replaces
+    #    said "a stuck trusted PR recovers within one window", which read as 30 minutes and is false;
+    #    a documented guarantee that does not hold is worse than none, because it stops anyone looking.
+    #    ★ So treat this as an EVENTUAL backstop measured in HOURS, not a 30-minute SLA. The step below
+    #      logs elapsed-since-last-run precisely so this is observable rather than archaeology.
+    #    ★ #393 (2026-08-05) is what this cost: a token-merge landed at 19:00, no janitor run happened
+    #      before the manual dispatch at 19:40, and the runner sat undeployed. The PROMPT recovery for a
+    #      merged PR is now deploy-on-merge.yml (a `pull_request: closed` EVENT, no polling, no cron);
+    #      this sweep remains the catch-all for everything that is not a merged PR.
+    - cron: '*/30 * * * *'
   workflow_dispatch: {}
 
 permissions:
@@ -42,6 +54,33 @@ jobs:
       pull-requests: write # enable auto-merge
       actions: write # list deploy runs + dispatch Deploy (the token-merge recovery below)
     steps:
+      # ★ OBSERVABILITY: how long since this sweep last actually fired? The cron says 30 min; reality is
+      #   a median of ~107. Logging it every run turns "the backstop is slow" from something you infer by
+      #   digging through run history into something the run itself tells you — and makes a genuinely
+      #   stalled schedule (hours, or GitHub disabling it) visible on the next firing.
+      - name: Report elapsed since the previous janitor run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          THIS_RUN: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          PREV=$(gh run list --repo "$REPO" --workflow automerge-janitor.yml --limit 10 \
+                   --json databaseId,createdAt \
+                   --jq "[.[] | select(.databaseId != $THIS_RUN)][0].createdAt // \"\"")
+          if [ -z "$PREV" ]; then
+            echo "No previous janitor run found — first firing, or history rolled."
+            exit 0
+          fi
+          NOW_S=$(date -u +%s)
+          PREV_S=$(date -u -d "$PREV" +%s 2>/dev/null || python3 -c "import datetime,sys;print(int(datetime.datetime.fromisoformat(sys.argv[1].replace('Z','+00:00')).timestamp()))" "$PREV")
+          MINS=$(( (NOW_S - PREV_S) / 60 ))
+          echo "Previous janitor run: $PREV — elapsed ${MINS} min (cron asks for 30)."
+          # 45 min = a generous allowance over the 30-min cron before we call it drift.
+          if [ "$MINS" -gt 45 ]; then
+            echo "::warning title=Janitor schedule is running late::${MINS} min since the previous run (cron: */30). GitHub throttles schedule events; this backstop is EVENTUAL, not a 30-minute SLA. A merged PR needing a deploy is covered promptly by deploy-on-merge.yml instead."
+          fi
+
       - name: Re-enable auto-merge on trusted, non-draft, auto-merge-off PRs
         env:
           GH_TOKEN: ${{ github.token }}

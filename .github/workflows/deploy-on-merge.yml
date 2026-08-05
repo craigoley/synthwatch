@@ -1,0 +1,83 @@
+name: Deploy dispatch on merge
+
+# ★★ THE THIRD DISPATCHER — and the only one that is neither a poll nor a cron.
+#
+# WHY IT EXISTS. GitHub SUPPRESSES the `push` event for a merge completed by GITHUB_TOKEN (native
+# auto-merge), so deploy.yml's `on: push` cannot fire post-auto-merge. Two dispatchers already cover
+# that, and BOTH missed on 2026-08-05 (#393, 3e7bbdf):
+#   • claude-review `automerge` — a ≤20 min POLL from when auto-merge is ARMED. #393's merge landed
+#     ~40 min late (hand re-runs of `Lib-flow parity`, then `ci-gate`), i.e. after the poll had gone.
+#     This is the documented #361 failure mode: "misses a merge that lands later (a re-run / slow check)".
+#   • automerge-janitor — `cron: */30`, but GitHub throttles schedule events hard. MEASURED gaps over
+#     13 consecutive firings: 95/103/142/116/170/159/191/136/86/76/107/56/60 min — median ~107, worst
+#     191. There was NO janitor run between #393's merge (19:00) and the manual dispatch (19:40).
+#
+# ★ `pull_request: closed` IS DELIVERED for a GITHUB_TOKEN merge and is an EVENT, not a poll — so it
+#   fires the moment the merge lands, however late that is. That closes the exact hole #393 fell into
+#   without touching `on: push`.
+#
+# ★★ THIS DOES NOT WIDEN WHAT DEPLOYS. It dispatches deploy.yml, which decides everything else; the
+#    path filter below mirrors deploy.yml's `on.push.paths` exactly, so a docs-only merge dispatches
+#    nothing. An accidental deploy-on-every-push would be worse than a missed one — this is not that:
+#    it fires once per MERGED pull request into main, never on a direct push.
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: read
+
+concurrency:
+  # Per-PR: a re-delivered event for the same PR supersedes rather than double-dispatches.
+  group: deploy-on-merge-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  deploy-dispatch:
+    # Merged only (a CLOSED-unmerged PR must never deploy), and only into main.
+    if: github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write # list deploy runs + dispatch deploy.yml
+      contents: read
+    steps:
+      - name: Dispatch Deploy if this merge touched deploy-relevant paths
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          set -euo pipefail
+
+          # ── 1. RELEVANCE — the SAME filter as deploy.yml's on.push.paths and the janitor's sweep:
+          #    runner/**, db/** except *.md, any Dockerfile, the deploy workflow itself.
+          #    Read from the PR's own file list, so this needs no checkout.
+          CHANGED=$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename' 2>/dev/null || echo "")
+          RELEVANT=$(printf '%s\n' "$CHANGED" | grep -vE '^db/.*\.md$' \
+                       | grep -E '^(runner/|db/|.*Dockerfile$|\.github/workflows/deploy\.yml$)' || true)
+          if [ -z "$RELEVANT" ]; then
+            echo "PR #$PR merged but touched no deploy-relevant paths — nothing to dispatch."
+            printf '  changed:\n%s\n' "$CHANGED" | sed 's/^/    /'
+            exit 0
+          fi
+
+          # ── 2. IDEMPOTENCE — do not race the ≤20 min poll. Same state test the janitor uses: if a
+          #    Deploy for THIS merge commit is already in flight or has succeeded, there is nothing to do.
+          #    ★ Belt AND braces: even if this check loses a race with the fast path, deploy.yml's
+          #      `concurrency: deploy-main, cancel-in-progress: true` means the second dispatch cancels
+          #      the first and rolls the same (or newer) main — one successful deploy of the right sha,
+          #      at worst one wasted build. Harmless, but skipping is cheaper and quieter.
+          EXISTING=$(gh run list --repo "$REPO" --workflow deploy.yml --limit 30 \
+                       --json headSha,status,conclusion \
+                       --jq '[.[] | select(.status=="in_progress" or .status=="queued" or .conclusion=="success")][0].headSha // ""')
+          if [ -n "$EXISTING" ] && [ "$EXISTING" = "$MERGE_SHA" ]; then
+            echo "Deploy for $MERGE_SHA is already in flight or succeeded — not dispatching."
+            exit 0
+          fi
+
+          echo "::notice title=Dispatching Deploy for a merged PR::PR #$PR merged into main with deploy-relevant changes; dispatching deploy.yml (the push event is suppressed for GITHUB_TOKEN merges)."
+          printf '  relevant changes:\n%s\n' "$RELEVANT" | sed 's/^/    /'
+          gh workflow run deploy.yml --repo "$REPO" --ref main
+          echo "Deploy dispatched for main after PR #$PR."

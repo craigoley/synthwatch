@@ -286,8 +286,56 @@ the only thing keeping the taxonomy doc from becoming fiction.
 
 ### `Deploy runner to ACA Job` — **P0 (not a gate — the deployment itself)**
 
-Listed because it appears in the same check list. It is not a PR gate; it rolls the runner image to all
-ACA jobs on push to `main`. Its own safety comes from `Deploy-script tests` and `verify()`.
+Listed because it appears in the same check list. It is not a PR gate; it builds the runner + migrate
+images (`az acr build` — there is **no separate build workflow**) and rolls them to all ACA jobs. Its own
+safety comes from `Deploy-script tests` and `verify()`.
+
+#### ★★ A merge does NOT trigger the deploy directly — it is *dispatched*
+
+`deploy.yml` does declare `on: push` (paths: `runner/**`, `db/**` except `*.md`, any `Dockerfile`,
+`deploy.yml` itself). **That trigger never fires for a normal merge**, because GitHub **suppresses the
+`push` event for a merge completed by `GITHUB_TOKEN`** — which is what native auto-merge uses. Every
+entry in the Deploy run history is `workflow_dispatch`, and that is correct, not a symptom.
+
+Three dispatchers cover it. Know which is which, because they fail differently:
+
+| dispatcher | kind | when it fires | fails when |
+|---|---|---|---|
+| `deploy-on-merge.yml` | **event** (`pull_request: closed`, `merged == true`) | seconds after any merged PR into `main` | never, for a merged PR — this is the reliable path |
+| `claude-review` → `automerge` | **poll**, ≤20 min from *arming* auto-merge | usually within seconds | the merge lands **later** than the poll window |
+| `automerge-janitor` | **cron** `*/30`, state-based sweep | eventually | GitHub throttles schedules — see below |
+
+★ **The janitor is not a 30-minute SLA.** Measured over 13 consecutive firings (2026-08-05):
+`95 / 103 / 142 / 116 / 170 / 159 / 191 / 136 / 86 / 76 / 107 / 56 / 60` minutes — **median ~107, worst
+191**. Treat it as an eventual catch-all measured in hours. It logs its own elapsed-since-last-run and
+warns past 45 min, so you can see the drift rather than reconstruct it.
+
+#### ★ THE GOTCHA YOU WILL HIT: re-running a stale gate
+
+This is not hypothetical — it happened on 2026-08-05 (#393) and it is the single most likely way a new
+engineer reproduces it, because **learning the gates means re-running them**:
+
+1. A PR goes red on a gate for a reason outside the PR (e.g. `Lib-flow parity` waiting on the paired
+   monitors merge — see that gate's entry).
+2. You fix the ordering, re-run the gate, then re-run `ci-gate` (**it does not recompute on its own when
+   a dependency re-runs** — you must re-run the aggregator too).
+3. The PR merges — but **~40 minutes after auto-merge was armed**, so the ≤20 min poll is long gone.
+4. Before `deploy-on-merge.yml` existed, the only remaining dispatcher was the janitor, which did not run
+   for another ~40 min. The runner sat merged-but-undeployed with **green CI on every check**.
+
+★ `deploy-on-merge.yml` closes this: it is an event, not a poll, so it fires whenever the merge lands.
+**But if you ever see a merged runner/db change with no Deploy run**, the remedy is one command — do not
+wait on the cron:
+
+```console
+$ gh workflow run deploy.yml --repo craigoley/synthwatch --ref main
+```
+
+`scripts/deploy.sh` also says this when it sees no Deploy run for the target SHA. A persistent
+*"no Deploy run exists yet"* is **not a slow build — it usually means nothing dispatched one.**
+
+★ The stakes are on record: **#361** (2026-07-23) was this exact class — a token-merge past the poll,
+nothing dispatched, the migration never reached prod, and the api 500'd on every `/incidents` read.
 
 ---
 
