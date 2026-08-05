@@ -348,7 +348,7 @@ export function expect(target: unknown, message?: string): SpecExpect {
 // hashes lib/flow.ts's SHARED block and compares it to LIBFLOW-VENDOR-SHA below. When lib/flow.ts's
 // shared helpers change, that check FAILS until you mirror the change into the functions below AND
 // update this sha to the value the check prints. (Single-source refactor — option b — is a follow-up.)
-// LIBFLOW-VENDOR-SHA: 2d49870eac440a766fc4233b0f9c593d24158356365720e7b36275a111b06b85
+// LIBFLOW-VENDOR-SHA: 5af81791930abb3fcf2d7fee885c15ee6b5a0c3007fba02fbb5e786e8b90a4ab
 // ---------------------------------------------------------------------------
 export async function assertLoaded(
   page: Page,
@@ -392,35 +392,86 @@ async function isInsideFlowModal(el: Locator): Promise<boolean> {
   }
 }
 
+/** origin+pathname only — the part a NAVIGATION changes. Query/hash churn and a reload are not
+ *  navigations for our purposes, and a cookie-accept that reloads must not be mistaken for one. */
+function navKey(url: string): string {
+  try {
+    const u = new URL(url);
+    return u.origin + u.pathname;
+  } catch {
+    return url;
+  }
+}
+
 export async function dismissInterstitials(page: Page): Promise<void> {
-  // Cookie/newsletter/consent matchers UNCHANGED — the exclusion is scoped, not a gutting.
   const candidates: Array<{ role: 'button'; name: RegExp }> = [
     { role: 'button', name: /accept( all)?( cookies)?/i },
     { role: 'button', name: /^(close|no thanks|not now|dismiss)$/i },
-    { role: 'button', name: /continue/i },
+    // ★★ ANCHORED (was /continue/i). An interstitial's button is named exactly "Continue"; an
+    //    UNANCHORED match also hits every app control whose label merely CONTAINS the word — and
+    //    Wegmans' /cart carries `<button class="…component--cart-continue-shopping-button…">Continue
+    //    Shopping</button>`, 4 of 6 instances not xl:hidden, so one is visible at 1280x720 and was
+    //    being clicked. That NAVIGATED the run off /cart (a Next.js client-side route change — no
+    //    document request, which is why it never showed up in the network trace), and every assertion
+    //    after the call then ran on a page the flow did not choose. Candidate 2 was already anchored;
+    //    this one being loose was the inconsistency, and the bug. "Continue to checkout" would have
+    //    been the next one.
+    { role: 'button', name: /^continue$/i },
   ];
+  // ★ Where we started. A dismisser must never move the page — see the exit guard below.
+  const startedAt = navKey(page.url());
+  let lastClicked: string | null = null;
+
   for (const c of candidates) {
     const matches = page.getByRole(c.role, { name: c.name });
     // Declared without an initializer (the runner's eslint flags the dead `= 0`); the catch's
     // `continue` means count is always assigned by the time the loop below reads it.
+    // ★ A DELIBERATE, RUNNER-LOCAL DIVERGENCE from lib/flow.ts, which keeps `let count = 0` — the
+    //   parity gate hashes lib/flow.ts's block rather than byte-comparing the copies precisely so
+    //   lint-driven differences like this one are allowed. Do not "restore" the initializer here.
     let count: number;
     try {
       count = await matches.count();
     } catch {
       continue;
     }
-    // Iterate REAL matches (not just .first()) so a flow-modal close button can't shadow a genuine
-    // cookie/newsletter button of the same accessible name.
     for (let i = 0; i < count; i++) {
       const el = matches.nth(i);
       try {
         if (!(await el.isVisible({ timeout: 1000 }))) continue;
-        if (await isInsideFlowModal(el)) continue; // never close a modal the active flow is driving
+        // Never dismiss a button the active flow is driving (e.g. the meals2go
+        // fulfillment modal's close button) -- that would close it on the flow.
+        if (await isInsideFlowModal(el)) continue;
+        lastClicked = (await el.textContent({ timeout: 500 }).catch(() => null))?.trim().slice(0, 40) ?? '(unnamed)';
         await el.click({ timeout: 2000 });
         break; // one genuine dismissal per candidate is enough
+        // ★ THIS break IS UNCONDITIONAL, and must stay so. An earlier draft of this change made it
+        //   conditional on "did the page move?", which quietly turned the loop into "click EVERY
+        //   visible match for this candidate" — widening the click surface in the very change whose
+        //   purpose is to narrow it. The navigation check belongs AFTER the inner loop (below), where
+        //   it stops the OUTER candidate walk without adding clicks.
       } catch {
         // best-effort; ignore
       }
     }
+    if (navKey(page.url()) !== startedAt) break; // stop clicking things on a page we did not choose
+  }
+
+  // ★★ THE GUARD — A SILENT NAVIGATION IS WORSE THAN A LOUD REFUSAL. This helper exists to clear
+  //    nuisance overlays; moving the page is never a correct outcome for it. If it happens, every
+  //    assertion after the call would be measuring a different page, and the failure would surface
+  //    somewhere unrelated — which is exactly what cost two separate diagnoses (the mega-menu in the
+  //    clear-cart occlusion, and verify-cart-4 reporting url=/shop/categories).
+  //    ★ Compared on origin+pathname, so a reload or a query/hash change does NOT trip it — only a
+  //      real move. Throwing is deliberate: the caller's step fails HERE, naming the control, instead
+  //      of an assertion failing later against the wrong page.
+  const endedAt = navKey(page.url());
+  if (endedAt !== startedAt) {
+    throw new Error(
+      `dismissInterstitials NAVIGATED the page — it must only dismiss overlays, never move. ` +
+        `Clicked ${lastClicked === null ? 'an unidentified control' : `"${lastClicked}"`}; ` +
+        `${startedAt} -> ${endedAt}. Every assertion after this call would have run on a page the ` +
+        `flow did not choose. Narrow the candidate that matched, or exclude this control.`,
+    );
   }
 }
