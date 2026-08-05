@@ -12,6 +12,7 @@ import {
   CRED_USERNAME_CLEARTEXT_ALLOWANCE,
 } from './loginCredentials.js';
 import { credential } from './specfetch/specShim.js';
+import { setSpecCredentials, __clearSpecCredentialsForTest } from './specfetch/specCredentials.js';
 import { encryptCredValue, loadCredEncKey } from './crypto.js';
 import { makeRedactor, MARKER_USERNAME } from './redact.js';
 
@@ -138,20 +139,86 @@ test('credential(role): returns the published (decrypted) value; throws fail-clo
   }
 });
 
-test('★ credential(role): the SANDBOX miss says preview creds never arrive (SW_SANDBOX-aware), not "set an env var"', () => {
-  // Item-2 behaviour: the sandbox sets SW_SANDBOX=1 and never receives SW_CRED_* (sandbox env boundary), so a
-  // credential()-based spec cannot resolve in a preview. credential() detects that and says so specifically.
+test('★ credential(role): the SANDBOX miss says NO CREDENTIALS WERE SUPPLIED, not "set an env var"', () => {
+  // ★ CHANGED. The message used to say the sandbox "never receives SW_CRED_*" and to send the operator to a
+  //   LIVE run. That is no longer true: a preview now delivers the user's typed credentials in-process
+  //   (specCredentials.ts), so a miss means they typed NONE — an actionable, fixable-here condition. Keeping
+  //   the old wording would have told an operator to go do a live deploy to work around a blank text field.
   const saved = snapshot();
   try {
     delete process.env.SW_CRED_USERNAME; // ensure unpublished
     process.env.SW_SANDBOX = '1';
+    __clearSpecCredentialsForTest(); // and nothing installed in-process either
     let msg = '';
     try { credential('username'); } catch (e) { msg = (e as Error).message; }
     assert.match(msg, /credential\("username"\) is not available/);
     assert.match(msg, /preview\/sandbox run/);
-    assert.match(msg, /never receives SW_CRED_\*/);
-    assert.match(msg, /LIVE run/);
+    assert.match(msg, /no credentials were supplied/);
+    assert.match(msg, /Credentials panel of the Tests area/);
+    assert.ok(!/never receives SW_CRED_\*/.test(msg), 'the stale "creds never arrive in a preview" claim must be gone');
     assert.ok(!/ENV_VAR_NAME/.test(msg), 'sandbox message must not carry the stale model-A ENV_VAR_NAME language');
+  } finally {
+    __clearSpecCredentialsForTest();
+    restoreEnv(saved);
+  }
+});
+
+// ── ★ credential() resolves from the IN-PROCESS store in a preview — the unit-level half of the gate ─────
+// The end-to-end proof (a real spec, a real browser, reaching its first navigation) is
+// sandbox/sandboxCredentialResolution.test.ts. These pin the accessor's own contract.
+test('★ credential(role): a PREVIEW resolves from the in-process store — with NOTHING in process.env', () => {
+  const saved = snapshot();
+  try {
+    delete process.env.SW_CRED_USERNAME;
+    delete process.env.SW_CRED_PASSWORD;
+    process.env.SW_SANDBOX = '1';
+    setSpecCredentials({ username: 'typed-user', password: 'typed-pass', bypassToken: 'typed-bypass' });
+
+    assert.equal(credential('username'), 'typed-user');
+    assert.equal(credential('password'), 'typed-pass');
+    assert.equal(credential('bypassToken'), 'typed-bypass');
+    // Case-insensitive, exactly as the fleet path is (SW_CRED_<ROLE.toUpperCase()>).
+    assert.equal(credential('USERNAME'), 'typed-user');
+    assert.equal(credential('BypassToken'), 'typed-bypass');
+
+    // ★ THE POINT: resolution happened with the credential in NO environment variable, under any name.
+    for (const [k, v] of Object.entries(process.env)) {
+      assert.ok(!String(v).includes('typed-pass'), `the password must not be in process.env (found at ${k})`);
+    }
+    assert.equal(process.env.SW_CRED_USERNAME, undefined);
+  } finally {
+    __clearSpecCredentialsForTest();
+    restoreEnv(saved);
+  }
+});
+
+test('★ credential(role): an EMPTY typed value is NOT a credential — it fails closed, never returns ""', () => {
+  // A blank field must not be submitted to a login form as an empty string; it must throw like an absent one.
+  const saved = snapshot();
+  try {
+    delete process.env.SW_CRED_PASSWORD;
+    process.env.SW_SANDBOX = '1';
+    setSpecCredentials({ username: 'typed-user', password: '' });
+    assert.throws(() => credential('password'), /credential\("password"\) is not available/);
+    // …and the diagnostic names the roles that DID arrive, so the operator sees which field they left blank.
+    let msg = '';
+    try { credential('password'); } catch (e) { msg = (e as Error).message; }
+    assert.match(msg, /supplied \[username\]/);
+  } finally {
+    __clearSpecCredentialsForTest();
+    restoreEnv(saved);
+  }
+});
+
+test('★ credential(role): the FLEET path is unchanged — env wins and the store is empty in the runner', () => {
+  const saved = snapshot();
+  try {
+    process.env.CRED_ENC_KEY = TEST_KEY_B64;
+    delete process.env.SW_SANDBOX;
+    __clearSpecCredentialsForTest(); // the live runner never calls setSpecCredentials
+    const handles = applyLoginCredentials({ username: enc('alice@test') });
+    assert.equal(credential('username'), 'alice@test'); // resolved from SW_CRED_USERNAME, as always
+    clearLoginCredentials(handles);
   } finally {
     restoreEnv(saved);
   }

@@ -18,6 +18,7 @@ import type { TerminalStatus } from '../db.js';
 import { IDENTITY_REDACTOR, makeRedactor, previewPersistPlan, scrubError, type Redactor } from '../redact.js';
 import { compileSpec } from '../specfetch/compileSpec.js';
 import { buildRedactedTraceZip } from '../traceRedact.js';
+import { writeChildCredentials } from './sandboxCredChannel.js';
 import { buildSandboxEnv, type SandboxRunVars } from './sandboxEnv.js';
 import { credentialValues, isCredentialedRun, type SandboxCredentials } from './sandboxPayload.js';
 
@@ -152,6 +153,14 @@ export async function runSandboxPreview(
      * Never pass this in prod. (Same accepted pattern as crypto.ts's `ivOverride`.)
      */
     __unsafeDisableSensitiveHandlingForTest?: boolean;
+    /**
+     * ★ TEST-ONLY, and the ONLY way the credential-RESOLUTION suite can prove it is not vacuous. Skips the
+     * stdin credential write, so the child installs nothing and `credential()` takes its fail-closed refusal
+     * branch — i.e. it reproduces the exact pre-fix behaviour on demand. A resolution test that cannot be
+     * made to RED by unwiring the resolution asserts nothing (the vacuous-check class from #279/#281).
+     * Never pass this in prod. (Same accepted pattern as the flag above.)
+     */
+    __unsafeSkipCredentialChannelForTest?: boolean;
   },
 ): Promise<PreviewResult> {
   const runVars: SandboxRunVars = {
@@ -200,25 +209,47 @@ export async function runSandboxPreview(
   const specFile = join(dir, 'spec.compiled.mjs');
   try {
     await writeFile(specFile, compiledJs, 'utf8');
-    return await runChild(specFile, runVars, sensitive, redact);
+    return await runChild(specFile, runVars, sensitive, redact, {
+      skipCredentialChannel: vars.__unsafeSkipCredentialChannelForTest === true,
+    });
   } finally {
     await rm(dir, { recursive: true, force: true }).catch(() => {});
   }
 }
 
-function runChild(specFile: string, vars: SandboxRunVars, sensitive: boolean, redact: Redactor): Promise<PreviewResult> {
+function runChild(
+  specFile: string,
+  vars: SandboxRunVars,
+  sensitive: boolean,
+  redact: Redactor,
+  opts: { skipCredentialChannel: boolean },
+): Promise<PreviewResult> {
   return new Promise((resolve) => {
     let stdout = '';
     let stderr = '';
     let timedOut = false;
     // ★ detached — the child leads its OWN process group, so the timeout kill reaps grandchildren too
     //   (a hostile spec that spawns a detached grandchild cannot outlive the budget by escaping its parent).
+    // ★ stdin is 'pipe' (was 'ignore') ONLY to carry the credential line — see sandboxCredChannel.ts for why
+    //   this channel is stdin and not env/argv/a temp file. It is written and CLOSED immediately below, so
+    //   uploaded code inherits an fd 0 that is already at EOF.
     const child = spawn(process.execPath, [CHILD_ENTRY, specFile], {
       env: buildSandboxEnv(vars), // ★ allowlist — the child NEVER inherits the parent's secrets
       cwd: tmpdir(),
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ['pipe', 'pipe', 'pipe'],
       detached: true,
     });
+
+    // ★ FIRST thing after spawn, before any output handling: hand over the credentials and end the pipe. The
+    //   child blocks on this read until EOF, so a skipped/failed write does not hang it — it proceeds with an
+    //   empty set and credential() throws its fail-closed refusal.
+    if (opts.skipCredentialChannel) {
+      // TEST-ONLY unwiring (see __unsafeSkipCredentialChannelForTest). stdin must still be CLOSED, or the
+      // child's drain never resolves and the run dies on the timeout instead of on the refusal we want to see.
+      child.stdin?.end();
+    } else {
+      writeChildCredentials(child.stdin, vars.credentials);
+    }
 
     // ★ hard kill the whole process GROUP — a runaway/infinite spec (or a detached grandchild it spawned)
     //   cannot outlive the budget. `-pid` targets the group; fall back to the direct child if pid is unset.
