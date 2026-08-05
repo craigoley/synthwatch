@@ -11,8 +11,21 @@
 //    NOT Playwright's context-wide extraHTTPHeaders.
 //  • FAIL-SOFT: if VERCEL_BYPASS_TOKEN is unset (local runs, non-protected fleets), NO header is added and
 //    nothing breaks — non-protected checks are unaffected.
-//  • NEVER LOGGED / NEVER PERSISTED: the value is a REQUEST header. The trace extractor (traceSignals.ts)
-//    captures response/url/method only — NOT request headers — so the token can't reach runs.trace_signals.
+//  • NEVER LOGGED / NEVER PERSISTED — ★ TRUE OF runs.trace_signals, AND IT WAS NOT TRUE OF THE TRACE ZIP.
+//    The narrow claim holds: the trace extractor (traceSignals.ts) captures response/url/method only, NOT
+//    request headers, so the token cannot reach runs.trace_signals.
+//    ★ BUT THE PLAYWRIGHT TRACE ZIP DOES CARRY REQUEST HEADERS, and until 2026-08-05 the token sat there
+//    in CLEARTEXT on every retained trace of a sensitive check — `x-vercel-protection-bypass`, 3,230
+//    occurrences in one measured run, under the 90-day artifact retention. traceRedact's structural rules
+//    key on AUTHISH FRAGMENTS (token|cookie|authorization|secret|api_key|…) and this header name contains
+//    none of them; the sibling `x-vercel-set-bypass-cookie` was redacted only by the accident of
+//    containing "cookie". A documented guarantee that did not hold is worse than no guarantee, so the
+//    scope is now stated exactly.
+//    ★ CLOSED TWO WAYS, deliberately belt-and-braces: traceRedact.SECRET_HEADER_NAMES matches the header
+//    by EXACT NAME, and runner/index.ts registers bypassToken() as a redactor knownValue so the VALUE is
+//    scrubbed wherever it appears — which is what survives a header rename.
+//    ★ IF YOU ADD A NEW SECRET REQUEST HEADER, it is NOT covered automatically. Add its name to
+//    SECRET_HEADER_NAMES, and its value to the zip redactor if the runner holds it.
 import { hostOf } from './deploys.js';
 
 export const BYPASS_HEADER = 'x-vercel-protection-bypass';

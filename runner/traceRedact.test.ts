@@ -496,3 +496,108 @@ test('★ PREVIEW: keepImages keeps the screencast jpeg VERBATIM — and still s
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ── ★★ THE AUTHISH GAP: SECRET HEADERS THAT NO FRAGMENT MATCHES ─────────────────────────────────────
+// FOUND IN PROD 2026-08-05: `x-vercel-protection-bypass` rode trace.network in CLEARTEXT on every
+// retained trace of a sensitive check (3,230 occurrences in one measured run, 90-day retention). The
+// structural rules key on AUTHISH FRAGMENTS and this name contains none of them; its sibling
+// `x-vercel-set-bypass-cookie` was redacted only by the accident of containing "cookie". Auditing all
+// 52 request-header names a real trace persists found a second: `ocp-apim-subscription-key` (AUTHISH's
+// `api[_-]?key` does not match "apim-subscription-key" — "api" is followed by "m").
+const VERCEL_TOKEN = 'K4gTbDwgVERCELtokenSENTINEL';
+const APIM_KEY = 'b90c7176APIMkeySENTINEL';
+
+/** A trace.network line shaped exactly as Playwright writes it: a HAR request with a header array. */
+const harLineWith = (headers: Array<[string, string]>): string =>
+  JSON.stringify({
+    type: 'resource-snapshot',
+    snapshot: {
+      request: {
+        method: 'GET',
+        url: 'https://www.wegmans.com/cart',
+        headers: headers.map(([name, value]) => ({ name, value })),
+      },
+      response: { status: 200, headers: [] },
+    },
+  });
+
+test('★ SECRET HEADER by exact NAME is redacted — the fragment list never matched it', () => {
+  const line = harLineWith([
+    ['x-vercel-protection-bypass', VERCEL_TOKEN],
+    ['ocp-apim-subscription-key', APIM_KEY],
+    ['user-agent', 'HeadlessChrome/151'], // an ordinary header must survive
+  ]);
+  // IDENTITY_REDACTOR: the STRUCTURAL rule alone must do it, with no known-value help.
+  const out = scrubPlainText(line, IDENTITY_REDACTOR);
+  assert.ok(!out.includes(VERCEL_TOKEN), 'the Vercel bypass token must not survive');
+  assert.ok(!out.includes(APIM_KEY), 'the APIM subscription key must not survive');
+  assert.ok(out.includes('HeadlessChrome/151'), 'an ordinary header value must NOT be over-redacted');
+  assert.doesNotThrow(() => JSON.parse(out), 'the NDJSON line must stay valid JSON for the trace viewer');
+});
+
+test('★ PROVE-CAN-FAIL: without the secret-header rule the token SURVIVES — the test is not vacuous', () => {
+  // Reconstruct the PRE-FIX behaviour exactly: the AUTHISH fragment rules, minus the exact-name rule.
+  // If this ever comes back clean, the assertion above is proving nothing.
+  const AUTHISH = '(?:token|session|sess[_-]?id|\\bsid\\b|jwt|bearer|authorization|oauth|\\bauth\\b|secret|password|passwd|pwd|api[_-]?key|cookie|csrf|xsrf|signature)';
+  const JSON_STR = '(?:[^"\\\\]|\\\\.)*';
+  const preFix = (t: string): string =>
+    t.replace(new RegExp(`("name"\\s*:\\s*"[\\w-]*${AUTHISH}[\\w-]*"\\s*,\\s*"value"\\s*:\\s*")${JSON_STR}(")`, 'gi'), '$1<redacted>$2');
+
+  const line = harLineWith([
+    ['x-vercel-protection-bypass', VERCEL_TOKEN],
+    ['ocp-apim-subscription-key', APIM_KEY],
+    ['x-vercel-set-bypass-cookie', 'true'],
+  ]);
+  const before = preFix(line);
+  assert.ok(before.includes(VERCEL_TOKEN), '★ VACUOUS: the pre-fix rules already redacted the Vercel token');
+  assert.ok(before.includes(APIM_KEY), '★ VACUOUS: the pre-fix rules already redacted the APIM key');
+  // …and the sibling WAS caught pre-fix, purely because its name contains "cookie" — the accident that
+  // made this leak look covered.
+  assert.ok(!before.includes('"value":"true"'), 'the -cookie sibling was already redacted by accident');
+});
+
+test('★ the VALUE half survives a header RENAME — registering the token scrubs it under any name', () => {
+  // The durable half: runner/index.ts registers bypassToken() as a knownValue, so the value is scrubbed
+  // wherever it appears. Model a header Vercel renamed tomorrow, which no name list could anticipate.
+  const renamed = harLineWith([['x-vercel-edge-bypass-v2', VERCEL_TOKEN]]);
+  const nameOnly = scrubPlainText(renamed, IDENTITY_REDACTOR);
+  assert.ok(nameOnly.includes(VERCEL_TOKEN), 'a renamed header is invisible to the name list — as expected');
+  const withValue = scrubPlainText(renamed, makeRedactor(null, [VERCEL_TOKEN]));
+  assert.ok(!withValue.includes(VERCEL_TOKEN), 'but registering the VALUE catches it under any name');
+});
+
+test('★★ END-TO-END: a REAL zip built with the header present contains no occurrence of the token', async () => {
+  const dir = tmpDir();
+  try {
+    const src = join(dir, 'trace.zip');
+    const dest = join(dir, 'out.zip');
+    const zip = new AdmZip();
+    // A trace.network with the header in BOTH shapes it really occurs in, plus a raw inline form.
+    zip.addFile('trace.trace', Buffer.from(TRACE_NDJSON, 'utf8'));
+    zip.addFile(
+      'trace.network',
+      Buffer.from(
+        [
+          harLineWith([['x-vercel-protection-bypass', VERCEL_TOKEN], ['ocp-apim-subscription-key', APIM_KEY]]),
+          JSON.stringify({ type: 'note', text: `x-vercel-protection-bypass: ${VERCEL_TOKEN}` }),
+        ].join('\n'),
+        'utf8',
+      ),
+    );
+    writeFileSync(src, zip.toBuffer());
+
+    // The zip redactor as index.ts now builds it: declared patterns + credential values + the token VALUE.
+    const ok = await buildRedactedTraceZip(src, dest, makeRedactor(null, [CRED_PASS, VERCEL_TOKEN]));
+    assert.equal(ok, true, 'the redacted zip must build');
+
+    // BYTE-SCAN every entry of the OUTPUT zip — the load-bearing assertion.
+    const out = new AdmZip(dest);
+    for (const entry of out.getEntries()) {
+      const text = entry.getData().toString('utf8');
+      assert.ok(!text.includes(VERCEL_TOKEN), `LEAK: the Vercel token survived in ${entry.entryName}`);
+      assert.ok(!text.includes(APIM_KEY), `LEAK: the APIM key survived in ${entry.entryName}`);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
