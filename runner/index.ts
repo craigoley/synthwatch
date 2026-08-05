@@ -18,7 +18,7 @@ import { writeProvisionalVerdict, enrichRunTrace } from './runFinalize.js';
 import { runHttpCheck } from './httpCheck.js';
 import { noteDeployMarker, hostOf } from './deploys.js';
 import { captureMainDocHeaders } from './browserMarker.js';
-import { browserHeaderAdditions } from './vercelBypass.js';
+import { browserHeaderAdditions, bypassToken } from './vercelBypass.js';
 import { decryptSecretHeaders, firstPartyHeaders } from './secretHeaders.js';
 import {
   applyLoginCredentials,
@@ -697,10 +697,23 @@ async function runOneInner(
       // (the Akamai bypass token rides the trace's network stream as a literal header value, exactly
       // like the typed credentials ride its DOM/console). A decrypt failure falls back to the
       // run-level redactor: a value that never decrypted was never injected into this trace either.
+      //
+      // ★★ PLUS THE PLATFORM-WIDE VERCEL BYPASS TOKEN — the gap this line closes. `secret_headers` is
+      //    PER-MONITOR; the Vercel token is injected by the RUNNER itself (vercelBypass.ts, host-scoped
+      //    per request), so it was in no monitor's secret_headers and nothing registered its value.
+      //    FOUND 2026-08-05: it sat in cleartext in `x-vercel-protection-bypass` request headers on
+      //    every retained trace of a sensitive check — 3,230 occurrences in a single run, 90-day
+      //    retention. traceRedact's SECRET_HEADER_NAMES rule now catches it by header name too, but
+      //    THIS is the durable half: registering the VALUE scrubs it wherever it appears — header,
+      //    body, URL, console — so a header rename on Vercel's side cannot silently reopen the leak.
+      // ★ Fail-soft by construction: bypassToken() returns null when VERCEL_BYPASS_TOKEN is unset, and
+      //   a token that was never set was never injected into this trace either.
       let zipRedact = redact;
       try {
+        const platformVals = [bypassToken()].filter((v): v is string => typeof v === 'string' && v.length > 0);
         const secretVals = Object.values(decryptSecretHeaders(check.secret_headers));
-        if (secretVals.length > 0) zipRedact = makeRedactor(check.redact_patterns, [...credValues, ...secretVals]);
+        const extra = [...secretVals, ...platformVals];
+        if (extra.length > 0) zipRedact = makeRedactor(check.redact_patterns, [...credValues, ...extra]);
       } catch {
         // fall back to `redact` (declared patterns + credential values)
       }

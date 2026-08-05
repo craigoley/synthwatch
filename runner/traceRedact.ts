@@ -58,6 +58,34 @@ const AUTHISH =
 // JSON validity (the trace viewer parses every NDJSON line).
 const JSON_STR = '(?:[^"\\\\]|\\\\.)*';
 
+// ── ★★ SECRET HEADERS BY EXACT NAME — the rule AUTHISH cannot express ───────────────────────────────
+//
+// ★ FOUND IN PROD, 2026-08-05: `x-vercel-protection-bypass` was riding trace.network in CLEARTEXT on
+//   every retained trace (3,230 occurrences in one run). AUTHISH keys on FRAGMENTS —
+//   token|cookie|authorization|secret|api[_-]?key|… — and this header name contains none of them. Its
+//   sibling `x-vercel-set-bypass-cookie` WAS redacted, purely by accident, because it contains "cookie".
+//
+// ★ AUDITING THE OTHER DIRECTION (all 52 request-header names a real trace persists) found a SECOND
+//   one: `ocp-apim-subscription-key`, the Azure API Management subscription key. AUTHISH's
+//   `api[_-]?key` does not match "apim-subscription-key" — "api" is followed by "m", not by `key` or a
+//   separator. It was leaking too.
+//
+// ★ WHY AN EXACT-NAME LIST AND NOT A WIDER FRAGMENT: fragment-matching is precisely how both of these
+//   slipped, and widening it (e.g. adding `bypass` or `key`) trades one silent miss for silent
+//   over-redaction of ordinary headers. A name we have DECIDED is secret-bearing is a fact worth
+//   writing down, reviewable in a diff, and greppable. Add to this list; do not loosen AUTHISH.
+//
+// ★ THIS IS THE BACKSTOP, NOT THE PRIMARY DEFENCE. For a secret whose VALUE the runner holds (the
+//   Vercel bypass token), the value itself is registered with the run's redactor (runner/index.ts) so
+//   it is scrubbed wherever it appears — header, body, URL, console — and a future header RENAME cannot
+//   reopen it. This list is what covers the other case: a secret the runner never sees the value of and
+//   can only recognise by the name it arrives under (ocp-apim-subscription-key is issued by the site).
+const SECRET_HEADER_NAMES = [
+  'x-vercel-protection-bypass',
+  'ocp-apim-subscription-key',
+] as const;
+const SECRET_HEADER_ALT = SECRET_HEADER_NAMES.join('|');
+
 const STRUCTURAL: Array<[RegExp, string]> = [
   // 1) HAR-style header pair — {"name":"cookie","value":"…"} / set-cookie / authorization / any
   //    auth-ish header name. This is where the reusable session material (cookies, bearer headers,
@@ -77,6 +105,18 @@ const STRUCTURAL: Array<[RegExp, string]> = [
   //    the trailing `\` was eaten, the now-bare `"` closed the JSON string, and the NDJSON line the
   //    trace viewer parses per-line became invalid (the event was silently dropped).
   [/((?:^|[\s"'])(?:cookie|set-cookie|authorization|proxy-authorization)\s*:\s*)(?:\\.|[^"'\r\n\\])+/gi, `$1${REDACTED}`],
+  // 4) ★ SECRET HEADERS BY EXACT NAME, HAR pair form — the AUTHISH gap (see SECRET_HEADER_NAMES).
+  //    Same escape-aware VALUE-only rewrite as rule 1, so the NDJSON stays parseable per line.
+  [
+    new RegExp(`("name"\\s*:\\s*"(?:${SECRET_HEADER_ALT})"\\s*,\\s*"value"\\s*:\\s*")${JSON_STR}(")`, 'gi'),
+    `$1${REDACTED}$2`,
+  ],
+  // 5) ★ Same names in raw header-text form ("x-vercel-protection-bypass: …"), for occurrences inlined
+  //    in console output or a DOM snapshot rather than a structured HAR pair. Mirrors rule 3.
+  [
+    new RegExp(`((?:^|[\\s"'])(?:${SECRET_HEADER_ALT})\\s*:\\s*)(?:\\\\.|[^"'\\r\\n\\\\])+`, 'gi'),
+    `$1${REDACTED}`,
+  ],
 ];
 
 /** How buildRedactedTraceZip treats a zip entry. Exported so the drop-by-default policy is pinnable. */
