@@ -39,9 +39,14 @@ const SENTINEL_USER = `SENTINEL_USER_${randomBytes(8).toString('hex')}`;
  *   • screenshot      — the throw makes the flow fail, which is what makes browserFlow capture a screenshot
  */
 const LEAKY_LOGIN_SPEC = `
-  import { test, step } from '../../lib/flow';
-  const user = process.env.SW_SANDBOX_CRED_USERNAME;
-  const pw = process.env.SW_SANDBOX_CRED_PASSWORD;
+  import { test, step, credential } from '../../lib/flow';
+  // ★ CHANGED from process.env.SW_SANDBOX_CRED_* to credential(): those env vars no longer exist (credentials
+  //   travel to the child on stdin and resolve in-process — sandboxCredChannel.ts). Reading env here would
+  //   silently give \`undefined\`, the sentinel would never enter any surface, and this whole suite would go
+  //   VACUOUSLY green. Using the real accessor also means the suite now exercises the channel the fleet's
+  //   login specs actually use, not a test-only shape.
+  const user = credential('username');
+  const pw = credential('password');
   console.log('LEAK_MARKER_STDOUT ' + user + ' / ' + pw);
   // ★ The credential is in the TEST NAME and the STEP NAMES, not only in errors/output. Interpolating an
   //   identity into a name is how people actually write login flows, and those names are uploaded verbatim

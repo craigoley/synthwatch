@@ -21,9 +21,11 @@ import { chromium } from 'playwright';
 
 import { runTracedFlow } from '../browserFlow.js';
 import { loadCompiledSpec } from '../specfetch/compileSpec.js';
+import { setSpecCredentials } from '../specfetch/specCredentials.js';
 import { specToFlow } from '../specfetch/specShim.js';
 import { StepRecorder, type RecordedStep } from '../stepRecorder.js';
 import { extractTraceSignals } from '../traceSignals.js';
+import { readChildCredentials } from './sandboxCredChannel.js';
 
 /** The child's stdout result line — the parent reads this (last stdout line) + the temp-file artifacts. */
 interface ChildResult {
@@ -56,6 +58,18 @@ async function main(): Promise<void> {
   // extract signals, and write the screenshot before the parent reaps the process group.
   const budgetMs = Number(process.env.SW_SANDBOX_TIMEOUT_MS ?? 120_000);
   const flowDeadlineMs = Math.max(30_000, budgetMs - 30_000);
+
+  // ★★ CREDENTIALS IN, BEFORE THE RCE MOMENT. Drain stdin to EOF and install the user's typed credentials in
+  //   this process's in-process store, which is what `credential(role)` resolves from in a preview
+  //   (specfetch/specCredentials.ts). Ordering is load-bearing TWICE:
+  //     • it must be BEFORE loadCompiledSpec, because a spec that calls credential() at import time (the
+  //       fleet's login specs read both roles at the top of the test body) would otherwise miss;
+  //     • draining to EOF here means fd 0 is already consumed and closed when uploaded code starts, so a
+  //       hostile `readFileSync('/dev/stdin')` finds nothing.
+  //   ★ NOTHING IS PUT IN process.env. That is the point — see sandboxCredChannel.ts / specCredentials.ts.
+  //   ★ readChildCredentials never throws; an absent/garbled line yields an empty set, credential() then
+  //     fails closed with a legible refusal, and the preview REDS rather than running with a wrong value.
+  setSpecCredentials(await readChildCredentials(process.stdin));
 
   // ★ THE RCE MOMENT — arbitrary uploaded code executes on this import (runs the spec's top-level test() calls
   //   to register them). Contained by: this process's allowlist env (no secrets), no DB reachability, nil RBAC.

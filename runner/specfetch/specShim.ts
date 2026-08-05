@@ -27,6 +27,9 @@ import type { Flow } from '../checks/index.js';
 // Runtime import (a value): the SAME class the runner classifies on. isExpectationError also
 // matches by `.name`, so classification survives the esbuild bundle boundary regardless.
 import { ExpectationError } from '../errors.js';
+// The PREVIEW credential channel. Module-private to this shim by construction: a compiled spec can import
+// only the lib/flow alias (compileSpec's single onResolve), so `credential()` is the sole reader a spec has.
+import { lookupSpecCredential, specCredentialRoles } from './specCredentials.js';
 
 // ---------------------------------------------------------------------------
 // test() — capture registry. Shared because the compiled spec imports THIS module
@@ -178,34 +181,54 @@ export function specToFlow(fn: (args: { page: Page }) => Promise<void>, page: Pa
 
 /**
  * Per-monitor LOGIN CREDENTIAL accessor (model B). A spec reads `credential('username')` instead of hardcoding
- * a secret; the check's `login_credentials` stores { role -> ENCRYPTED VALUE } — an operator sets the plaintext
- * in the dashboard Credentials panel and the api encrypts it under CRED_ENC_KEY. At RUN time the runner DECRYPTS
- * it and publishes the plaintext as process.env[SW_CRED_<ROLE>] for the life of this run (cleared after — see
- * runner/loginCredentials.ts). There is NO operator env-var step: the runner derives SW_CRED_<ROLE> itself.
- * Fail-CLOSED: an unset/undecryptable role throws, so a mis-configured login monitor fails loudly instead of
- * submitting an empty credential.
- * ★ SANDBOX: a preview/sandbox run NEVER receives SW_CRED_* (they don't cross the sandbox env boundary, by
- *   design — runner/sandbox/sandboxEnv.ts), so credential() cannot resolve in a preview regardless of how the
- *   check is configured. It is a LIVE-run accessor; the error below detects the sandbox and says so.
+ * a secret. It resolves from TWO channels, one per execution context, and they never overlap:
+ *
+ *   LIVE (fleet) — process.env[SW_CRED_<ROLE>]. The check's `login_credentials` stores { role -> ENCRYPTED
+ *     VALUE }; an operator sets the plaintext in the dashboard Credentials panel, the api encrypts it under
+ *     CRED_ENC_KEY, and at RUN time the runner decrypts + publishes it for the life of that run (cleared
+ *     after — runner/loginCredentials.ts). There is NO operator env-var step. ★ UNCHANGED by the preview work.
+ *
+ *   PREVIEW (sandbox) — the IN-PROCESS store (specCredentials.ts), populated by sandboxChild from the user's
+ *     per-run typed credentials before the spec is imported. ★ These are deliberately NOT env vars: the
+ *     sandbox executes uploaded code, so anything in `process.env` is one `console.log` away from the UI.
+ *     See specCredentials.ts for the full argument. This is what lets the Tests area preview the fleet's
+ *     AUTHENTICATED monitors — previously `credential()` could not resolve in a preview at all, which made
+ *     the area unusable for exactly the specs it was built for.
+ *
+ * ★ ENV IS CHECKED FIRST so the live path is byte-for-byte what it always was: the sandbox never receives
+ *   SW_CRED_*, and the fleet never populates the store, so the order can only matter if an invariant has
+ *   already broken — and in that case the STORED, operator-configured credential is the right winner.
+ *
+ * Fail-CLOSED: an unset role throws, so a mis-configured login monitor fails loudly instead of submitting an
+ * empty credential. The throw NAMES the role and never echoes a value.
+ *
  * IN THE PARITY-HASHED BLOCK on purpose — a security-relevant, spec-reachable accessor whose authoring
  * (synthwatch-monitors lib/flow.ts) and runtime (specShim) copies must never silently drift. The env-var
  * format `SW_CRED_<ROLE>` must stay in lockstep with runner/loginCredentials.ts credentialEnvKey.
+ * ★ THE IN-PROCESS BRANCH IS A DELIBERATE, RUNTIME-ONLY DIVERGENCE from monitors/lib/flow.ts. That copy is
+ *   the LOCAL-DEV authoring shim, run by `playwright test` on a developer's machine where env vars are the
+ *   only channel and no sandbox child exists — the branch would be dead code there. The SHARED contract that
+ *   must not drift is the SIGNATURE and the env format, both unchanged.
  */
 export function credential(role: string): string {
-  const value = process.env[`SW_CRED_${role.toUpperCase()}`];
+  const value = process.env[`SW_CRED_${role.toUpperCase()}`] || lookupSpecCredential(role);
   if (value === undefined || value.length === 0) {
-    // Message-only branch (the THROW condition is unchanged): the sandbox sets SW_SANDBOX=1 and never receives
-    // SW_CRED_*, so a credential()-based spec can't resolve in a preview — say that specifically instead of
-    // sending the operator to a (model-A) runner env-var step that model B does not use.
+    // Message-only branch (the THROW condition is unchanged). Three distinct misses, three distinct fixes:
     const inSandbox = process.env.SW_SANDBOX === '1';
+    const supplied = specCredentialRoles(); // ROLE NAMES only — never values
     throw new Error(
-      inSandbox
-        ? `credential("${role}") is not available in a preview/sandbox run — the sandbox never receives ` +
-            `SW_CRED_* (secrets do not cross the sandbox boundary, by design), so a credential()-based spec ` +
-            `cannot resolve here no matter how the check is configured. Test it with a LIVE run.`
-        : `credential("${role}") is not available — set login_credentials.${role} on this check via the ` +
+      !inSandbox
+        ? `credential("${role}") is not available — set login_credentials.${role} on this check via the ` +
             `dashboard Credentials panel (check detail page). The runner publishes SW_CRED_${role.toUpperCase()} ` +
-            `automatically from the stored, encrypted value at run time; there is no runner env-var step.`,
+            `automatically from the stored, encrypted value at run time; there is no runner env-var step.`
+        : supplied.length === 0
+          ? `credential("${role}") is not available in a preview/sandbox run — no credentials were supplied ` +
+            `for this preview. Type them into the Credentials panel of the Tests area and re-run; they are ` +
+            `delivered to the spec for this run only, and are never stored.`
+          : `credential("${role}") is not available in a preview/sandbox run — this preview supplied ` +
+            `[${supplied.join(', ')}], which does not include "${role.toLowerCase()}". The Tests area collects ` +
+            `the roles "username", "password" and "bypassToken"; a spec needing any other role can only be ` +
+            `run LIVE, against a check whose login_credentials define it.`,
     );
   }
   return value;

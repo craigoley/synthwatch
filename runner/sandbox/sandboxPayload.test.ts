@@ -11,6 +11,7 @@ import { randomBytes } from 'node:crypto';
 
 import { encryptCredValue, parseAes256Key } from '../crypto.js';
 import { runSandboxPreview } from './runSandboxPreview.js';
+import { buildChildCredentials } from './sandboxCredChannel.js';
 import { buildSandboxEnv } from './sandboxEnv.js';
 import {
   credentialValues,
@@ -195,20 +196,40 @@ test('★ a non-string credential value is dropped, not passed through as a trut
   assert.equal(isCredentialedRun(d2.credentials), false);
 });
 
-// ── buildSandboxEnv must apply the SAME string predicate (the second lock) ───────────────────────────────
-test('★ buildSandboxEnv publishes only STRING credentials — it cannot disagree with isCredentialedRun', () => {
+// ── The child credential CHANNEL must apply the SAME string predicate (the second lock) ─────────────────
+// ★ This assertion MOVED from buildSandboxEnv to buildChildCredentials, following the publication it guards:
+//   credentials no longer become env vars at all (they travel on the child's stdin — sandboxCredChannel.ts).
+//   The lock itself is unchanged, and the case it pins is unchanged.
+test('★ buildChildCredentials passes only STRING credentials — it cannot disagree with isCredentialedRun', () => {
+  const sent = buildChildCredentials({
+    username: 'u',
+    // Deliberately cast: models a decode path that let a non-string through.
+    password: 99 as unknown as string,
+    bypassToken: '',
+  });
+  assert.equal(sent.username, 'u');
+  assert.ok(!('password' in sent), 'a non-string password must never reach the spec');
+  assert.ok(!('bypassToken' in sent), 'an empty token is not a credential');
+});
+
+// ── ★ AND NO CREDENTIAL BECOMES AN ENV VAR — the property the stdin channel bought ──────────────────────
+test('★ buildSandboxEnv publishes NO credential under ANY name, however many were typed', () => {
   const env = buildSandboxEnv(
     {
       targetUrl: 'https://example.com',
       timeoutMs: 1000,
-      // Deliberately cast: models a decode path that let a non-string through.
-      credentials: { username: 'u', password: 99 as unknown as string, bypassToken: '' },
+      credentials: { username: 'SENTINEL_U', password: 'SENTINEL_P', bypassToken: 'SENTINEL_B' },
     },
     {} as NodeJS.ProcessEnv,
   );
-  assert.equal(env.SW_SANDBOX_CRED_USERNAME, 'u');
-  assert.ok(!('SW_SANDBOX_CRED_PASSWORD' in env), 'a non-string password must never reach the spec');
-  assert.ok(!('SW_SANDBOX_CRED_BYPASS_TOKEN' in env), 'an empty token is not a credential');
+  // By VALUE, not by name — a renamed or derived publication is caught too.
+  for (const v of Object.values(env)) {
+    assert.ok(!String(v).includes('SENTINEL_'), `a credential value reached the child env: ${String(v)}`);
+  }
+  // And the old names are gone specifically, so a revert is a loud diff rather than a silent one.
+  for (const k of ['SW_SANDBOX_CRED_USERNAME', 'SW_SANDBOX_CRED_PASSWORD', 'SW_SANDBOX_CRED_BYPASS_TOKEN']) {
+    assert.ok(!(k in env), `${k} must no longer be published — credentials travel on stdin`);
+  }
 });
 
 // ── ★ redactCredentials: fail-SAFE normalisation (only a literal `false` disables) ──────────────────────
