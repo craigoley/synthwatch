@@ -21,11 +21,11 @@
     "@azure/identity": "^4.13.2",
     "@azure/storage-blob": "12.33.0",
     "@opentelemetry/api": "^1.9.1",
-    "@opentelemetry/exporter-metrics-otlp-http": "^0.221.0",
-    "@opentelemetry/exporter-trace-otlp-http": "^0.221.0",
-    "@opentelemetry/resources": "^2.10.0",
+    "@opentelemetry/exporter-metrics-otlp-http": "^0.222.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.222.0",
+    "@opentelemetry/resources": "^2.11.0",
     "@opentelemetry/sdk-metrics": "^2.8.0",
-    "@opentelemetry/sdk-trace-node": "^2.10.0",
+    "@opentelemetry/sdk-trace-node": "^2.11.0",
     "@opentelemetry/semantic-conventions": "^1.43.0",
     "adm-zip": "^0.6.0",
     "esbuild": "^0.28.2",
@@ -39,13 +39,13 @@
     "@microsoft/eslint-formatter-sarif": "3.1.0",
     "@stryker-mutator/core": "^9.6.1",
     "@types/adm-zip": "^0.5.8",
-    "@types/node": "26.3.0",
+    "@types/node": "26.4.1",
     "@types/pg": "8.23.1",
     "@types/yauzl": "^3.4.0",
     "@types/yazl": "^3.3.1",
     "eslint": "10.9.1",
-    "globals": "17.11.0",
+    "globals": "17.12.0",
     "typescript": "6.0.3",
-    "typescript-eslint": "8.68.0"
+    "typescript-eslint": "8.69.0"
   }
 }
