@@ -149,11 +149,11 @@
                   },
                   {
                     "name": "AZURE_OPENAI_DEPLOYMENT",
-                    "value": "gpt-5-mini"
+                    "value": "gpt-5.6-luna"
                   },
                   {
                     "name": "AZURE_OPENAI_API_VERSION",
-                    "value": "2025-04-01-preview"
+                    "value": "v1"
                   },
                   {
                     "name": "RCA_MAX_TOKENS",
@@ -254,11 +254,11 @@
                   },
                   {
                     "name": "AZURE_OPENAI_DEPLOYMENT",
-                    "value": "gpt-5-mini"
+                    "value": "gpt-5.6-luna"
                   },
                   {
                     "name": "AZURE_OPENAI_API_VERSION",
-                    "value": "2025-04-01-preview"
+                    "value": "v1"
                   },
                   {
                     "name": "RCA_MAX_TOKENS",

@@ -195,20 +195,14 @@ param sandboxRetentionDays int = 1
 @description('Azure OpenAI endpoint for RCA (AZURE_OPENAI_ENDPOINT).')
 param aoaiEndpoint string = 'https://synthwatch-aoai.openai.azure.com/'
 
-@description('Azure OpenAI deployment name for RCA (AZURE_OPENAI_DEPLOYMENT).')
-param aoaiDeployment string = 'gpt-5-mini'
+@description('Microsoft Foundry model deployment name for RCA and report narratives (AZURE_OPENAI_DEPLOYMENT).')
+param aoaiDeployment string = 'gpt-5.6-luna'
 
-// AZURE_OPENAI_API_VERSION — the Azure OpenAI REST api-version (a date the data-plane API
-// recognizes), NOT the model version. The previous value '2025-08-07' was the gpt-5-mini
-// MODEL version mistakenly used as the api-version: it 404s ("Resource not found" — the
-// route doesn't exist), so EVERY fresh AOAI call (RCA + the Layer-3 narrative) returned
-// null and fell back. '2025-04-01-preview' is a current api-version that routes AND
-// supports the gpt-5-mini reasoning params the code sends (max_completion_tokens +
-// reasoning_effort) — proven end-to-end: a fresh narrative call returned HTTP 200 +
-// content (model=gpt-5-mini). Flows to all three jobs (both runner jobs for RCA + the
-// narrative job). 2024-10-21 routes but predates the reasoning params; don't use it.
-@description('Azure OpenAI REST api-version for AZURE_OPENAI_API_VERSION (a data-plane api-version date, e.g. 2025-04-01-preview — NOT the model version 2025-08-07, which 404s).')
-param aoaiApiVersion string = '2025-04-01-preview'
+// v1 is the current Microsoft Foundry OpenAI-compatible API: /openai/v1/chat/completions
+// receives the deployment name as `model`. The runner retains a dated-version compatibility
+// path for forks whose endpoint has not moved to Foundry v1.
+@description('Microsoft Foundry API version for AZURE_OPENAI_API_VERSION. Use v1 for the /openai/v1 endpoint; dated Azure OpenAI versions remain supported for forks.')
+param aoaiApiVersion string = 'v1'
 
 @description('RCA completion-token budget (RCA_MAX_TOKENS).')
 param rcaMaxTokens string = '4000'

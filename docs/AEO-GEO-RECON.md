@@ -106,7 +106,7 @@ The codebase **already calls an external AI API in three places**, same pattern 
 - **`runner/aoai.ts`** — the runner's shared transport (`chatCompletionContent()` `:71-124`), MI via
   `AZURE_CLIENT_ID` (`:29-32`), 30s abort (`:81-82`), returns `null` on failure.
 - **`runner/rca.ts`** — the fullest worked example and closest analog to an "AI engine call":
-  **multimodal** (sends screenshots as `image_url` `:526-535`), `gpt-5-mini`, token budget
+  **multimodal** (sends screenshots as `image_url` `:526-535`), the configured Foundry deployment (`gpt-5.6-luna` by default), token budget
   (`RCA_MAX_TOKENS` `:32`), a **24h pattern cache to avoid re-spending** (`:38,509-511`), and an
   **abstain-if-evidence-thin** short-circuit that skips the call entirely (`:519-522`).
 

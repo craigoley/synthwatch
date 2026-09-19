@@ -797,11 +797,29 @@ export function spotCheck(n: Narrative, fp: FactPack): boolean {
 
 /** Narrate the fact pack. Returns the narrative + which model produced it (the deployment,
  *  or 'fallback-template'). The model only narrates; on any failure/filler -> fallback. */
-// gpt-5-mini is a REASONING model: max_completion_tokens bounds reasoning + output COMBINED. The old 700
+// Luna is a REASONING model: max_completion_tokens bounds reasoning + output COMBINED. The old 700
 // was output-sized — low-effort reasoning over the enriched fleet pack (cost + deploys + 34-check data)
 // consumed the whole budget BEFORE any content → finish_reason=length, content_len=0 → fallback. 4000 gives
-// comfortable headroom for the reasoning pass + the ~700-token JSON output (RCA, same model, uses 16000).
+// comfortable headroom for the reasoning pass + the ~700-token JSON output.
 const NARRATIVE_MAX_TOKENS = 4000;
+
+const NARRATIVE_RESPONSE_FORMAT = {
+  type: 'json_schema',
+  json_schema: {
+    name: 'report_narrative',
+    strict: true,
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['headline', 'body', 'highlights'],
+      properties: {
+        headline: { type: 'string' },
+        body: { type: 'string' },
+        highlights: { type: 'array', items: { type: 'string' } },
+      },
+    },
+  },
+} as const;
 
 export async function narrate(fp: FactPack): Promise<{ narrative: Narrative; model: string }> {
   const user = JSON.stringify(fp);
@@ -816,6 +834,7 @@ export async function narrate(fp: FactPack): Promise<{ narrative: Narrative; mod
     user,
     maxTokens: NARRATIVE_MAX_TOKENS,
     reasoningEffort: 'low',
+    responseFormat: NARRATIVE_RESPONSE_FORMAT,
     logPrefix: '[narrative]',
   });
   if (content) {
