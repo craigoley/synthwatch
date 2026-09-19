@@ -80,7 +80,8 @@ readonly LOGIN_SERVER='synthwatcholey0620.azurecr.io'
 readonly RUNNER_REPO='synthwatch-runner'
 readonly MIGRATE_REPO='synthwatch-migrate'
 readonly ENV_FILE="${HOME}/.synthwatch.env"
-readonly EXPECTED_API_VERSION='2025-04-01-preview'   # the #93/#94 fix — must survive every deploy
+readonly EXPECTED_API_VERSION='v1'                    # Foundry v1 — must survive every deploy
+readonly EXPECTED_MODEL_DEPLOYMENT='gpt-5.6-luna'      # Foundry deployment — must survive every deploy
 readonly ACS_SECRET_REF='acs-email-conn'             # the runner ACS env's secretRef — the wipe canary
 readonly CRED_ENC_KEY_SECRET_REF='cred-enc-key'      # CRED_ENC_KEY secretRef — model-B value crypto (runner decrypt)
 readonly API_HEALTH_URL='https://synthwatch-api.azurewebsites.net/api/checks'
@@ -1012,13 +1013,22 @@ verify() {
   c_bold "Verifying what landed…"
 
   # AOAI api-version preserved on runner + narrative (the #93/#94 defect).
-  local v ok
+  local v ok j
   v="$(job_env_value "${RUNNER_JOB}" AZURE_OPENAI_API_VERSION)"
   str_eq "${EXPECTED_API_VERSION}" "${v}" && ok=1 || ok=0
   check "${ok}" "${RUNNER_JOB} AZURE_OPENAI_API_VERSION='${v}' (expect ${EXPECTED_API_VERSION})"
   v="$(job_env_value "${NARRATIVE_JOB}" AZURE_OPENAI_API_VERSION)"
   str_eq "${EXPECTED_API_VERSION}" "${v}" && ok=1 || ok=0
   check "${ok}" "${NARRATIVE_JOB} AZURE_OPENAI_API_VERSION='${v}' (expect ${EXPECTED_API_VERSION})"
+
+  # Foundry model deployment preserved on every AI-consuming job. The #80 cutover-wipe lesson applies to
+  # model selection too: a successful infra deploy with the old deployment silently routes all new RCA and
+  # narrative calls to the wrong model. Assert the material env, not only the Bicep default.
+  for j in "${RUNNER_JOB}" "${CENTRALUS_RUNNER_JOB}" "${WESTUS2_RUNNER_JOB}" "${NARRATIVE_JOB}"; do
+    v="$(job_env_value "${j}" AZURE_OPENAI_DEPLOYMENT)"
+    str_eq "${EXPECTED_MODEL_DEPLOYMENT}" "${v}" && ok=1 || ok=0
+    check "${ok}" "${j} AZURE_OPENAI_DEPLOYMENT='${v}' (expect ${EXPECTED_MODEL_DEPLOYMENT})"
+  done
 
   # ★ AZURE COST ENV on the ROLLUP job — the env the Azure Cost Management pull needs.
   # THE DEFECT THIS CATCHES: bicep declared AZURE_SUBSCRIPTION_ID/AZURE_RESOURCE_GROUP on the three RUNNER
@@ -1055,7 +1065,6 @@ verify() {
   check "${ok}" "${RUNNER_JOB} CRED_ENC_KEY secretRef='${v}' (expect ${CRED_ENC_KEY_SECRET_REF})"
 
   # AZURE_CLIENT_ID present where expected (MI pin; #90).
-  local j
   for j in "${RUNNER_JOB}" "${NARRATIVE_JOB}" "${RECONCILE_JOB}"; do
     v="$(job_env_value "${j}" AZURE_CLIENT_ID)"
     [[ -n "${v}" ]] && ok=1 || ok=0

@@ -13,26 +13,27 @@
 // the incident records WITHOUT rca; RCA never blocks incident-open or changes a
 // verdict.
 import { DefaultAzureCredential, type TokenCredential } from '@azure/identity';
+import { chatCompletionUrl, isFoundryV1ApiVersion } from './aoai.js';
 import { pool, type Check, type RunRecord } from './db.js';
 import { downloadBlobBase64 } from './artifacts.js';
 import type { TraceSignals, ConsoleMessage, TraceRequest } from './traceSignals.js';
 
 const ENDPOINT = process.env.AZURE_OPENAI_ENDPOINT; // e.g. https://my-aoai.openai.azure.com
 const DEPLOYMENT = process.env.RCA_MODEL_DEPLOYMENT ?? process.env.AZURE_OPENAI_DEPLOYMENT;
-// GA chat-completions version (learn.microsoft.com); override if a fork needs newer.
-const API_VERSION = process.env.AZURE_OPENAI_API_VERSION ?? '2024-10-21';
+// Foundry v1 is the current OpenAI-compatible API. A dated value remains supported for forks
+// that still use the legacy deployment-path endpoint.
+const API_VERSION = process.env.AZURE_OPENAI_API_VERSION ?? 'v1';
 // `Number(env) || default` (not `?? default`): a malformed value (e.g. "30s") makes
 // Number() return NaN; NaN is falsy so we fall back to the default rather than
 // propagating NaN into a setTimeout / the API request (which would 400).
 const TIMEOUT_MS = Number(process.env.RCA_TIMEOUT_MS) || 30000;
-// Completion budget. gpt-5-mini is a REASONING model: hidden reasoning tokens count
+// Completion budget. Luna is a REASONING model: hidden reasoning tokens count
 // against this BEFORE the visible JSON is emitted (commonly 1000-2000), so a tight
 // budget truncates the output (finish_reason='length' -> empty content). Default
 // 4000 leaves ample room for reasoning + the small classification JSON.
 const MAX_TOKENS = Number(process.env.RCA_MAX_TOKENS) || 4000;
-// OPT-IN reasoning_effort (minimal|low|medium|high) to cap reasoning spend. Sent
-// ONLY when set: api-version 2024-10-21 predates GPT-5 and may 400 on this param, so
-// it stays off by default; a fork on a newer api-version / the v1 API can enable it.
+// OPT-IN reasoning_effort (low|medium|high|xhigh) to cap reasoning spend. When unset,
+// the deployed model chooses its documented default (medium for Luna).
 const REASONING_EFFORT = process.env.RCA_REASONING_EFFORT;
 // Reuse an RCA for an identical failure signature opened within this window.
 const CACHE_TTL = process.env.RCA_CACHE_TTL ?? '24 hours';
@@ -43,6 +44,29 @@ const SCOPE = 'https://cognitiveservices.azure.com/.default';
 // signal a Wegmans monitor cares about isn't drowned by tracker noise, and the pack stays inside RCA_MAX_TOKENS.
 const FIRST_PARTY_CONSOLE_CAP = 10;
 const NET_FAILED_CAP = 8;
+
+const RCA_RESPONSE_FORMAT = {
+  type: 'json_schema',
+  json_schema: {
+    name: 'root_cause_analysis',
+    strict: true,
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['classification', 'confidence', 'observed', 'inferred', 'summary'],
+      properties: {
+        classification: {
+          type: 'string',
+          enum: ['real-outage', 'flaky-transient', 'selector-drift', 'environment-regional', 'perf-regression', 'infra-deterministic'],
+        },
+        confidence: { type: 'string', enum: ['high', 'medium', 'low'] },
+        observed: { type: 'array', items: { type: 'string' } },
+        inferred: { type: 'array', items: { type: 'string' } },
+        summary: { type: 'string' },
+      },
+    },
+  },
+} as const;
 
 const CLASSIFICATIONS = [
   'real-outage',
@@ -642,16 +666,17 @@ export async function runRca(
       userContent.push({ type: 'image_url', image_url: { url: `data:image/png;base64,${ctx.baselineB64}` } });
     }
 
-    const url = `${ENDPOINT!.replace(/\/$/, '')}/openai/deployments/${DEPLOYMENT}/chat/completions?api-version=${API_VERSION}`;
+    const url = chatCompletionUrl(ENDPOINT!, DEPLOYMENT!, API_VERSION);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
     const body: Record<string, unknown> = {
+      ...(isFoundryV1ApiVersion(API_VERSION) ? { model: DEPLOYMENT } : {}),
       messages: [
         { role: 'system', content: SYSTEM_PROMPT },
         { role: 'user', content: userContent },
       ],
       max_completion_tokens: MAX_TOKENS,
-      response_format: { type: 'json_object' },
+      response_format: isFoundryV1ApiVersion(API_VERSION) ? RCA_RESPONSE_FORMAT : { type: 'json_object' },
     };
     if (REASONING_EFFORT) body.reasoning_effort = REASONING_EFFORT;
 
