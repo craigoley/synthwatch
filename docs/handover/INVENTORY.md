@@ -192,7 +192,7 @@ $ az postgres flexible-server list/db list; az communication list; az cognitives
 
 | Deployment | Model | Version | SKU | Capacity |
 |---|---|---|---|---|
-| `gpt-5-mini` | gpt-5-mini | 2025-08-07 | GlobalStandard | 50 |
+| `gpt-5.6-luna` | gpt-5.6-luna | 2026-07-09 | GlobalStandard | 16K TPM |
 
 ## 2. Secrets — names, scope, and where they live
 

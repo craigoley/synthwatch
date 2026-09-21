@@ -1,11 +1,7 @@
 // Shared Microsoft Foundry transport — the AAD credential (with the #90 user-assigned-MI pin),
-// the chat-completions call, and JSON extraction. Used by the report-narrative job
-// (narrative.ts). Opt-in on AZURE_OPENAI_* (absent => callers gate their feature off).
-//
-// NOTE: rca.ts predates this module and keeps its own inline transport — it was just
-// stabilized in #90, so it is NOT refactored here (one concern per PR). credentialOptions()
-// below MIRRORS rca.ts's #90 pin; a follow-up should migrate rca.ts onto this module to
-// dedupe the credential + fetch. Keep the two request contracts in sync until then.
+// chat-completions call, structured output settings, bounded rate-limit retry, and telemetry.
+// Used by both report narratives and RCA. Opt-in on AZURE_OPENAI_* (absent => callers gate
+// their feature off).
 import { DefaultAzureCredential, type TokenCredential } from '@azure/identity';
 
 const ENDPOINT = process.env.AZURE_OPENAI_ENDPOINT;
@@ -72,7 +68,7 @@ export function extractJson(content: string): string {
 export interface ChatRequest {
   deployment?: string; // default DEFAULT_DEPLOYMENT
   system: string;
-  user: string; // compact JSON / text
+  user: string | unknown[]; // compact JSON / text, or multimodal content blocks
   maxTokens: number;
   reasoningEffort?: string; // minimal|low|medium|high
   responseFormat?: Record<string, unknown>;
@@ -156,6 +152,9 @@ export async function chatCompletionContent(req: ChatRequest): Promise<string | 
     const content = choice?.message?.content;
     const finishReason = choice?.finish_reason ?? 'unknown';
     console.log(`${log} finish_reason=${finishReason} content_len=${content?.length ?? 0} usage=${JSON.stringify(json.usage ?? {})}`);
+    if (finishReason === 'length') {
+      console.warn(`${log} finish_reason=length — output TRUNCATED, raise max token budget (content_len=${content?.length ?? 0})`);
+    }
     if (!content) {
       console.warn(`${log} empty model content (finish_reason=${finishReason}) — fallback`);
       return null;

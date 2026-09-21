@@ -35,3 +35,24 @@ test('Foundry v1 carries the deployment name as model and preserves structured o
   assert.equal(body.reasoning_effort, 'low');
   assert.deepEqual(body.response_format, { type: 'json_schema' });
 });
+
+test('shared v1 transport preserves multimodal RCA content blocks', () => {
+  const body = buildChatCompletionBody(
+    {
+      system: 'system',
+      user: [
+        { type: 'text', text: 'facts' },
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,redacted' } },
+      ],
+      maxTokens: 4000,
+      responseFormat: { type: 'json_schema' },
+    },
+    'gpt-5.6-luna',
+    'v1',
+  );
+  const messages = body.messages as { role: string; content: unknown }[];
+  assert.deepEqual(messages[1]?.content, [
+    { type: 'text', text: 'facts' },
+    { type: 'image_url', image_url: { url: 'data:image/png;base64,redacted' } },
+  ]);
+});
