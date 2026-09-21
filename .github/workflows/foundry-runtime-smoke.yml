@@ -74,10 +74,10 @@ jobs:
             # versions. Try the replica-scoped form first, then the execution-scoped form; never
             # mistake a log-query incompatibility for a model success.
             LOGS=$(az containerapp job logs show -g "$RG" -n "$JOB" --execution "$EXEC" \
-              --replica "$REPLICA" --container narrative --format text --tail 500 2>&1 || true)
+              --replica "$REPLICA" --container narrative --format text --tail 300 2>&1 || true)
             if ! printf '%s\n' "$LOGS" | grep -Fq '[narrative]'; then
               LOGS=$(az containerapp job logs show -g "$RG" -n "$JOB" --execution "$EXEC" \
-                --container narrative --format json --tail 500 2>&1 || true)
+                --container narrative --format json --tail 300 2>&1 || true)
             fi
             FLEET_LINE=$(printf '%s\n' "$LOGS" | grep -F '[narrative] fleet:' | tail -1 || true)
             WROTE_LINE=$(printf '%s\n' "$LOGS" | grep -F '[narrative] wrote ' | tail -1 || true)
