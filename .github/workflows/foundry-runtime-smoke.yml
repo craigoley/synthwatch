@@ -111,7 +111,7 @@ jobs:
               LOGS=$(normalize_logs "$(az containerapp job logs show -g "$RG" -n "$JOB" --execution "$EXEC" \
                 --container narrative --format json --tail 300 2>&1 || true)")
             fi
-            FLEET_MATCH=$(printf '%s\n' "$LOGS" | grep -F '[narrative] fleet:' | grep -F "($EXPECTED_MODEL)" | tail -1 || true)
+            FLEET_MATCH=$(printf '%s\n' "$LOGS" | grep -F '[narrative] fleet:' | grep -F "$EXPECTED_MODEL" | tail -1 || true)
             WROTE_MATCH=$(printf '%s\n' "$LOGS" | grep -F '[narrative] wrote ' | tail -1 || true)
 
             # narrate() reports the selected deployment, and the wrote line is emitted only after the
@@ -121,6 +121,8 @@ jobs:
               echo "::error::Narrative log inspection found no Luna fleet result (source=$LOG_SOURCE log_bytes=$LOG_BYTES)"
               MARKERS=$(printf '%s\n' "$LOGS" | grep -oE '\[narrative\] (fleet:|wrote |done:|AZURE_OPENAI_[^ ]*)' | sort | uniq -c || true)
               printf 'Observed safe markers:\n%s\n' "${MARKERS:-<none>}"
+              MODELS=$(printf '%s\n' "$LOGS" | grep -oE 'gpt-[0-9.]+-[[:alnum:]-]+|fallback-template' | sort -u || true)
+              printf 'Observed model tokens: %s\n' "${MODELS:-<none>}"
               exit 1
             fi
             if [[ -z "$WROTE_MATCH" ]]; then
