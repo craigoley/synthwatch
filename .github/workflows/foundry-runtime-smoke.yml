@@ -68,16 +68,26 @@ jobs:
               echo "::error::No narrative replica was available for log inspection ($EXEC)"
               exit 1
             fi
+            echo "Narrative replica selected: $REPLICA"
 
+            # The Container Apps CLI extension has emitted both text and JSON log shapes across
+            # versions. Try the replica-scoped form first, then the execution-scoped form; never
+            # mistake a log-query incompatibility for a model success.
             LOGS=$(az containerapp job logs show -g "$RG" -n "$JOB" --execution "$EXEC" \
               --replica "$REPLICA" --container narrative --format text --tail 500 2>&1 || true)
+            if ! printf '%s\n' "$LOGS" | grep -Fq '[narrative]'; then
+              LOGS=$(az containerapp job logs show -g "$RG" -n "$JOB" --execution "$EXEC" \
+                --container narrative --format json --tail 500 2>&1 || true)
+            fi
             FLEET_LINE=$(printf '%s\n' "$LOGS" | grep -F '[narrative] fleet:' | tail -1 || true)
             WROTE_LINE=$(printf '%s\n' "$LOGS" | grep -F '[narrative] wrote ' | tail -1 || true)
 
             # narrate() reports the selected deployment, and the wrote line is emitted only after the
             # report_narratives upsert completes. Together these prove request acceptance + persistence.
             if [[ "$FLEET_LINE" != *"($EXPECTED_MODEL)" ]]; then
-              echo "::error::Narrative did not report a Luna-backed fleet result: $FLEET_LINE"
+              LOG_BYTES=${#LOGS}
+              echo "::error::Narrative log inspection found no Luna fleet result (log_bytes=$LOG_BYTES)"
+              printf '%s\n' "$LOGS" | grep -Ei 'error|not found|logs|replica' | tail -10 || true
               exit 1
             fi
             if [[ -z "$WROTE_LINE" ]]; then
