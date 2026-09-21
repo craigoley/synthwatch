@@ -1,0 +1,88 @@
+name: Foundry runtime smoke
+
+# Manual only. This starts the existing narrative ACA Job against the current production data,
+# verifies the managed-identity request path, and uses the job's post-upsert log as the stored-output
+# proof. It does not build, roll, mutate infra, or create a model deployment.
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: foundry-runtime-smoke
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Azure login (OIDC)
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Run narrative job and prove Luna output
+        uses: azure/cli@9eb25b8360668fb0ecbafa808d40e2197b2f5f52 # v3.0.0
+        with:
+          azcliversion: latest
+          inlineScript: |
+            set -euo pipefail
+            RG=synthwatch-rg
+            JOB=synthwatch-narrative-job
+            EXPECTED_MODEL=gpt-5.6-luna
+
+            EXEC=$(az containerapp job start -g "$RG" -n "$JOB" --query name -o tsv)
+            echo "Started narrative execution: $EXEC"
+
+            STATUS=
+            for _ in $(seq 1 90); do
+              STATUS=$(az containerapp job execution show -g "$RG" -n "$JOB" \
+                --job-execution-name "$EXEC" --query properties.status -o tsv)
+              echo "status: $STATUS"
+              case "$STATUS" in
+                Succeeded) break ;;
+                Failed|Degraded|Cancelled)
+                  echo "::error::Narrative execution $EXEC ended: $STATUS"
+                  exit 1
+                  ;;
+              esac
+              sleep 10
+            done
+            if [[ "$STATUS" != Succeeded ]]; then
+              echo "::error::Narrative execution $EXEC did not finish within 15 minutes"
+              exit 1
+            fi
+
+            REPLICA=
+            for _ in $(seq 1 12); do
+              REPLICA=$(az containerapp job replica list -g "$RG" -n "$JOB" --execution "$EXEC" \
+                --query '[0].name' -o tsv 2>/dev/null || true)
+              [[ -n "$REPLICA" ]] && break
+              sleep 5
+            done
+            if [[ -z "$REPLICA" ]]; then
+              echo "::error::No narrative replica was available for log inspection ($EXEC)"
+              exit 1
+            fi
+
+            LOGS=$(az containerapp job logs show -g "$RG" -n "$JOB" --execution "$EXEC" \
+              --replica "$REPLICA" --container narrative --format text --tail 500 2>&1 || true)
+            FLEET_LINE=$(printf '%s\n' "$LOGS" | grep -F '[narrative] fleet:' | tail -1 || true)
+            WROTE_LINE=$(printf '%s\n' "$LOGS" | grep -F '[narrative] wrote ' | tail -1 || true)
+
+            # narrate() reports the selected deployment, and the wrote line is emitted only after the
+            # report_narratives upsert completes. Together these prove request acceptance + persistence.
+            if [[ "$FLEET_LINE" != *"($EXPECTED_MODEL)" ]]; then
+              echo "::error::Narrative did not report a Luna-backed fleet result: $FLEET_LINE"
+              exit 1
+            fi
+            if [[ -z "$WROTE_LINE" ]]; then
+              echo "::error::Narrative did not report a stored report_narratives write"
+              exit 1
+            fi
+            echo "Runtime smoke passed: $FLEET_LINE"
+            echo "Runtime smoke stored-output proof: $WROTE_LINE"
