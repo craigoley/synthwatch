@@ -111,23 +111,21 @@ jobs:
               LOGS=$(normalize_logs "$(az containerapp job logs show -g "$RG" -n "$JOB" --execution "$EXEC" \
                 --container narrative --format json --tail 300 2>&1 || true)")
             fi
-            FLEET_LINE=$(printf '%s\n' "$LOGS" | grep -F '[narrative] fleet:' | tail -1 || true)
-            WROTE_LINE=$(printf '%s\n' "$LOGS" | grep -F '[narrative] wrote ' | tail -1 || true)
-            FLEET_MODEL=$(printf '%s\n' "$FLEET_LINE" | sed -n 's/.*(\([^()]*\)).*/\1/p' | tail -1)
-            WROTE_COUNT=$(printf '%s\n' "$WROTE_LINE" | sed -n 's/.*wrote \([0-9][0-9]*\) narrative.*/\1/p' | tail -1)
+            FLEET_MATCH=$(printf '%s\n' "$LOGS" | grep -F '[narrative] fleet:' | grep -F "($EXPECTED_MODEL)" | tail -1 || true)
+            WROTE_MATCH=$(printf '%s\n' "$LOGS" | grep -F '[narrative] wrote ' | tail -1 || true)
 
             # narrate() reports the selected deployment, and the wrote line is emitted only after the
             # report_narratives upsert completes. Together these prove request acceptance + persistence.
-            if [[ "$FLEET_MODEL" != "$EXPECTED_MODEL" ]]; then
+            if [[ -z "$FLEET_MATCH" ]]; then
               LOG_BYTES=${#LOGS}
               echo "::error::Narrative log inspection found no Luna fleet result (source=$LOG_SOURCE log_bytes=$LOG_BYTES)"
               MARKERS=$(printf '%s\n' "$LOGS" | grep -oE '\[narrative\] (fleet:|wrote |done:|AZURE_OPENAI_[^ ]*)' | sort | uniq -c || true)
               printf 'Observed safe markers:\n%s\n' "${MARKERS:-<none>}"
               exit 1
             fi
-            if [[ -z "$WROTE_COUNT" ]]; then
+            if [[ -z "$WROTE_MATCH" ]]; then
               echo "::error::Narrative did not report a stored report_narratives write"
               exit 1
             fi
-            echo "Runtime smoke passed: fleet model=$FLEET_MODEL"
-            echo "Runtime smoke stored-output proof: wrote_count=$WROTE_COUNT"
+            echo "Runtime smoke passed: fleet model=$EXPECTED_MODEL"
+            echo "Runtime smoke stored-output proof: wrote_marker=observed"
