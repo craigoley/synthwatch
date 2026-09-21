@@ -2,7 +2,7 @@
 #
 # Base image ships a real Chromium (+ the chrome-headless-shell the runner launches)
 # plus every OS dependency it needs (fonts, libnss, etc.). It MUST be pinned to the
-# EXACT SAME version as the `playwright` npm dependency (1.62.1) — a MINOR drift bumps
+# EXACT SAME version as the `playwright` npm dependency (1.63.0) — a MINOR drift bumps
 # the bundled browser revision, so the binary the npm package looks for won't exist in
 # the image and `chromium.launch()` fails at runtime (the 2026-07-25 outage: #368 moved
 # npm to 1.62.0 while this stayed 1.61.0, and prod's browser monitors went 100% down with
@@ -12,10 +12,10 @@
 #
 # ★ BEFORE BUMPING EITHER SIDE, CONFIRM THE TAG EXISTS. `curl -s
 # https://mcr.microsoft.com/v2/playwright/tags/list` is the check; a `-next-canary-*` tag is NOT
-# a stable release and must not be used here. `v1.62.1-noble` (and -amd64/-arm64) is live on mcr,
+# a stable release and must not be used here. `v1.63.0-noble` is live on mcr,
 # verified before this bump; Dependabot bumped the npm side, the pairing gate demands this side
 # move with it — landing the npm half alone is exactly the #368 shape.
-FROM mcr.microsoft.com/playwright:v1.62.1-noble
+FROM mcr.microsoft.com/playwright:v1.63.0-noble
 
 WORKDIR /app
 
