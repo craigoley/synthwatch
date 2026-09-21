@@ -38,6 +38,15 @@ jobs:
             EXEC=$(az containerapp job start -g "$RG" -n "$JOB" --query name -o tsv)
             echo "Started narrative execution: $EXEC"
 
+            # ACA job log retrieval is preview and its post-execution output has varied across
+            # CLI extension versions. Stream the execution while it is live, then use the
+            # replica-scoped historical query as a fallback. The proof below is still based on
+            # application markers, never on execution status alone.
+            STREAM_FILE=$(mktemp)
+            az containerapp job logs show -g "$RG" -n "$JOB" --execution "$EXEC" \
+              --container narrative --format text --tail 300 --follow true >"$STREAM_FILE" 2>&1 &
+            STREAM_PID=$!
+
             STATUS=
             for _ in $(seq 1 90); do
               STATUS=$(az containerapp job execution show -g "$RG" -n "$JOB" \
@@ -53,9 +62,17 @@ jobs:
               sleep 10
             done
             if [[ "$STATUS" != Succeeded ]]; then
+              kill "$STREAM_PID" 2>/dev/null || true
+              wait "$STREAM_PID" 2>/dev/null || true
               echo "::error::Narrative execution $EXEC did not finish within 15 minutes"
               exit 1
             fi
+
+            # Give the stream a brief chance to receive the final upsert line, then stop it so
+            # the smoke cannot hang on a preview CLI websocket after the container exits.
+            sleep 5
+            kill "$STREAM_PID" 2>/dev/null || true
+            wait "$STREAM_PID" 2>/dev/null || true
 
             REPLICA=
             for _ in $(seq 1 12); do
@@ -70,29 +87,47 @@ jobs:
             fi
             echo "Narrative replica selected: $REPLICA"
 
-            # The Container Apps CLI extension has emitted both text and JSON log shapes across
-            # versions. Try the replica-scoped form first, then the execution-scoped form; never
-            # mistake a log-query incompatibility for a model success.
-            LOGS=$(az containerapp job logs show -g "$RG" -n "$JOB" --execution "$EXEC" \
-              --replica "$REPLICA" --container narrative --format text --tail 300 2>&1 || true)
+            normalize_logs() {
+              local raw="$1"
+              local parsed=
+              if parsed=$(printf '%s\n' "$raw" | jq -r '.. | strings' 2>/dev/null); then
+                if [[ -n "$parsed" ]]; then
+                  printf '%s\n' "$parsed"
+                  return 0
+                fi
+              fi
+              printf '%s\n' "$raw"
+            }
+
+            LOG_SOURCE=stream
+            LOGS=$(normalize_logs "$(cat "$STREAM_FILE")")
             if ! printf '%s\n' "$LOGS" | grep -Fq '[narrative]'; then
-              LOGS=$(az containerapp job logs show -g "$RG" -n "$JOB" --execution "$EXEC" \
-                --container narrative --format json --tail 300 2>&1 || true)
+              LOG_SOURCE=replica-text
+              LOGS=$(normalize_logs "$(az containerapp job logs show -g "$RG" -n "$JOB" --execution "$EXEC" \
+                --replica "$REPLICA" --container narrative --format text --tail 300 2>&1 || true)")
+            fi
+            if ! printf '%s\n' "$LOGS" | grep -Fq '[narrative]'; then
+              LOG_SOURCE=execution-json
+              LOGS=$(normalize_logs "$(az containerapp job logs show -g "$RG" -n "$JOB" --execution "$EXEC" \
+                --container narrative --format json --tail 300 2>&1 || true)")
             fi
             FLEET_LINE=$(printf '%s\n' "$LOGS" | grep -F '[narrative] fleet:' | tail -1 || true)
             WROTE_LINE=$(printf '%s\n' "$LOGS" | grep -F '[narrative] wrote ' | tail -1 || true)
+            FLEET_MODEL=$(printf '%s\n' "$FLEET_LINE" | sed -n 's/.*(\([^()]*\)).*/\1/p' | tail -1)
+            WROTE_COUNT=$(printf '%s\n' "$WROTE_LINE" | sed -n 's/.*wrote \([0-9][0-9]*\) narrative.*/\1/p' | tail -1)
 
             # narrate() reports the selected deployment, and the wrote line is emitted only after the
             # report_narratives upsert completes. Together these prove request acceptance + persistence.
-            if [[ "$FLEET_LINE" != *"($EXPECTED_MODEL)" ]]; then
+            if [[ "$FLEET_MODEL" != "$EXPECTED_MODEL" ]]; then
               LOG_BYTES=${#LOGS}
-              echo "::error::Narrative log inspection found no Luna fleet result (log_bytes=$LOG_BYTES)"
-              printf '%s\n' "$LOGS" | grep -Ei 'error|not found|logs|replica' | tail -10 || true
+              echo "::error::Narrative log inspection found no Luna fleet result (source=$LOG_SOURCE log_bytes=$LOG_BYTES)"
+              MARKERS=$(printf '%s\n' "$LOGS" | grep -oE '\[narrative\] (fleet:|wrote |done:|AZURE_OPENAI_[^ ]*)' | sort | uniq -c || true)
+              printf 'Observed safe markers:\n%s\n' "${MARKERS:-<none>}"
               exit 1
             fi
-            if [[ -z "$WROTE_LINE" ]]; then
+            if [[ -z "$WROTE_COUNT" ]]; then
               echo "::error::Narrative did not report a stored report_narratives write"
               exit 1
             fi
-            echo "Runtime smoke passed: $FLEET_LINE"
-            echo "Runtime smoke stored-output proof: $WROTE_LINE"
+            echo "Runtime smoke passed: fleet model=$FLEET_MODEL"
+            echo "Runtime smoke stored-output proof: wrote_count=$WROTE_COUNT"
