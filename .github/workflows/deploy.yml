@@ -116,13 +116,16 @@ jobs:
               --query properties.model.name -o tsv)
             CAPACITY=$(az cognitiveservices account deployment show \
               --resource-group "$RG" --name "$AOAI_ACCOUNT" --deployment-name "$EXPECTED_MODEL" \
-              --query properties.sku.capacity -o tsv)
+              --query sku.capacity -o tsv)
+            CURRENT_CAPACITY=$(az cognitiveservices account deployment show \
+              --resource-group "$RG" --name "$AOAI_ACCOUNT" --deployment-name "$EXPECTED_MODEL" \
+              --query properties.currentCapacity -o tsv)
 
-            if [[ "$STATE" != Succeeded || "$MODEL" != "$EXPECTED_MODEL" || "$CAPACITY" != "$EXPECTED_CAPACITY" ]]; then
-              echo "::error::Foundry deployment gate failed: name=$EXPECTED_MODEL model=$MODEL state=$STATE capacity=${CAPACITY}K TPM expected=${EXPECTED_CAPACITY}K TPM"
+            if [[ "$STATE" != Succeeded || "$MODEL" != "$EXPECTED_MODEL" || "$CAPACITY" != "$EXPECTED_CAPACITY" || "$CURRENT_CAPACITY" != "$EXPECTED_CAPACITY" ]]; then
+              echo "::error::Foundry deployment gate failed: name=$EXPECTED_MODEL model=$MODEL state=$STATE capacity=${CAPACITY}K TPM current=${CURRENT_CAPACITY}K TPM expected=${EXPECTED_CAPACITY}K TPM"
               exit 1
             fi
-            echo "Foundry deployment ready: $EXPECTED_MODEL ($MODEL, $STATE, capacity=${CAPACITY}K TPM)."
+            echo "Foundry deployment ready: $EXPECTED_MODEL ($MODEL, $STATE, capacity=${CAPACITY}K TPM, current=${CURRENT_CAPACITY}K TPM)."
 
       - name: Build and push runner image (ACR)
         uses: azure/cli@9eb25b8360668fb0ecbafa808d40e2197b2f5f52 # v3.0.0
