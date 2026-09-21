@@ -200,12 +200,18 @@ jobs:
           # fail before a region/job's bicep has landed — same as centralus was.
           inlineScript: |
             IMAGE=synthwatcholey0620.azurecr.io/synthwatch-runner:${{ github.sha }}
-            az containerapp job update -n synthwatch-runner-job -g synthwatch-rg --image "$IMAGE"
+            # --set-env-vars updates only these non-secret keys; it preserves the existing endpoint,
+            # secretRefs, identity, and all other job env. The image roll alone does not apply Bicep.
+            az containerapp job update -n synthwatch-runner-job -g synthwatch-rg --image "$IMAGE" \
+              --set-env-vars AZURE_OPENAI_DEPLOYMENT=gpt-5.6-luna AZURE_OPENAI_API_VERSION=v1
             az containerapp job update -n synthwatch-runner-job-centralus -g synthwatch-rg --image "$IMAGE" \
+              --set-env-vars AZURE_OPENAI_DEPLOYMENT=gpt-5.6-luna AZURE_OPENAI_API_VERSION=v1 \
               || echo "::notice::synthwatch-runner-job-centralus not present yet — skipping (deploy its bicep to create it)."
             az containerapp job update -n synthwatch-runner-job-westus2 -g synthwatch-rg --image "$IMAGE" \
+              --set-env-vars AZURE_OPENAI_DEPLOYMENT=gpt-5.6-luna AZURE_OPENAI_API_VERSION=v1 \
               || echo "::notice::synthwatch-runner-job-westus2 not present yet — skipping (deploy its bicep to create it)."
             az containerapp job update -n synthwatch-narrative-job -g synthwatch-rg --image "$IMAGE" \
+              --set-env-vars AZURE_OPENAI_DEPLOYMENT=gpt-5.6-luna AZURE_OPENAI_API_VERSION=v1 \
               || echo "::notice::synthwatch-narrative-job not present yet — skipping (deploy its bicep to create it)."
             az containerapp job update -n synthwatch-rollup-job -g synthwatch-rg --image "$IMAGE" \
               || echo "::notice::synthwatch-rollup-job not present yet — skipping (deploy its bicep to create it)."
