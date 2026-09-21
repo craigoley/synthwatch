@@ -123,6 +123,8 @@ jobs:
               printf 'Observed safe markers:\n%s\n' "${MARKERS:-<none>}"
               MODELS=$(printf '%s\n' "$LOGS" | grep -oE 'gpt-[0-9.]+-[[:alnum:]-]+|fallback-template' | sort -u || true)
               printf 'Observed model tokens: %s\n' "${MODELS:-<none>}"
+              RESULTS=$(printf '%s\n' "$LOGS" | grep -oE '\[narrative\] (model HTTP [0-9]+|model returned [0-9]+|finish_reason=[^ ]+ content_len=[0-9]+|empty model content|model output (off-shape|not JSON|failed spot-check)|failed \(non-fatal\))' | sort -u || true)
+              printf 'Observed request/result diagnostics: %s\n' "${RESULTS:-<none>}"
               exit 1
             fi
             if [[ -z "$WROTE_MATCH" ]]; then
