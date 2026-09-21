@@ -68,6 +68,32 @@ jobs:
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
+      # The runner image can be healthy while the model route is broken: the Foundry deployment is
+      # an existing Azure resource and the ACA env is template/live state, not part of this image roll.
+      # Fail before building anything when the selected Luna deployment is absent or not ready.
+      - name: Verify Foundry Luna deployment
+        uses: azure/cli@9eb25b8360668fb0ecbafa808d40e2197b2f5f52 # v3.0.0
+        with:
+          azcliversion: latest
+          inlineScript: |
+            set -euo pipefail
+            RG=synthwatch-rg
+            AOAI_ACCOUNT=synthwatch-aoai
+            EXPECTED_MODEL=gpt-5.6-luna
+
+            STATE=$(az cognitiveservices account deployment show \
+              --resource-group "$RG" --name "$AOAI_ACCOUNT" --deployment-name "$EXPECTED_MODEL" \
+              --query properties.provisioningState -o tsv)
+            MODEL=$(az cognitiveservices account deployment show \
+              --resource-group "$RG" --name "$AOAI_ACCOUNT" --deployment-name "$EXPECTED_MODEL" \
+              --query properties.model.name -o tsv)
+
+            if [[ "$STATE" != Succeeded || "$MODEL" != "$EXPECTED_MODEL" ]]; then
+              echo "::error::Foundry deployment gate failed: name=$EXPECTED_MODEL model=$MODEL state=$STATE"
+              exit 1
+            fi
+            echo "Foundry deployment ready: $EXPECTED_MODEL ($MODEL, $STATE)."
+
       - name: Build and push runner image (ACR)
         uses: azure/cli@9eb25b8360668fb0ecbafa808d40e2197b2f5f52 # v3.0.0
         with:
@@ -163,6 +189,37 @@ jobs:
             az containerapp job update -n synthwatch-sandbox -g synthwatch-rg --image "$IMAGE" \
               || echo "::notice::synthwatch-sandbox not present yet — skipping (deploy its bicep to create it)."
 
+      # The image roll does not apply infra/main.bicep, so prove the material Foundry env landed on every
+      # AI-consuming ACA job. This catches the out-of-band-env wipe class and prevents a green deploy from
+      # silently leaving RCA/narrative on gpt-5-mini or an incompatible dated API route.
+      - name: Verify live Foundry wiring
+        uses: azure/cli@9eb25b8360668fb0ecbafa808d40e2197b2f5f52 # v3.0.0
+        with:
+          azcliversion: latest
+          inlineScript: |
+            set -euo pipefail
+            RG=synthwatch-rg
+            EXPECTED_MODEL=gpt-5.6-luna
+            EXPECTED_API_VERSION=v1
+            JOBS=(
+              synthwatch-runner-job
+              synthwatch-runner-job-centralus
+              synthwatch-runner-job-westus2
+              synthwatch-narrative-job
+            )
+
+            for JOB in "${JOBS[@]}"; do
+              MODEL=$(az containerapp job show -g "$RG" -n "$JOB" \
+                --query "properties.template.containers[0].env[?name=='AZURE_OPENAI_DEPLOYMENT'].value | [0]" -o tsv)
+              API_VERSION=$(az containerapp job show -g "$RG" -n "$JOB" \
+                --query "properties.template.containers[0].env[?name=='AZURE_OPENAI_API_VERSION'].value | [0]" -o tsv)
+              if [[ "$MODEL" != "$EXPECTED_MODEL" || "$API_VERSION" != "$EXPECTED_API_VERSION" ]]; then
+                echo "::error::Live Foundry wiring failed for $JOB: deployment=$MODEL api_version=$API_VERSION"
+                exit 1
+              fi
+              echo "$JOB: deployment=$MODEL api_version=$API_VERSION"
+            done
+
       - name: Write deployment summary
         run: |
           {
@@ -174,4 +231,3 @@ jobs:
             echo "- **Migrations:** applied via \`synthwatch-migrate-job\` before the roll"
             echo "- **ACA Job:** \`synthwatch-runner-job\` (resource group \`synthwatch-rg\`)"
           } >> "$GITHUB_STEP_SUMMARY"
-
