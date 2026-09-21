@@ -42,6 +42,12 @@ on:
       - '**/Dockerfile'
       - '.github/workflows/deploy.yml'
   workflow_dispatch:
+    inputs:
+      provision_luna:
+        description: 'Create the missing gpt-5.6-luna GlobalStandard deployment before rolling the runner.'
+        required: false
+        default: false
+        type: boolean
 
 # Serialize deploys to main; a newer deploy cancels an in-flight older one so two pushes can't
 # race back-to-back (mirrors the synthwatch-api fix after the 2026-06-22 deploy-race incident).
@@ -67,6 +73,30 @@ jobs:
           client-id: ${{ vars.AZURE_CLIENT_ID }}
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # Explicit, idempotent remediation for the one-time Luna cutover. Normal pushes and automatic
+      # merge dispatches never create model deployments; they fail closed in the verification below.
+      - name: Provision Foundry Luna deployment (explicit dispatch only)
+        if: github.event_name == 'workflow_dispatch' && inputs.provision_luna == true
+        uses: azure/cli@9eb25b8360668fb0ecbafa808d40e2197b2f5f52 # v3.0.0
+        with:
+          azcliversion: latest
+          inlineScript: |
+            set -euo pipefail
+            RG=synthwatch-rg
+            AOAI_ACCOUNT=synthwatch-aoai
+            DEPLOYMENT=gpt-5.6-luna
+
+            if az cognitiveservices account deployment show \
+              --resource-group "$RG" --name "$AOAI_ACCOUNT" --deployment-name "$DEPLOYMENT" \
+              --only-show-errors >/dev/null 2>&1; then
+              echo "Foundry deployment already exists: $DEPLOYMENT"
+            else
+              az cognitiveservices account deployment create \
+                --resource-group "$RG" --name "$AOAI_ACCOUNT" --deployment-name "$DEPLOYMENT" \
+                --model-name gpt-5.6-luna --model-version 2026-07-09 --model-format OpenAI \
+                --sku-capacity 1 --sku-name GlobalStandard
+            fi
 
       # The runner image can be healthy while the model route is broken: the Foundry deployment is
       # an existing Azure resource and the ACA env is template/live state, not part of this image roll.

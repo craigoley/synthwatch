@@ -195,14 +195,62 @@ param sandboxRetentionDays int = 1
 @description('Azure OpenAI endpoint for RCA (AZURE_OPENAI_ENDPOINT).')
 param aoaiEndpoint string = 'https://synthwatch-aoai.openai.azure.com/'
 
+@description('Microsoft Foundry account name that owns the model deployment.')
+param aoaiAccountName string = 'synthwatch-aoai'
+
 @description('Microsoft Foundry model deployment name for RCA and report narratives (AZURE_OPENAI_DEPLOYMENT).')
 param aoaiDeployment string = 'gpt-5.6-luna'
+
+@description('Microsoft Foundry model ID provisioned for the deployment.')
+param aoaiModelName string = 'gpt-5.6-luna'
+
+@description('Pinned Microsoft Foundry model version for the deployment.')
+param aoaiModelVersion string = '2026-07-09'
+
+@allowed([
+  'GlobalStandard'
+  'DataZoneStandard'
+  'Standard'
+  'GlobalProvisioned'
+  'Provisioned'
+])
+@description('Microsoft Foundry deployment SKU.')
+param aoaiDeploymentSku string = 'GlobalStandard'
+
+@minValue(1)
+@description('Minimum Microsoft Foundry deployment capacity. Keep at 1 unless measured traffic requires more.')
+param aoaiDeploymentCapacity int = 1
 
 // v1 is the current Microsoft Foundry OpenAI-compatible API: /openai/v1/chat/completions
 // receives the deployment name as `model`. The runner retains a dated-version compatibility
 // path for forks whose endpoint has not moved to Foundry v1.
 @description('Microsoft Foundry API version for AZURE_OPENAI_API_VERSION. Use v1 for the /openai/v1 endpoint; dated Azure OpenAI versions remain supported for forks.')
 param aoaiApiVersion string = 'v1'
+
+// Own the Luna deployment in the same template as the env that selects it. The account itself is
+// pre-existing; without this child resource an infra redeploy can preserve the env string while
+// leaving the referenced Foundry deployment absent, which is a green-looking but dark AI failure.
+resource aoaiAccount 'Microsoft.CognitiveServices/accounts@2022-10-01' existing = {
+  name: aoaiAccountName
+}
+
+resource aoaiModelDeployment 'Microsoft.CognitiveServices/accounts/deployments@2024-04-01-preview' = {
+  parent: aoaiAccount
+  name: aoaiDeployment
+  sku: {
+    name: aoaiDeploymentSku
+    capacity: aoaiDeploymentCapacity
+  }
+  properties: {
+    model: {
+      format: 'OpenAI'
+      name: aoaiModelName
+      version: aoaiModelVersion
+    }
+    raiPolicyName: 'Microsoft.DefaultV2'
+    versionUpgradeOption: 'NoAutoUpgrade'
+  }
+}
 
 @description('RCA completion-token budget (RCA_MAX_TOKENS).')
 param rcaMaxTokens string = '4000'
