@@ -12,17 +12,13 @@
 // NON-FATAL: any failure (token, network, 401, timeout, bad output) is swallowed —
 // the incident records WITHOUT rca; RCA never blocks incident-open or changes a
 // verdict.
-import { DefaultAzureCredential, type TokenCredential } from '@azure/identity';
-import { chatCompletionUrl, isFoundryV1ApiVersion } from './aoai.js';
+import { chatCompletionContent } from './aoai.js';
 import { pool, type Check, type RunRecord } from './db.js';
 import { downloadBlobBase64 } from './artifacts.js';
 import type { TraceSignals, ConsoleMessage, TraceRequest } from './traceSignals.js';
 
 const ENDPOINT = process.env.AZURE_OPENAI_ENDPOINT; // e.g. https://my-aoai.openai.azure.com
 const DEPLOYMENT = process.env.RCA_MODEL_DEPLOYMENT ?? process.env.AZURE_OPENAI_DEPLOYMENT;
-// Foundry v1 is the current OpenAI-compatible API. A dated value remains supported for forks
-// that still use the legacy deployment-path endpoint.
-const API_VERSION = process.env.AZURE_OPENAI_API_VERSION ?? 'v1';
 // `Number(env) || default` (not `?? default`): a malformed value (e.g. "30s") makes
 // Number() return NaN; NaN is falsy so we fall back to the default rather than
 // propagating NaN into a setTimeout / the API request (which would 400).
@@ -37,9 +33,6 @@ const MAX_TOKENS = Number(process.env.RCA_MAX_TOKENS) || 4000;
 const REASONING_EFFORT = process.env.RCA_REASONING_EFFORT;
 // Reuse an RCA for an identical failure signature opened within this window.
 const CACHE_TTL = process.env.RCA_CACHE_TTL ?? '24 hours';
-// AAD scope for Azure AI / Cognitive Services data-plane.
-const SCOPE = 'https://cognitiveservices.azure.com/.default';
-
 // ★ Fact-pack caps — the trace can carry hundreds of console errors; cap + RANK (first-party first) so the
 // signal a Wegmans monitor cares about isn't drowned by tracker noise, and the pack stays inside RCA_MAX_TOKENS.
 const FIRST_PARTY_CONSOLE_CAP = 10;
@@ -531,31 +524,6 @@ async function gatherContext(
   return { facts, text: withShots, citeIndex, failureB64, baselineB64 };
 }
 
-/**
- * Managed-identity options for DefaultAzureCredential. The runner runs under a
- * USER-ASSIGNED-only MI (no system-assigned), and a bare DefaultAzureCredential can't
- * resolve WHICH identity to use in that case -> "ChainedTokenCredential authentication
- * failed" -> RCA token acquisition fails (the intermittent-RCA root cause, masked by the
- * 24h cache). Pin the user-assigned MI's client id from AZURE_CLIENT_ID. Unset (local /
- * system-assigned envs) -> bare DefaultAzureCredential, unchanged. Exported so a test can
- * assert the pinning decision without a live token.
- */
-export function credentialOptions(): { managedIdentityClientId: string } | undefined {
-  const clientId = process.env.AZURE_CLIENT_ID;
-  return clientId ? { managedIdentityClientId: clientId } : undefined;
-}
-
-let credential: TokenCredential | null = null;
-async function getAadToken(): Promise<string> {
-  if (!credential) {
-    const opts = credentialOptions();
-    credential = opts ? new DefaultAzureCredential(opts) : new DefaultAzureCredential();
-  }
-  const token = await credential.getToken(SCOPE);
-  if (!token?.token) throw new Error('no AAD token for cognitive-services scope');
-  return token.token;
-}
-
 /** Look up a recent RCA for the same failure signature on this check (cost + consistency). */
 async function cacheLookup(checkId: number, signature: string): Promise<RcaResult | null> {
   const { rows } = await pool.query<{ rca: RcaResult }>(
@@ -653,8 +621,6 @@ export async function runRca(
       return deterministicResult(ctx.facts, signature, true);
     }
 
-    const token = await getAadToken();
-
     // Multimodal user content: the structured facts + the screenshot(s).
     const userContent: unknown[] = [{ type: 'text', text: ctx.text }];
     if (ctx.failureB64) {
@@ -666,60 +632,18 @@ export async function runRca(
       userContent.push({ type: 'image_url', image_url: { url: `data:image/png;base64,${ctx.baselineB64}` } });
     }
 
-    const url = chatCompletionUrl(ENDPOINT!, DEPLOYMENT!, API_VERSION);
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
-    const body: Record<string, unknown> = {
-      ...(isFoundryV1ApiVersion(API_VERSION) ? { model: DEPLOYMENT } : {}),
-      messages: [
-        { role: 'system', content: SYSTEM_PROMPT },
-        { role: 'user', content: userContent },
-      ],
-      max_completion_tokens: MAX_TOKENS,
-      response_format: isFoundryV1ApiVersion(API_VERSION) ? RCA_RESPONSE_FORMAT : { type: 'json_object' },
-    };
-    if (REASONING_EFFORT) body.reasoning_effort = REASONING_EFFORT;
-
-    let res: Response;
-    try {
-      res = await fetch(url, {
-        method: 'POST',
-        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-        body: JSON.stringify(body),
-        signal: controller.signal,
-      });
-    } finally {
-      clearTimeout(timer);
-    }
-
-    // Funnel telemetry — make every exit path observable from logs alone.
-    console.log(`[rca] model HTTP ${res.status}`);
-    if (!res.ok) {
-      console.warn(`[rca] model returned ${res.status} ${res.statusText} (non-fatal); incident records without RCA`);
-      return null;
-    }
-    const json = (await res.json()) as {
-      choices?: { message?: { content?: string }; finish_reason?: string }[];
-      usage?: unknown;
-    };
-    const choice = json.choices?.[0];
-    const content = choice?.message?.content;
-    const finishReason = choice?.finish_reason ?? 'unknown';
-    // usage carries completion/reasoning token counts (no prompt content, non-sensitive).
-    console.log(
-      `[rca] finish_reason=${finishReason} content_len=${content?.length ?? 0} usage=${JSON.stringify(json.usage ?? {})}`,
-    );
-    // Truncation surfaces two ways on a reasoning model: empty content (all budget
-    // spent on hidden reasoning) OR a non-empty PARTIAL that then fails to parse.
-    // Emit the actionable hint whenever finish_reason='length', not only when empty,
-    // so a truncated-but-non-empty response isn't diagnosed as a generic parse error.
-    if (finishReason === 'length') {
-      console.warn(
-        `[rca] finish_reason=length — output TRUNCATED, raise RCA_MAX_TOKENS (content_len=${content?.length ?? 0})`,
-      );
-    }
+    const content = await chatCompletionContent({
+      deployment: DEPLOYMENT,
+      system: SYSTEM_PROMPT,
+      user: userContent,
+      maxTokens: MAX_TOKENS,
+      reasoningEffort: REASONING_EFFORT,
+      responseFormat: RCA_RESPONSE_FORMAT,
+      timeoutMs: TIMEOUT_MS,
+      logPrefix: '[rca]',
+    });
     if (!content) {
-      console.warn(`[rca] empty model content (finish_reason=${finishReason}) — no RCA`);
+      console.warn('[rca] model content unavailable — no RCA');
       return null;
     }
     const result = parseResult(content, signature);
