@@ -38,21 +38,15 @@ case "$MODULE" in
     MUTATE='["traceSignals.ts"]'; BREAK=69 ;;
   rca)
     CMD="node --test dist/rca.test.js"
-    # pure-function surface, in THREE ranges:
-    #   • normalizeSignatureText + signatureOf (104-115) — the failure-signature normaliser;
-    #   • extractTraceFacts + renderFactPack cite-logic (198-285);
-    #   • validateCites / evidenceThin / deterministicResult / isDeterministicInfraError /
-    #     infraDeterministicResult / rcaScreenshotUrls (331-479).
-    # Excludes SYSTEM_PROMPT, the render TEXT (286-330), and the model/DB orchestration (gatherContext+).
-    # ★ Ranges RE-DERIVED — TWICE now, for the same reason. First after the infra-deterministic classifier
-    # landed (the old 159-246/284-384 then mutated render-text and MISSED the new pure functions). Again on
-    # 2026-07-30 when signatureOf's normaliser added +32 lines ABOVE both windows: 166-253/299-447 slid onto
-    # the render TEXT, so the gate reported survivors in prompt strings it is meant to EXCLUDE and the score
-    # fell 59 → 55.85 with no test having gotten worse. THE LESSON, twice paid: these are FIXED line numbers
-    # against a file that grows at the top, so ANY insertion above line ~500 silently re-aims the whole gate.
-    # Shifting by exactly the inserted line count (+32) preserves the identical measured window the BREAK=59
-    # baseline was derived from; the new range is additive and its mutants are killed in rca.test.ts.
-    MUTATE='["rca.ts:104-115","rca.ts:198-285","rca.ts:331-479"]'; BREAK=59 ;;
+    # Pure-function surface, explicitly split so prompt text and DB/model orchestration are not mutated:
+    #   • normalizeSignatureText + signatureOf (121-132);
+    #   • extractTraceFacts (214-236) and renderFactPack cite-index logic (291-302);
+    #   • validateCites (348-357), evidenceThin (367-377), deterministicResult (385-421),
+    #     isDeterministicInfraError (444-447), infraDeterministicResult (456-479),
+    #     and rcaScreenshotUrls (490-496).
+    # These ranges were re-derived after the shared Foundry transport moved RCA's orchestration out of this
+    # file. Keep them explicit: fixed line ranges must be updated whenever code is inserted above them.
+    MUTATE='["rca.ts:121-132","rca.ts:214-236","rca.ts:291-302","rca.ts:348-357","rca.ts:367-377","rca.ts:385-421","rca.ts:444-447","rca.ts:456-479","rca.ts:490-496"]'; BREAK=59 ;;
   evaluate)
     CMD="node --test dist/evaluate.test.js dist/evaluate.integration.test.js dist/confirmationRetry.integration.test.js dist/transientBaselineSuccess.integration.test.js dist/countableRun.integration.test.js"
     MUTATE='["evaluate.ts"]'; BREAK=28 ;;   # measured 31.8% (post #307/#308) − margin
