@@ -11,6 +11,9 @@ import { DefaultAzureCredential, type TokenCredential } from '@azure/identity';
 const ENDPOINT = process.env.AZURE_OPENAI_ENDPOINT;
 const API_VERSION = process.env.AZURE_OPENAI_API_VERSION ?? 'v1';
 const SCOPE = 'https://cognitiveservices.azure.com/.default';
+const MAX_RATE_LIMIT_RETRIES = 2;
+const RATE_LIMIT_BACKOFF_MS = 2000;
+const MAX_RATE_LIMIT_BACKOFF_MS = 8000;
 
 /** The deployment selected by the environment, shared with RCA. */
 export const DEFAULT_DEPLOYMENT = process.env.AZURE_OPENAI_DEPLOYMENT;
@@ -115,20 +118,32 @@ export async function chatCompletionContent(req: ChatRequest): Promise<string | 
     const body = buildChatCompletionBody(req, deployment, API_VERSION);
 
     const url = chatCompletionUrl(ENDPOINT, deployment, API_VERSION);
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), req.timeoutMs ?? 30000);
-    let res: Response;
-    try {
-      res = await fetch(url, {
-        method: 'POST',
-        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-        body: JSON.stringify(body),
-        signal: controller.signal,
-      });
-    } finally {
-      clearTimeout(timer);
+    let res: Response | undefined;
+    for (let attempt = 0; attempt <= MAX_RATE_LIMIT_RETRIES; attempt += 1) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), req.timeoutMs ?? 30000);
+      try {
+        res = await fetch(url, {
+          method: 'POST',
+          headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+          body: JSON.stringify(body),
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+      console.log(`${log} model HTTP ${res.status}`);
+      if (res.status !== 429 || attempt === MAX_RATE_LIMIT_RETRIES) break;
+
+      const retryAfterSeconds = Number(res.headers.get('retry-after') ?? '');
+      const retryAfterMs = Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0
+        ? retryAfterSeconds * 1000
+        : RATE_LIMIT_BACKOFF_MS * 2 ** attempt;
+      const delayMs = Math.min(Math.max(retryAfterMs, 0), MAX_RATE_LIMIT_BACKOFF_MS);
+      console.warn(`${log} model returned 429; retrying ${attempt + 1}/${MAX_RATE_LIMIT_RETRIES} in ${delayMs}ms`);
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
-    console.log(`${log} model HTTP ${res.status}`);
+    if (!res) return null;
     if (!res.ok) {
       console.warn(`${log} model returned ${res.status} ${res.statusText} (non-fatal)`);
       return null;

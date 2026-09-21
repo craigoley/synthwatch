@@ -44,7 +44,7 @@ on:
   workflow_dispatch:
     inputs:
       provision_luna:
-        description: 'Create the missing gpt-5.6-luna GlobalStandard deployment before rolling the runner.'
+        description: 'Ensure the gpt-5.6-luna GlobalStandard deployment and its measured capacity before rolling the runner.'
         required: false
         default: false
         type: boolean
@@ -74,9 +74,9 @@ jobs:
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
-      # Explicit, idempotent remediation for the one-time Luna cutover. Normal pushes and automatic
-      # merge dispatches never create model deployments; they fail closed in the verification below.
-      - name: Provision Foundry Luna deployment (explicit dispatch only)
+      # Explicit, idempotent remediation for the Luna deployment/capacity. Normal pushes and automatic
+      # merge dispatches never mutate model capacity; they fail closed in the verification below.
+      - name: Ensure Foundry Luna deployment capacity (explicit dispatch only)
         if: github.event_name == 'workflow_dispatch' && inputs.provision_luna == true
         uses: azure/cli@9eb25b8360668fb0ecbafa808d40e2197b2f5f52 # v3.0.0
         with:
@@ -86,17 +86,13 @@ jobs:
             RG=synthwatch-rg
             AOAI_ACCOUNT=synthwatch-aoai
             DEPLOYMENT=gpt-5.6-luna
+            CAPACITY=16
 
-            if az cognitiveservices account deployment show \
+            echo "Ensuring Foundry deployment: name=$DEPLOYMENT model=$DEPLOYMENT sku=GlobalStandard capacity=${CAPACITY}K TPM"
+            az cognitiveservices account deployment create \
               --resource-group "$RG" --name "$AOAI_ACCOUNT" --deployment-name "$DEPLOYMENT" \
-              --only-show-errors >/dev/null 2>&1; then
-              echo "Foundry deployment already exists: $DEPLOYMENT"
-            else
-              az cognitiveservices account deployment create \
-                --resource-group "$RG" --name "$AOAI_ACCOUNT" --deployment-name "$DEPLOYMENT" \
-                --model-name gpt-5.6-luna --model-version 2026-07-09 --model-format OpenAI \
-                --sku-capacity 1 --sku-name GlobalStandard
-            fi
+              --model-name gpt-5.6-luna --model-version 2026-07-09 --model-format OpenAI \
+              --sku-capacity "$CAPACITY" --sku-name GlobalStandard
 
       # The runner image can be healthy while the model route is broken: the Foundry deployment is
       # an existing Azure resource and the ACA env is template/live state, not part of this image roll.
@@ -110,6 +106,7 @@ jobs:
             RG=synthwatch-rg
             AOAI_ACCOUNT=synthwatch-aoai
             EXPECTED_MODEL=gpt-5.6-luna
+            EXPECTED_CAPACITY=16
 
             STATE=$(az cognitiveservices account deployment show \
               --resource-group "$RG" --name "$AOAI_ACCOUNT" --deployment-name "$EXPECTED_MODEL" \
@@ -117,12 +114,15 @@ jobs:
             MODEL=$(az cognitiveservices account deployment show \
               --resource-group "$RG" --name "$AOAI_ACCOUNT" --deployment-name "$EXPECTED_MODEL" \
               --query properties.model.name -o tsv)
+            CAPACITY=$(az cognitiveservices account deployment show \
+              --resource-group "$RG" --name "$AOAI_ACCOUNT" --deployment-name "$EXPECTED_MODEL" \
+              --query properties.sku.capacity -o tsv)
 
-            if [[ "$STATE" != Succeeded || "$MODEL" != "$EXPECTED_MODEL" ]]; then
-              echo "::error::Foundry deployment gate failed: name=$EXPECTED_MODEL model=$MODEL state=$STATE"
+            if [[ "$STATE" != Succeeded || "$MODEL" != "$EXPECTED_MODEL" || "$CAPACITY" != "$EXPECTED_CAPACITY" ]]; then
+              echo "::error::Foundry deployment gate failed: name=$EXPECTED_MODEL model=$MODEL state=$STATE capacity=${CAPACITY}K TPM expected=${EXPECTED_CAPACITY}K TPM"
               exit 1
             fi
-            echo "Foundry deployment ready: $EXPECTED_MODEL ($MODEL, $STATE)."
+            echo "Foundry deployment ready: $EXPECTED_MODEL ($MODEL, $STATE, capacity=${CAPACITY}K TPM)."
 
       - name: Build and push runner image (ACR)
         uses: azure/cli@9eb25b8360668fb0ecbafa808d40e2197b2f5f52 # v3.0.0

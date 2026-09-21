@@ -218,8 +218,8 @@ param aoaiModelVersion string = '2026-07-09'
 param aoaiDeploymentSku string = 'GlobalStandard'
 
 @minValue(1)
-@description('Minimum Microsoft Foundry deployment capacity. Keep at 1 unless measured traffic requires more.')
-param aoaiDeploymentCapacity int = 1
+@description('Microsoft Foundry deployment capacity in 1K TPM units. Default 16 gives the narrative and RCA reasoning calls headroom; tune from observed 429s.')
+param aoaiDeploymentCapacity int = 16
 
 // v1 is the current Microsoft Foundry OpenAI-compatible API: /openai/v1/chat/completions
 // receives the deployment name as `model`. The runner retains a dated-version compatibility
