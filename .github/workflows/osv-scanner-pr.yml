@@ -18,7 +18,7 @@ jobs:
     # Don't run on Dependabot's own PRs (they get the scheduled full scan).
     if: ${{ github.actor != 'dependabot[bot]' }}
     # SHA-pinned third-party action (v2.3.8); Dependabot bumps it.
-    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@a345acffa64b0eaede81a3d9aae6141214d9c8fc
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@b1d267aea5211fa648d9d442fa64b90dbdcbdd36
     with:
       # Recursively scan the repo (picks up runner/package-lock.json).
       scan-args: |-
