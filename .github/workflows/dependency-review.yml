@@ -31,6 +31,6 @@ jobs:
         # AND EXECUTES at privilege (Option C). A vulnerable/malicious dependency landing here has the
         # widest blast radius of the three, so it must not be the one repo where the check can't go red.
         # ci-gate now gates on it (it is neither ADVISORY nor ORCHESTRATION).
-        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        uses: actions/dependency-review-action@bbc44d14a204704ccc493733616cd1e93a0321ec # v5.0.1
         with:
           comment-summary-in-pr: always

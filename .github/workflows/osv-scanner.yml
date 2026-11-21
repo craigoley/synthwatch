@@ -18,7 +18,7 @@ permissions:
 jobs:
   scan:
     # SHA-pinned third-party action (v2.3.8); Dependabot bumps it.
-    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@a345acffa64b0eaede81a3d9aae6141214d9c8fc
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@32d3cd482bdadfb38b186c0ad1b031902d55d932
     with:
       scan-args: |-
         -r
